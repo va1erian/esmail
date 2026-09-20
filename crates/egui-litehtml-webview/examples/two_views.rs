@@ -1,11 +1,8 @@
 //! Two independent [`WebView`]s sharing one [`WebViewHost`], side by side.
 //!
-//! Ported from the Servo-backed predecessor crate's own `two_views` example,
-//! which proved "one engine, N views" held for Servo -- this proves the
-//! litehtml-backed replacement holds the same shape: two independently
-//! scrolling, independently loaded views from one host, with no engine
-//! driving loop needed at all now (litehtml's `pixbuf` backend has no event
-//! loop to spin; `WebViewHost::spin()` no longer exists).
+//! Shows the one-host-many-views shape: two independently scrolling,
+//! independently loaded views from one host, with no engine driving loop
+//! needed (litehtml's `pixbuf` backend has no event loop to spin).
 //!
 //! Run with:
 //! ```text
@@ -16,9 +13,9 @@ use egui_litehtml_webview::{WebView, WebViewConfig, WebViewHost, WebViewSource};
 
 struct TwoViewsApp {
     // `host` outlives both views only by convention here (litehtml's
-    // pixbuf backend owns no shared engine state the views actually
-    // depend on at drop time, unlike Servo) -- kept anyway so this example
-    // still demonstrates the intended one-host-many-views call shape.
+    // pixbuf backend owns no shared engine state the views depend on at
+    // drop time) -- kept so this example demonstrates the intended
+    // one-host-many-views call shape.
     host: WebViewHost,
     left: WebView,
     right: WebView,

@@ -10,20 +10,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # This used to be a long list for Servo (cmake, nasm, clang/llvm-dev for
-      # bindgen, X11/Vulkan/Mesa/GL dev headers, freetype/harfbuzz/glib,
-      # gstreamer, python3 for mach, etc.) -- see PLAN.md's Servo -> litehtml
-      # migration section. litehtml's `cc`-crate build only needs a C/C++
-      # compiler (build-essential) and pkg-config (probed by openssl-sys and
+      # litehtml's `cc`-crate build only needs a C/C++ compiler
+      # (build-essential) and pkg-config (probed by openssl-sys and
       # wayland-sys); nothing here needs bindgen/libclang since the crate
       # ships pre-generated FFI bindings by default. libssl-dev is for
-      # native-tls (async-imap/lettre), unrelated to Servo or litehtml, and
-      # was previously only working by accident because GitHub's ubuntu-latest
-      # runner ships it preinstalled. libdbus-1-dev is for keyring's Linux
-      # secret-service backend, also unrelated to Servo/litehtml -- keep it.
-      # Verified by a clean `cargo build --workspace` / `cargo test
-      # --workspace --no-run` against exactly this package set in a bare
-      # rust:slim-bookworm container.
+      # native-tls (async-imap/lettre), and libdbus-1-dev is for keyring's
+      # Linux secret-service backend. Verified by a clean `cargo build
+      # --workspace` / `cargo test --workspace --no-run` against exactly this
+      # package set in a bare rust:slim-bookworm container.
       - name: Install dependencies
         run: |
           sudo apt-get update

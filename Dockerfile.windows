@@ -11,16 +11,12 @@ RUN Set-ExecutionPolicy Bypass -Scope Process -Force; `
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; `
     iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
 
-# Install build dependencies via Chocolatey. python3, nasm and cmake were
-# for Servo's mach build system and its C dependencies -- gone now that
-# Servo is replaced by litehtml (see PLAN.md's Servo -> litehtml migration
-# section). litehtml's `cc`-crate build compiles straight through
-# visualstudio2022buildtools' MSVC toolchain (cl.exe/link.exe), the same
-# toolchain rustup/cargo already need on Windows, so nothing extra is
-# required for it specifically. git is kept since nothing here has actually
-# confirmed cargo's own git-fetching (used for the `litehtml` git
-# dependency) works without a system git binary on Windows -- it was proven
-# unnecessary on Linux during this cleanup, but not re-verified here.
+# Install build dependencies via Chocolatey. litehtml's `cc`-crate build
+# compiles straight through visualstudio2022buildtools' MSVC toolchain
+# (cl.exe/link.exe), the same toolchain rustup/cargo already need on Windows,
+# so nothing extra is required for it specifically. git is kept since nothing
+# here has confirmed cargo's own git-fetching (used for the `litehtml` git
+# dependency) works without a system git binary on Windows.
 RUN choco install -y `
     visualstudio2022buildtools `
     visualstudio2022-workload-vctools `

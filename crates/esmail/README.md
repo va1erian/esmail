@@ -1,9 +1,9 @@
 # esmail
 
-An IMAP/SMTP mail client built on `egui` and the Servo browser engine (via
-`egui-servo-webview`, this workspace's other crate). See `../../PLAN.md` for
-the full design and phase-by-phase status, and `../../HANDOFF.md` for how to
-build, run, and verify changes.
+An IMAP/SMTP mail client built on `egui` and litehtml (via
+`egui-litehtml-webview`, this workspace's other crate). See `../../PLAN.md` for
+the design and open work, and `../../HANDOFF.md` for how to build, run, and
+verify changes.
 
 **Internal to this workspace.** Not published to crates.io.
 
