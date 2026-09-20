@@ -276,15 +276,16 @@ fn separator(prev: &TextRun, next: &TextRun, saw_space: bool) -> &'static str {
 mod tests {
     use super::*;
     use crate::text_runs::TextRunTable;
-    use litehtml::pixbuf::PixbufContainer;
-    use litehtml::Document;
 
-    fn table_for(html: &str, width: f32) -> TextRunTable {
-        let mut container = PixbufContainer::new_with_scale(width as u32, 600, 1.0);
-        let measure = container.text_measure_fn();
-        let mut doc = Document::from_html(html, &mut container, None, None).unwrap();
-        let _ = doc.render(width);
-        TextRunTable::collect(&doc, &measure)
+    /// The engine lays pages out under the email master stylesheet, which zeroes
+    /// paragraph margins and cell padding; these tests are about the gaps
+    /// between blocks and cells, so put browser-like spacing back.
+    const SPACING: &str = "<style>p{margin:1em 0 !important}td,th{padding:1px !important}</style>";
+
+    fn table_for(html: &str, width: f32) -> std::sync::Arc<TextRunTable> {
+        let mut engine = crate::painter::PainterEngine::new(&egui::Context::default());
+        engine.draw_pass(&format!("{SPACING}{html}"), width, 1.0).expect("parses");
+        engine.runs.clone()
     }
 
     /// The text `select_all` would copy.

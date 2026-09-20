@@ -1,4 +1,4 @@
-//! Font handling for the [`Backend::Painter`](crate::Backend) engine: turning
+//! Font handling for the painter engine: turning
 //! a CSS `font-family` list + weight + style into something egui can draw.
 //!
 //! egui knows nothing about system fonts, and its [`FontId`] has no weight or
@@ -7,10 +7,7 @@
 //! * [`fontdb`] finds faces on the system and applies the CSS font-matching
 //!   rules (nearest weight, italic -> oblique -> normal). Every entry of the
 //!   `font-family` list is tried in order; the faces found become that text's
-//!   *chain*. (The Pixbuf backend hands the whole comma-separated list to
-//!   cosmic-text as a single family name, which matches nothing, so mail
-//!   written for `Arial, Helvetica, sans-serif` falls back to the platform
-//!   default face instead.)
+//!   *chain*.
 //! * `fontdb` only indexes each family's *typographic* name (`Segoe UI`), but
 //!   CSS authors write the legacy, style-linked names those faces also carry
 //!   (`Segoe UI Semibold`, `Calibri Light`, `Open Sans Light`). Those are looked
@@ -580,8 +577,8 @@ mod tests {
     #[test]
     fn a_family_list_resolves_to_its_first_installed_family_not_the_platform_default() {
         let mut b = book();
-        // The whole point versus PixbufContainer: `Arial,Helvetica,sans-serif`
-        // must measure like `Arial` where Arial is installed.
+        // `Arial,Helvetica,sans-serif` must measure like `Arial` where Arial is
+        // installed.
         let list = b.resolve("Arial,Helvetica,sans-serif", 400, false);
         let single = b.resolve("Arial", 400, false);
         let unknown = b.resolve("No Such Font Anywhere", 400, false);

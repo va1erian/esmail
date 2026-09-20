@@ -1,6 +1,5 @@
-//! The [`Backend::Painter`](crate::Backend) engine: litehtml's layout is
-//! recorded as a **display list** and painted with [`egui::Painter`] every
-//! frame, instead of being rasterized into a bitmap by tiny-skia.
+//! The rendering engine: litehtml's layout is recorded as a **display list**
+//! and painted with [`egui::Painter`] every frame.
 //!
 //! # Shape of it
 //!
@@ -15,15 +14,15 @@
 //!   onto white (a white rect is painted first), and text stays crisp at any
 //!   `pixels_per_point`.
 //!
-//! # Where it deliberately differs from the Pixbuf backend
+//! # What it does and does not draw
 //!
-//! Better: CSS `font-family` lists are resolved (see [`crate::fonts`]),
+//! CSS `font-family` lists are resolved (see [`crate::fonts`]),
 //! `text-decoration` (underlines on links!) is drawn, uniform rounded borders
-//! are drawn as rounded borders, `vh` units resolve against a stable viewport.
-//! Worse: overflow clips ignore their border radius (egui clip rects are
+//! are drawn as rounded borders, and `vh` units resolve against a stable
+//! viewport. Overflow clips ignore their border radius (egui clip rects are
 //! rectangles), gradients on rounded boxes are painted square, conic gradients
-//! fall back to their first colour (as in Pixbuf), and only solid / dashed /
-//! dotted border styles exist.
+//! fall back to their first colour, and only solid / dashed / dotted border
+//! styles exist.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -42,12 +41,10 @@ use litehtml::{
 };
 
 use crate::fonts::{FAMILY_PREFIX, FONT_PREFIX, FontBook};
-use crate::{Engine, Output, TextRunTable};
+use crate::{Output, TextRunTable};
 
-/// Height reported to litehtml as the viewport's. See the Pixbuf backend's
-/// `INITIAL_CANVAS_HEIGHT` for why `vh` is a problem there; here it is simply
-/// a fixed, plausible window height, so `60vh` means the same thing on every
-/// render.
+/// Height reported to litehtml as the viewport's: a fixed, plausible window
+/// height, so `60vh` means the same thing on every render.
 const VIEWPORT_HEIGHT: f32 = 800.0;
 
 /// Most tiles of a repeated background image drawn along one axis / in total.
@@ -114,7 +111,7 @@ pub(crate) struct DisplayList {
     pub size: Vec2,
 }
 
-/// What the worker sends the UI for the Painter backend.
+/// What the worker sends the UI for one pass of a page.
 pub(crate) struct ListFrame {
     pub id: u64,
     pub list: Arc<DisplayList>,
@@ -365,7 +362,7 @@ fn stop_lines(lo: f32, hi: f32, origin: f32, delta: f32, stops: &Stops) -> Vec<f
     v
 }
 
-// ─── Image tiling (ported from litehtml-rs's PixbufContainer::draw_image) ───
+// ─── Image tiling (ported from litehtml-rs's `PixbufContainer::draw_image`) ──
 
 /// Origins along one axis of every tile of a background of `size` starting at
 /// `origin` that could be visible in `[clip_start, clip_end)`.
@@ -605,7 +602,7 @@ impl DocumentContainer for PainterContainer {
             ListStyleType::Square => {
                 self.cmds.push(Cmd::Rect { rect: rect_of(&pos), radius: CornerRadius::ZERO, fill: color });
             }
-            // Numbered / lettered: the same "N." text the Pixbuf backend draws.
+            // Numbered / lettered: "N." text.
             _ => self.push_text(&format!("{}.", marker.index()), marker.font(), marker.color(), pos, false),
         }
     }
@@ -698,8 +695,9 @@ impl DocumentContainer for PainterContainer {
         let rect = rect_of(&b);
         // litehtml's gradient line is in document coordinates already (it adds
         // the layer's origin box itself). Adding the box origin again -- as
-        // `PixbufContainer` does -- pushes the line out of any box that is not
-        // at the document's (0, 0), and the gradient clamps to a flat colour.
+        // litehtml-rs's `PixbufContainer` does -- would push the line out of
+        // any box that is not at the document's (0, 0), and the gradient would
+        // clamp to a flat colour.
         let (s, e) = (gradient.start(), gradient.end());
         let start = pos2(s.x, s.y);
         let d = pos2(e.x, e.y) - start;
@@ -748,7 +746,7 @@ impl DocumentContainer for PainterContainer {
     }
 
     fn draw_conic_gradient(&mut self, _hdc: DrawContext, layer: &BackgroundLayer, gradient: &ConicGradient) {
-        // Same fallback as the Pixbuf backend: the first colour.
+        // Unsupported: fall back to the first colour.
         if let Some(p) = gradient.color_points().first() {
             self.fill(layer, p.color);
         }
@@ -759,7 +757,7 @@ impl DocumentContainer for PainterContainer {
         let sides = [&borders.top, &borders.right, &borders.bottom, &borders.left];
 
         // One colour and width all round, with rounded corners: a real
-        // rounded outline (Pixbuf draws four square edges and no radius).
+        // rounded outline.
         if is_rounded(&borders.radius)
             && sides.iter().all(|s| drawn(s) && solid_like(s.style) && s.width == borders.top.width && same_color(s.color, borders.top.color))
         {
@@ -873,30 +871,34 @@ impl DocumentContainer for PainterContainer {
 pub(crate) struct PainterEngine {
     container: PainterContainer,
     /// The text of the page as of the last draw pass; sent with each frame.
-    runs: Arc<TextRunTable>,
+    pub(crate) runs: Arc<TextRunTable>,
 }
 
 impl PainterEngine {
     pub(crate) fn new(ctx: &egui::Context) -> Self {
         Self { container: PainterContainer::new(ctx), runs: Arc::default() }
     }
-}
 
-impl Engine for PainterEngine {
-    fn clear_pending_images(&mut self) {
+    /// Forget which image URLs were already requested.
+    pub(crate) fn clear_pending_images(&mut self) {
         self.container.pending_images.clear();
         self.container.requested_images.clear();
     }
 
-    fn take_pending_images(&mut self) -> Vec<(String, bool)> {
+    /// Image URLs layout discovered that are not loaded yet.
+    pub(crate) fn take_pending_images(&mut self) -> Vec<(String, bool)> {
         std::mem::take(&mut self.container.pending_images)
     }
 
-    fn load_image_data(&mut self, url: &str, bytes: &[u8]) {
+    /// Decode `bytes` and remember them as the image at `url`.
+    pub(crate) fn load_image_data(&mut self, url: &str, bytes: &[u8]) {
         self.container.load_image_data(url, bytes);
     }
 
-    fn draw_pass(&mut self, html: &str, width: f32, scale: f32) -> Option<f32> {
+    /// Lay the document out at `width` points and record it from scratch.
+    /// Returns the content height in points, or `None` if the HTML could not
+    /// be parsed.
+    pub(crate) fn draw_pass(&mut self, html: &str, width: f32, scale: f32) -> Option<f32> {
         self.container.begin(width, scale);
         // Captured before the `Document` takes its mutable borrow.
         let measure = self.container.text_measure_fn();
@@ -924,21 +926,24 @@ impl Engine for PainterEngine {
         Some(height)
     }
 
-    fn frame(&mut self, id: u64, width: f32, scale: f32, content_height: f32, _max_texture_side: usize) -> Option<Output> {
+    /// What the UI needs to show the last `draw_pass`.
+    pub(crate) fn frame(&mut self, id: u64, width: f32, scale: f32, content_height: f32) -> Output {
         let cmds = std::mem::take(&mut self.container.cmds);
         let families = self.container.families.iter().cloned().collect();
         let defs = self.container.book.borrow_mut().definitions();
-        Some(Output::List(ListFrame {
+        Output::List(ListFrame {
             id,
             list: Arc::new(DisplayList { cmds, families, size: vec2(width, content_height) }),
             defs,
             layout_width: width,
             scale,
             runs: self.runs.clone(),
-        }))
+        })
     }
 
-    fn hit_test(&mut self, html: &str, width: f32, scale: f32, x: f32, y: f32) -> Option<String> {
+    /// The anchor URL under document-local `(x, y)` (points), if any. A full
+    /// parse + layout: no `Document` is kept between jobs (see the crate docs).
+    pub(crate) fn hit_test(&mut self, html: &str, width: f32, scale: f32, x: f32, y: f32) -> Option<String> {
         self.container.begin(width, scale);
         let Ok(mut doc) = Document::from_html(html, &mut self.container, None, Some(EMAIL_MASTER_CSS)) else {
             return None;
@@ -967,7 +972,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut engine = PainterEngine::new(&ctx);
         let height = engine.draw_pass(html, 300.0, 1.0).expect("parses");
-        let Some(Output::List(frame)) = engine.frame(1, 300.0, 1.0, height, 2048) else { panic!("no list frame") };
+        let Output::List(frame) = engine.frame(1, 300.0, 1.0, height) else { panic!("no list frame") };
         Rendered { list: frame.list, engine }
     }
 
@@ -1124,7 +1129,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         engine.load_image_data(&pending[0].0, &litehtml::html::decode_data_uri(&pending[0].0).unwrap());
         let h = engine.draw_pass(&html, 300.0, 1.0).unwrap();
-        let Some(Output::List(frame)) = engine.frame(1, 300.0, 1.0, h, 2048) else { panic!() };
+        let Output::List(frame) = engine.frame(1, 300.0, 1.0, h) else { panic!() };
         let Some(Cmd::Image { rect, .. }) = frame.list.cmds.iter().find(|c| matches!(c, Cmd::Image { .. })) else {
             panic!("no image cmd")
         };
@@ -1141,8 +1146,8 @@ mod tests {
 
     #[test]
     fn a_font_family_list_measures_like_its_first_installed_family() {
-        // The Pixbuf backend measures `Arial,sans-serif` with the platform
-        // fallback; here it must be Arial's width.
+        // A list like `Arial,sans-serif` must measure as Arial's width, not
+        // as some platform fallback.
         let ctx = egui::Context::default();
         let mut c = PainterContainer::new(&ctx);
         let width_in = |c: &mut PainterContainer, family: &str| {
