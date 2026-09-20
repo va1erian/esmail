@@ -180,16 +180,21 @@ impl TextRunTable {
     pub fn selection_rects(&self, sel: &Selection) -> Vec<Rect> {
         let (start, end) = sel.ordered();
         let mut out: Vec<Rect> = Vec::new();
-        for i in start.run..=end.run.min(self.runs.len().saturating_sub(1)) {
+        let Some(last_run) = self.runs.len().checked_sub(1) else {
+            return out;
+        };
+        // A selection that no longer fits the table (which the view prevents,
+        // but a panic here would abort the app) paints nothing.
+        for i in start.run..=end.run.min(last_run) {
             let run = &self.runs[i];
             let from = if i == start.run { start.ch } else { 0 };
-            let to = if i == end.run { end.ch } else { run.char_count() };
+            let to = (if i == end.run { end.ch } else { run.char_count() }).min(run.char_count());
             if from >= to {
                 continue;
             }
             let rect = Rect::from_min_max(
                 egui::pos2(run.rect.min.x + run.offsets[from], run.rect.min.y),
-                egui::pos2(run.rect.min.x + run.offsets[to.min(run.char_count())], run.rect.max.y),
+                egui::pos2(run.rect.min.x + run.offsets[to], run.rect.max.y),
             );
             let extends_last = out.last().is_some_and(|last| {
                 (last.center().y - rect.center().y).abs() < rect.height() * SAME_LINE
@@ -215,9 +220,12 @@ impl TextRunTable {
     pub fn selection_text(&self, sel: &Selection) -> String {
         let (start, end) = sel.ordered();
         let mut out = String::new();
+        let Some(last_run) = self.runs.len().checked_sub(1) else {
+            return out;
+        };
         let mut prev: Option<&TextRun> = None;
         let mut saw_space = false;
-        for i in start.run..=end.run.min(self.runs.len().saturating_sub(1)) {
+        for i in start.run..=end.run.min(last_run) {
             let run = &self.runs[i];
             let from = if i == start.run { start.ch } else { 0 };
             let to = if i == end.run { end.ch } else { run.char_count() };
@@ -481,6 +489,23 @@ mod tests {
         let back = Selection { anchor: sel.head, head: sel.anchor };
         assert_eq!(t.selection_text(&back), "pha beta gam");
         assert_eq!(t.selection_rects(&back), t.selection_rects(&sel));
+    }
+
+    #[test]
+    fn a_stale_selection_paints_and_copies_nothing_instead_of_panicking() {
+        let t = table_for("<body><p>abc</p></body>", 300.0);
+        let stale = Selection {
+            anchor: TextPos { run: 40, ch: 3 },
+            head: TextPos { run: 50, ch: 9 },
+        };
+        assert!(t.selection_rects(&stale).is_empty());
+        assert_eq!(t.selection_text(&stale), "");
+        // Past the end of a run that does exist.
+        let long = Selection { anchor: TextPos { run: 0, ch: 1 }, head: TextPos { run: 0, ch: 99 } };
+        assert_eq!(t.selection_rects(&long).len(), 1);
+        let empty = TextRunTable::default();
+        assert!(empty.selection_rects(&long).is_empty());
+        assert_eq!(empty.selection_text(&long), "");
     }
 
     #[test]
