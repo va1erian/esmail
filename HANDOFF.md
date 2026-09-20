@@ -85,13 +85,42 @@ Check with `cargo build --workspace` and `cargo test --workspace --
 --include-ignored` (with `ESMAIL_TEST_CA_TRUSTED=1`). Last full run
 (2026-09-19): 176 tests passing.
 
-## In progress: #36, text selection and copy
+## #36: text selection and copy (mostly landed)
 
-Full design in the issue. Chosen approach (its option A): during the render
-pass, while the `Document` is alive, record a table of text runs (rect in
-document points, text, font info) and ship it to the UI thread with the frame.
-Hit-testing, drag, highlight and copy then work from that table with no
-`Document`. Link rectangles (#27) share the same plumbing.
-Increments: 1. run table; 2. click/drag/double-click + overlay highlight;
-3. copy, select-all, focus model; 4. auto-scroll, hover cursor; 5. keep the
-selection across re-layout. See git log for which have landed.
+Design: while the render worker has the `Document` alive it records a
+`TextRunTable` (one run per word: box, text, per-character x offsets, block,
+forced breaks) and ships it with each frame (`text_runs.rs`). Everything else
+is plain geometry on the UI thread (`selection.rs`, and `WebView::interact` in
+the webview `lib.rs`): no `Document`, no per-move layout. See the module docs
+of those files and the issue.
+
+Landed: drag select (a drag that starts on a link selects; a plain click still
+opens it), double-click word, triple-click paragraph, shift-click extend,
+highlight painted by egui over the tiles, I-beam cursor over text, auto-scroll
+while dragging past the top/bottom edge, Ctrl+C / Ctrl+A only while the view has
+egui focus (so the search box and compose fields keep theirs), a Copy / Select
+all context menu, and the selection surviving a re-layout of the same text.
+Copies read as paragraphs with blank lines, list items and rows on their own
+lines, and wrapped lines joined; verified on the Meilleurtaux fixture.
+
+Things learned that are not obvious from the code:
+
+- litehtml lays "preheader" text (hidden with `font-size:1px`, not `display:none`)
+  out as a ~2 pt box, so runs shorter than 4 pt are dropped.
+- Whitespace between tags arrives as runs with raw `"
+"`/nbsp text and stray
+  boxes at the left margin; run text is normalised to plain spaces and blank
+  runs are never highlighted.
+- A `<br>` is a childless element with a 0x0 box and no inline boxes; a newline
+  in `<pre>` is a zero-width text element. Geometry alone cannot tell a `<br>`
+  from a soft wrap, so forced breaks are counted at collection time.
+- egui reports a drag only after the pointer has moved a few points; the
+  anchor must come from `press_origin()`, not the position at `drag_started`.
+- Building the table costs ~26 ms on a ~220 ms release render of the
+  Meilleurtaux fixture (per-character measuring); it shrinks with #28.
+
+Not done: hand cursor over links and "Copy link address" (need link rectangles,
+the same table work as #27), keeping a selection across a re-layout that
+changes the words (only identical text is kept), and no manual check on a real
+window with a real mouse yet (the tests drive synthetic egui input; a
+screenshot with everything selected looked right).

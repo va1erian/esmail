@@ -37,9 +37,11 @@ The UI thread sends jobs (render, hit test) and uploads finished frames.
 - The frame is cut into tiles no larger than the GPU's `max_texture_side`, so
   tall messages display.
 - A litehtml `Document` borrows the container and cannot be stored, so it is
-  built, used and dropped inside one worker call. This is why link hit tests
-  re-layout (#27) and why text selection needs data gathered during the render
-  pass (#36).
+  built, used and dropped inside one worker call. Link hit tests therefore
+  re-layout (#27), and text selection works from a `TextRunTable` recorded
+  during the render pass and sent with each frame (word boxes, per-character
+  offsets, block and forced-break info): selection, highlight and copy are
+  geometry on the UI thread.
 - Every draw pass starts from a cleared canvas; the canvas only grows (seeded
   at 4000 px) because a taller page forces a second parse + layout.
 - Layout speed depends on litehtml-rs `master` (table-cell measurement
@@ -75,7 +77,7 @@ The UI thread sends jobs (render, hit test) and uploads finished frames.
 
 | # | What |
 |---|---|
-| #36 | Text selection and copy in message bodies (in progress; see HANDOFF.md) |
+| #36 | Text selection and copy: landed except link cursor / "Copy link address" (needs the #27 link table); see HANDOFF.md |
 | #35 | Multiple accounts in one session, new-mail watching for each |
 | #34 | Compose in a dedicated native window |
 | #32 | Umbrella: render-time breakdown and the path to sub-second |

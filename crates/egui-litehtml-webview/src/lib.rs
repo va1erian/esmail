@@ -41,6 +41,20 @@
 //! across jobs) and builds a `Document` fresh for each pass, dropping it
 //! straight after.
 //!
+//! # Text selection without a `Document`
+//!
+//! Selecting text needs the page's text and geometry long after the
+//! `Document` is gone, so the worker records them while it is alive: every
+//! draw pass walks the laid-out document once and sends a [`TextRunTable`]
+//! (one run per word: box, text, per-character x offsets, containing block,
+//! forced line breaks) with the frame. Hit-testing, dragging, double/triple
+//! click, the highlight (painted by egui over the tiles, never into them) and
+//! the copied text are all plain geometry over that table on the UI thread,
+//! so nothing re-lays-out per pointer move. A selection is two carets (run
+//! index + character); it survives a re-layout of the same text (resize,
+//! images arriving) and is dropped when a different page loads. Ctrl+C and
+//! Ctrl+A act only while the view has egui focus, so text fields keep theirs.
+//!
 //! # Render sequence (one `Render` job)
 //!
 //! 1. **Draw** into a cleared canvas: build a `Document`, `render()` it at
@@ -291,6 +305,8 @@ impl WebViewHost {
             rendering: false,
             failed: spawned.is_err(),
             runs: Arc::default(),
+            runs_signature: 0,
+            selection: None,
         }
     }
 }
@@ -366,6 +382,11 @@ pub struct WebView {
     failed: bool,
     /// Where the text is in the current frame (see [`TextRunTable`]).
     runs: Arc<TextRunTable>,
+    /// Identifies the text `runs` holds (not where it is), so a selection can
+    /// be kept when only the layout changed.
+    runs_signature: u64,
+    /// The selected text, as carets into `runs`.
+    selection: Option<Selection>,
 }
 
 impl WebView {
@@ -383,6 +404,8 @@ impl WebView {
         self.html = Arc::new(html);
         self.textures.clear();
         self.runs = Arc::default();
+        self.runs_signature = 0;
+        self.selection = None;
         self.failed = false;
         // Invalidate whatever the worker is (or has just finished) rendering
         // for the *previous* page right now, not when `show()` next submits
@@ -470,7 +493,7 @@ impl WebView {
                     }
                     return;
                 }
-                let (rect, resp) = ui.allocate_exact_size(self.frame_size, egui::Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(self.frame_size, egui::Sense::click_and_drag());
                 let clip = ui.clip_rect();
                 let scale = self.frame_scale;
                 for tile in &self.textures {
@@ -489,20 +512,178 @@ impl WebView {
                     }
                 }
 
-                if resp.clicked() {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        let _ = self.tx.send(Job::HitTest(HitTestJob {
-                            html: self.html.clone(),
-                            width: self.frame_layout_width,
-                            scale: self.frame_scale,
-                            x: pos.x - rect.left(),
-                            y: pos.y - rect.top(),
-                        }));
-                    }
-                }
+                self.paint_selection(ui, rect);
+                self.interact(ui, &resp, rect);
             });
 
         events
+    }
+
+    /// The selected text, as a copy should read, or `None` if nothing is
+    /// selected.
+    pub fn selected_text(&self) -> Option<String> {
+        let sel = self.selection.filter(|s| !s.is_empty())?;
+        Some(self.runs.selection_text(&sel)).filter(|t| !t.is_empty())
+    }
+
+    /// Whether any text is selected.
+    pub fn has_selection(&self) -> bool {
+        self.selected_text().is_some()
+    }
+
+    /// Select all the text of the page.
+    pub fn select_all(&mut self) {
+        self.selection = self.runs.select_all();
+    }
+
+    /// Drop the selection.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    // ── Private: selection ───────────────────────────────────────────────
+
+    /// Draw the highlight over the picture. It is painted by egui on top of
+    /// the tiles, not into them, so moving the selection never re-renders or
+    /// re-uploads the page. Points in the run table are document points,
+    /// which are also egui points relative to the picture's corner.
+    fn paint_selection(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let Some(sel) = self.selection.filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let clip = ui.clip_rect();
+        // The page is always white, so a translucent fill keeps the text
+        // legible underneath, whatever the app theme.
+        let color = ui.visuals().selection.bg_fill.gamma_multiply(0.55);
+        for r in self.runs.selection_rects(&sel) {
+            let r = r.translate(rect.min.to_vec2());
+            if r.intersects(clip) {
+                ui.painter().rect_filled(r, 0.0, color);
+            }
+        }
+    }
+
+    /// Pointer and keyboard handling for the picture at `rect`.
+    fn interact(&mut self, ui: &mut egui::Ui, resp: &egui::Response, rect: egui::Rect) {
+        let to_doc = |pos: egui::Pos2| (pos - rect.min).to_pos2();
+        let shift = ui.input(|i| i.modifiers.shift);
+
+        if resp.hovered() || resp.dragged() {
+            let over_text = ui
+                .input(|i| i.pointer.hover_pos())
+                .is_some_and(|p| self.runs.is_text_at(to_doc(p)));
+            if over_text || resp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            }
+        }
+
+        // A drag that starts anywhere (a link included) selects.
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            resp.request_focus();
+            // egui reports a drag only once the pointer has moved a few points,
+            // so the anchor is where the button went down, not where it is.
+            let origin = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
+            if let Some(at) = origin.and_then(|p| self.runs.pos_at(to_doc(p))) {
+                match self.selection {
+                    Some(sel) if shift => self.selection = Some(Selection { anchor: sel.anchor, head: at }),
+                    _ => self.selection = Some(Selection::caret(at)),
+                }
+            }
+        } else if resp.dragged_by(egui::PointerButton::Primary) {
+            if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+                if let (Some(sel), Some(at)) = (self.selection, self.runs.pos_at(to_doc(pos))) {
+                    self.selection = Some(Selection { anchor: sel.anchor, head: at });
+                    // Dragging past the top or bottom edge keeps scrolling:
+                    // bring the caret's line into view. The pointer stays put
+                    // while the page moves, so ask for another frame.
+                    let clip = ui.clip_rect();
+                    if pos.y < clip.min.y || pos.y > clip.max.y {
+                        let line = self.runs.runs[at.run].rect.translate(rect.min.to_vec2());
+                        ui.scroll_to_rect(line.expand2(egui::vec2(0.0, line.height())), None);
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+        }
+
+        if resp.clicked_by(egui::PointerButton::Primary) {
+            resp.request_focus();
+            if resp.triple_clicked() {
+                self.select_at(resp, rect, |runs, p| runs.block_at(p));
+            } else if resp.double_clicked() {
+                self.select_at(resp, rect, |runs, p| runs.word_at(p));
+            } else if shift && self.selection.is_some() {
+                // Shift-click extends from where the selection began.
+                if let (Some(sel), Some(at)) = (
+                    self.selection,
+                    resp.interact_pointer_pos().and_then(|p| self.runs.pos_at(to_doc(p))),
+                ) {
+                    self.selection = Some(Selection { anchor: sel.anchor, head: at });
+                }
+            } else {
+                self.selection = None;
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let _ = self.tx.send(Job::HitTest(HitTestJob {
+                        html: self.html.clone(),
+                        width: self.frame_layout_width,
+                        scale: self.frame_scale,
+                        x: pos.x - rect.left(),
+                        y: pos.y - rect.top(),
+                    }));
+                }
+            }
+        }
+
+        // A click anywhere else takes the selection with it.
+        if ui.input(|i| i.pointer.any_pressed()) && !resp.contains_pointer() && !resp.context_menu_opened() {
+            self.selection = None;
+        }
+
+        // Keyboard: only while this view has focus, so the search box and the
+        // compose fields keep their own Ctrl+C / Ctrl+A.
+        if resp.has_focus() {
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
+                self.select_all();
+            }
+            let copy = ui.input_mut(|i| {
+                let n = i.events.len();
+                i.events.retain(|e| !matches!(e, egui::Event::Copy));
+                i.events.len() != n
+            });
+            if copy {
+                self.copy_selection(ui.ctx());
+            }
+        }
+
+        resp.context_menu(|ui| {
+            if ui.add_enabled(self.has_selection(), egui::Button::new("Copy")).clicked() {
+                self.copy_selection(ui.ctx());
+                ui.close();
+            }
+            if ui.button("Select all").clicked() {
+                self.select_all();
+                ui.close();
+            }
+        });
+    }
+
+    /// Select whatever `pick` chooses at the pointer.
+    fn select_at(
+        &mut self,
+        resp: &egui::Response,
+        rect: egui::Rect,
+        pick: impl Fn(&TextRunTable, egui::Pos2) -> Option<Selection>,
+    ) {
+        if let Some(p) = resp.interact_pointer_pos() {
+            self.selection = pick(&self.runs, (p - rect.min).to_pos2());
+        }
+    }
+
+    /// Put the selection on the clipboard.
+    fn copy_selection(&self, ctx: &egui::Context) {
+        if let Some(text) = self.selected_text() {
+            ctx.copy_text(text);
+        }
     }
 
     // ── Private: talking to the worker ───────────────────────────────────
@@ -543,6 +724,15 @@ impl WebView {
                     self.frame_layout_width = frame.layout_width;
                     self.frame_scale = frame.scale;
                     self.runs = frame.runs;
+                    // A new layout of the same text (a resize, images
+                    // arriving) keeps the selection: carets are run indexes,
+                    // and the same words come out in the same order. Different
+                    // text (another message) cannot.
+                    let signature = self.runs.text_signature();
+                    if signature != self.runs_signature {
+                        self.selection = None;
+                        self.runs_signature = signature;
+                    }
                     self.textures.truncate(frame.tiles.len());
                     for (i, tile) in frame.tiles.into_iter().enumerate() {
                         match self.textures.get_mut(i) {
@@ -1491,5 +1681,345 @@ mod tests {
         }
         assert!(!view.textures.is_empty());
         assert!(!view.failed);
+    }
+
+    // ── Selection interaction, driven with synthetic egui input ─────────
+
+    /// A view in a headless egui context that tests poke with pointer and
+    /// keyboard events, one frame at a time.
+    struct Harness {
+        ctx: egui::Context,
+        view: WebView,
+        /// Where the picture's top-left corner is on screen (with no scroll).
+        origin: egui::Pos2,
+        time: f64,
+        /// The modifier keys currently held.
+        modifiers: egui::Modifiers,
+        /// Everything the frames asked the platform to do (clipboard...).
+        commands: Vec<egui::OutputCommand>,
+        /// Link clicks the view reported.
+        links: Vec<String>,
+        /// An egui text field shown above the view, to test focus.
+        field: Option<String>,
+        field_id: egui::Id,
+    }
+
+    const SCREEN: egui::Vec2 = egui::vec2(400.0, 300.0);
+
+    impl Harness {
+        fn new(html: &str, with_field: bool) -> Self {
+            let ctx = egui::Context::default();
+            let view = WebViewHost::new().new_view(&ctx, WebViewConfig::new(WebViewSource::Html(html.to_string())));
+            let mut h = Self {
+                ctx,
+                view,
+                origin: egui::Pos2::ZERO,
+                time: 1.0,
+                modifiers: egui::Modifiers::NONE,
+                commands: Vec::new(),
+                links: Vec::new(),
+                field: with_field.then(String::new),
+                field_id: egui::Id::new("test-field"),
+            };
+            h.settle();
+            h
+        }
+
+        /// Run frames until the view has finished rendering.
+        fn settle(&mut self) {
+            self.frame(vec![], egui::Modifiers::NONE);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while self.view.is_rendering() {
+                assert!(Instant::now() < deadline, "render never finished");
+                std::thread::sleep(Duration::from_millis(10));
+                self.frame(vec![], egui::Modifiers::NONE);
+            }
+            self.frame(vec![], egui::Modifiers::NONE);
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>, modifiers: egui::Modifiers) {
+            self.time += 0.05;
+            let mut events = events;
+            if modifiers != self.modifiers {
+                events.insert(0, egui::Event::ModifiersChanged(modifiers));
+                self.modifiers = modifiers;
+            }
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let view = &mut self.view;
+            let field = &mut self.field;
+            let field_id = self.field_id;
+            let mut origin = self.origin;
+            let mut links = Vec::new();
+            let mut out = self.ctx.run_ui(input, |ui| {
+                if let Some(text) = field {
+                    ui.add(egui::TextEdit::singleline(text).id(field_id));
+                }
+                origin = ui.cursor().min;
+                for e in view.show(ui) {
+                    let WebViewEvent::LinkClicked(url) = e;
+                    links.push(url);
+                }
+            });
+            self.origin = origin;
+            self.links.extend(links);
+            out.textures_delta.clear();
+            self.commands.extend(out.platform_output.commands);
+        }
+
+        /// Screen position of a point in document space.
+        fn at(&self, doc: egui::Pos2) -> egui::Pos2 {
+            self.origin + doc.to_vec2()
+        }
+
+        fn run(&self, text: &str) -> TextRun {
+            self.view
+                .text_runs()
+                .runs
+                .iter()
+                .find(|r| r.text == text)
+                .unwrap_or_else(|| panic!("no run {text:?}"))
+                .clone()
+        }
+
+        /// The screen position just inside a word's left / right edge, and its middle.
+        fn left_of(&self, text: &str) -> egui::Pos2 {
+            self.at(self.run(text).rect.left_center() + egui::vec2(1.0, 0.0))
+        }
+
+        fn right_of(&self, text: &str) -> egui::Pos2 {
+            self.at(self.run(text).rect.right_center() - egui::vec2(1.0, 0.0))
+        }
+
+        fn middle_of(&self, text: &str) -> egui::Pos2 {
+            self.at(self.run(text).rect.center())
+        }
+
+        fn button(&mut self, pos: egui::Pos2, pressed: bool, modifiers: egui::Modifiers) {
+            self.frame(
+                vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers }],
+                modifiers,
+            );
+        }
+
+        fn move_to(&mut self, pos: egui::Pos2) {
+            self.frame(vec![egui::Event::PointerMoved(pos)], egui::Modifiers::NONE);
+        }
+
+        fn click(&mut self, pos: egui::Pos2) {
+            self.move_to(pos);
+            self.button(pos, true, egui::Modifiers::NONE);
+            self.button(pos, false, egui::Modifiers::NONE);
+        }
+
+        /// Press at `from`, drag through a few points to `to`, release.
+        fn drag(&mut self, from: egui::Pos2, to: egui::Pos2) {
+            self.move_to(from);
+            self.button(from, true, egui::Modifiers::NONE);
+            for i in 1..=4 {
+                self.move_to(from + (to - from) * (i as f32 / 4.0));
+            }
+            self.button(to, false, egui::Modifiers::NONE);
+        }
+
+        fn copied(&self) -> Vec<String> {
+            self.commands
+                .iter()
+                .filter_map(|c| match c {
+                    egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn selected(&self) -> Option<String> {
+            self.view.selected_text()
+        }
+
+        /// The vertical scroll offset of the view's scroll area.
+        fn scroll_offset(&self) -> f32 {
+            let mut y = 0.0;
+            let name = self.view.texture_name.clone();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+                ..Default::default()
+            };
+            let _ = self.ctx.run_ui(input, |ui| {
+                let id = ui.make_persistent_id(egui::IdSalt::new(&name));
+                y = egui::scroll_area::State::load(ui.ctx(), id).map_or(0.0, |s| s.offset.y);
+            });
+            y
+        }
+    }
+
+    const TWO_PARAS: &str = r#"<body style="margin:0"><p style="margin:0 0 20px">alpha beta gamma</p><p style="margin:0">delta epsilon</p></body>"#;
+
+    #[test]
+    fn dragging_across_text_selects_it() {
+        let mut h = Harness::new(TWO_PARAS, false);
+        h.drag(h.left_of("alpha"), h.right_of("gamma"));
+        assert_eq!(h.selected().as_deref(), Some("alpha beta gamma"));
+        assert!(h.view.has_selection());
+
+        // Dragging backwards, into the second paragraph, is the same gesture.
+        h.drag(h.right_of("delta"), h.left_of("alpha"));
+        assert_eq!(h.selected().as_deref(), Some("alpha beta gamma\n\ndelta"));
+    }
+
+    #[test]
+    fn a_drag_starting_on_a_link_selects_instead_of_following_it() {
+        let html = r#"<body style="margin:0"><p style="margin:0"><a href="https://example.com/x">click here now</a></p></body>"#;
+        let mut h = Harness::new(html, false);
+        h.drag(h.left_of("click"), h.right_of("now"));
+        assert_eq!(h.selected().as_deref(), Some("click here now"));
+        // The worker would answer a hit test within moments: give it the chance.
+        std::thread::sleep(Duration::from_millis(500));
+        h.frame(vec![], egui::Modifiers::NONE);
+        assert!(h.links.is_empty(), "a drag must not open the link: {:?}", h.links);
+    }
+
+    #[test]
+    fn a_plain_click_on_a_link_still_reports_it_and_clears_the_selection() {
+        let html = r#"<body style="margin:0"><p style="margin:0"><a href="https://example.com/x">link</a> and other words</p></body>"#;
+        let mut h = Harness::new(html, false);
+        h.drag(h.left_of("words"), h.right_of("words"));
+        assert!(h.view.has_selection());
+        h.click(h.middle_of("link"));
+        assert!(!h.view.has_selection(), "a click elsewhere clears the selection");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.links.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            h.frame(vec![], egui::Modifiers::NONE);
+        }
+        assert_eq!(h.links, vec!["https://example.com/x".to_string()]);
+    }
+
+    #[test]
+    fn double_click_selects_a_word_and_triple_click_the_paragraph() {
+        let mut h = Harness::new(TWO_PARAS, false);
+        let p = h.middle_of("beta");
+        h.click(p);
+        h.click(p);
+        assert_eq!(h.selected().as_deref(), Some("beta"));
+        h.click(p);
+        assert_eq!(h.selected().as_deref(), Some("alpha beta gamma"));
+    }
+
+    #[test]
+    fn shift_click_extends_the_selection() {
+        let mut h = Harness::new(TWO_PARAS, false);
+        let pa = h.middle_of("alpha");
+        h.click(pa);
+        h.click(pa); // double-click: "alpha"
+        assert_eq!(h.selected().as_deref(), Some("alpha"));
+        let shift = egui::Modifiers::SHIFT;
+        let pg = h.right_of("gamma");
+        h.move_to(pg);
+        h.button(pg, true, shift);
+        h.button(pg, false, shift);
+        assert_eq!(h.selected().as_deref(), Some("alpha beta gamma"));
+    }
+
+    #[test]
+    fn copy_puts_the_selection_on_the_clipboard() {
+        let mut h = Harness::new(TWO_PARAS, false);
+        let p = h.middle_of("epsilon");
+        h.click(p);
+        h.click(p);
+        assert!(h.copied().is_empty());
+        h.frame(vec![egui::Event::Copy], egui::Modifiers::NONE);
+        assert_eq!(h.copied(), vec!["epsilon".to_string()]);
+    }
+
+    #[test]
+    fn copy_with_nothing_selected_does_nothing() {
+        let mut h = Harness::new(TWO_PARAS, false);
+        h.click(h.middle_of("delta"));
+        h.frame(vec![egui::Event::Copy], egui::Modifiers::NONE);
+        assert!(h.copied().is_empty());
+    }
+
+    #[test]
+    fn ctrl_a_selects_everything_when_the_view_has_focus() {
+        let mut h = Harness::new(TWO_PARAS, false);
+        h.click(h.middle_of("delta"));
+        let key = egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: Some(egui::Key::A),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        h.frame(vec![key], egui::Modifiers::COMMAND);
+        assert_eq!(h.selected().as_deref(), Some("alpha beta gamma\n\ndelta epsilon"));
+    }
+
+    #[test]
+    fn copy_belongs_to_a_focused_text_field_not_to_the_selection() {
+        let mut h = Harness::new(TWO_PARAS, true);
+        // Select a word in the message...
+        let p = h.middle_of("beta");
+        h.click(p);
+        h.click(p);
+        assert_eq!(h.selected().as_deref(), Some("beta"));
+        // ...then focus the text field and press Ctrl+C.
+        h.ctx.memory_mut(|m| m.request_focus(h.field_id));
+        h.frame(vec![], egui::Modifiers::NONE);
+        h.frame(vec![egui::Event::Copy], egui::Modifiers::NONE);
+        assert!(h.copied().is_empty(), "the message must not steal the copy: {:?}", h.copied());
+    }
+
+    #[test]
+    fn clicking_outside_the_view_clears_the_selection() {
+        let mut h = Harness::new(TWO_PARAS, true);
+        let p = h.middle_of("beta");
+        h.click(p);
+        h.click(p);
+        assert!(h.view.has_selection());
+        // The text field sits above the picture.
+        h.click(egui::pos2(20.0, 5.0));
+        assert!(!h.view.has_selection());
+    }
+
+    #[test]
+    fn the_selection_survives_a_relayout_of_the_same_text_but_not_a_new_page() {
+        let mut h = Harness::new(TWO_PARAS, false);
+        let p = h.middle_of("beta");
+        h.click(p);
+        h.click(p);
+        assert_eq!(h.selected().as_deref(), Some("beta"));
+        // Same text, laid out again (as when images arrive or "reload" runs).
+        h.view.reload();
+        h.settle();
+        assert_eq!(h.selected().as_deref(), Some("beta"));
+        // A different message drops it.
+        h.view.load(WebViewSource::Html("<p>something else</p>".to_string()));
+        assert!(!h.view.has_selection());
+    }
+
+    #[test]
+    fn dragging_below_the_visible_area_scrolls_the_page_and_keeps_selecting() {
+        let many: String = (0..60).map(|i| format!("<p style=\"margin:0 0 10px\">line number {i}</p>")).collect();
+        let mut h = Harness::new(&format!("<body style=\"margin:0\">{many}</body>"), false);
+        assert!(h.view.content_size().unwrap().y > 900.0);
+        assert_eq!(h.scroll_offset(), 0.0);
+        let start = h.left_of("line");
+        h.move_to(start);
+        h.button(start, true, egui::Modifiers::NONE);
+        // Hold the pointer past the bottom edge of the 300pt-tall screen.
+        let below = egui::pos2(start.x + 30.0, SCREEN.y + 30.0);
+        for _ in 0..12 {
+            h.move_to(below);
+        }
+        let offset = h.scroll_offset();
+        assert!(offset > 20.0, "the page did not scroll (offset {offset})");
+        // The selection reaches lines that were never on screen.
+        let selected = h.selected().unwrap();
+        assert!(selected.contains("line number 12"), "{selected:?}");
+        h.button(below, false, egui::Modifiers::NONE);
     }
 }
