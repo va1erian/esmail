@@ -6,6 +6,12 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# The repository's default GITHUB_TOKEN permission is read-only, so the
+# release job has to ask for `contents: write` explicitly -- without it
+# action-gh-release fails with "Resource not accessible by integration".
+permissions:
+  contents: read
+
 jobs:
   build-linux:
     name: Build Linux
@@ -69,6 +75,8 @@ jobs:
     needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     steps:
       - name: Download Linux Artifact
         uses: actions/download-artifact@v4
