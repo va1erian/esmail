@@ -107,8 +107,7 @@ Things learned that are not obvious from the code:
 
 - litehtml lays "preheader" text (hidden with `font-size:1px`, not `display:none`)
   out as a ~2 pt box, so runs shorter than 4 pt are dropped.
-- Whitespace between tags arrives as runs with raw `"
-"`/nbsp text and stray
+- Whitespace between tags arrives as runs with raw newline/nbsp text and stray
   boxes at the left margin; run text is normalised to plain spaces and blank
   runs are never highlighted.
 - A `<br>` is a childless element with a 0x0 box and no inline boxes; a newline
