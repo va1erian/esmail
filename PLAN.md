@@ -27,8 +27,7 @@ Three crates in one workspace:
 ### Webview rendering
 
 Each `WebView` owns a render thread holding the (`!Send`) painter engine.
-The UI thread sends jobs (render, hit test) and paints the finished display
-lists.
+The UI thread sends render jobs and paints the finished display lists.
 
 - Jobs carry an id; superseded jobs are dropped or abandoned between stages and
   the UI ignores frames that are not the newest. `load()` invalidates
@@ -39,11 +38,12 @@ lists.
 - A frame is a display list replayed by egui's painter every frame, culled to
   the visible region, so tall messages cost only what is on screen.
 - A litehtml `Document` borrows the container and cannot be stored, so it is
-  built, used and dropped inside one worker call. Link hit tests therefore
-  re-layout (#27), and text selection works from a `TextRunTable` recorded
-  during the render pass and sent with each frame (word boxes, per-character
-  offsets, block and forced-break info): selection, highlight and copy are
-  geometry on the UI thread.
+  built, used and dropped inside one worker call. Text selection works from a
+  `TextRunTable` recorded during the render pass and sent with each frame (word
+  boxes, per-character offsets, block and forced-break info): selection,
+  highlight and copy are geometry on the UI thread. Links work the same way: a
+  `LinkTable` (`href` + per-line, block and image rectangles of every anchor)
+  answers clicks and the hand cursor with a point-in-rectangle lookup (#27).
 - Layout speed depends on litehtml-rs `master` (table-cell measurement
   memoization; without it layout is exponential in table nesting depth). Do
   not pin `Cargo.toml` to an older commit.
@@ -76,7 +76,7 @@ lists.
 
 | # | What |
 |---|---|
-| #36 | Text selection and copy: landed except link cursor / "Copy link address" (needs the #27 link table); see HANDOFF.md |
+| #36 | Text selection and copy: landed except "Copy link address"; see HANDOFF.md |
 | #35 | Multiple accounts in one session, new-mail watching for each |
 | #34 | Compose in a dedicated native window |
 | #32 | Umbrella: render-time breakdown and the path to sub-second |
@@ -84,7 +84,6 @@ lists.
 | #30 | litehtml-rs: paint fast paths |
 | #29 | litehtml-rs: `draw_text` bypasses the glyph cache |
 | #28 | litehtml-rs: cache text widths in `text_width` |
-| #27 | Link hit test re-lays out the page (needs the same run table as #36) |
 
 Not ticketed:
 

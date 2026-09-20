@@ -2235,7 +2235,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 [[package]]
 name = "litehtml"
 version = "0.2.6"
-source = "git+https://github.com/va1erian/litehtml-rs.git#cda6ec411256ee7f8579ac7389c2a50687d49256"
+source = "git+https://github.com/va1erian/litehtml-rs.git?branch=element-tag-attr#63cdffcb6b9d7998a047de05855d8450233fc1b7"
 dependencies = [
  "base64 0.22.1",
  "encoding_rs",
@@ -2246,7 +2246,7 @@ dependencies = [
 [[package]]
 name = "litehtml-sys"
 version = "0.2.5"
-source = "git+https://github.com/va1erian/litehtml-rs.git#cda6ec411256ee7f8579ac7389c2a50687d49256"
+source = "git+https://github.com/va1erian/litehtml-rs.git?branch=element-tag-attr#63cdffcb6b9d7998a047de05855d8450233fc1b7"
 dependencies = [
  "cc",
 ]

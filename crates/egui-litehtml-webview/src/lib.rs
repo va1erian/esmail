@@ -19,11 +19,9 @@
 //! *on* the worker and never crosses a thread boundary. The UI thread only
 //! ever:
 //!
-//! * sends the worker a job (`Render` after a `load`/`reload`/resize,
-//!   `HitTest` after a click), and
-//! * receives finished outputs -- display lists and clicked links -- in
-//!   [`WebView::show`]. The worker calls `Context::request_repaint` when it
-//!   has something to show.
+//! * sends the worker a `Render` job after a `load`/`reload`/resize, and
+//! * receives finished outputs -- display lists -- in [`WebView::show`]. The
+//!   worker calls `Context::request_repaint` when it has something to show.
 //!
 //! Render jobs carry a monotonically increasing id. The worker drops
 //! superseded render jobs from its queue and re-checks the id between
@@ -62,6 +60,14 @@
 //! index + character); it survives a re-layout of the same text (resize,
 //! images arriving) and is dropped when a different page loads. Ctrl+C and
 //! Ctrl+A act only while the view has egui focus, so text fields keep theirs.
+//!
+//! # Links without a `Document`
+//!
+//! Which link is under the pointer is answered the same way. The draw pass
+//! also records a [`LinkTable`] (every `<a href>` with its per-line boxes and
+//! the blocks and images inside it), and the UI thread resolves clicks and the
+//! hand cursor by point-in-rectangle lookup: instant, with no second parse +
+//! layout per click (issue #27).
 //!
 //! # Render sequence (one `Render` job)
 //!
@@ -103,8 +109,10 @@ use std::time::{Duration, Instant};
 use litehtml::html::decode_data_uri;
 
 mod selection;
+mod links;
 mod text_runs;
 pub use selection::{Selection, TextPos};
+pub use links::{Link, LinkTable};
 pub use text_runs::{TextRun, TextRunTable};
 
 /// How many image URLs the worker fetches at the same time.
@@ -143,9 +151,8 @@ pub enum WebViewEvent {
     /// the one that decides what to do with it (open in the system browser,
     /// etc.).
     ///
-    /// Arrives a little after the click, not synchronously: working out
-    /// which link (if any) sits under the pointer needs a layout pass, which
-    /// runs on the worker thread.
+    /// Resolved on the UI thread from the frame's [`LinkTable`], so it is
+    /// returned by the [`WebView::show`] call that saw the click.
     LinkClicked(String),
 }
 
@@ -281,6 +288,8 @@ impl WebViewHost {
             failed: spawned.is_err(),
             runs: Arc::default(),
             runs_signature: 0,
+            links: Arc::default(),
+            click_events: Vec::new(),
             selection: None,
             last_render: None,
             scroll_y: 0.0,
@@ -365,6 +374,10 @@ pub struct WebView {
     /// Identifies the text `runs` holds (not where it is), so a selection can
     /// be kept when only the layout changed.
     runs_signature: u64,
+    /// Where the links are in the current frame (see [`LinkTable`]).
+    links: Arc<LinkTable>,
+    /// Events raised while drawing (link clicks), returned by `show`.
+    click_events: Vec<WebViewEvent>,
     /// The selected text, as carets into `runs`.
     selection: Option<Selection>,
     /// How long the worker took over the newest finished render job.
@@ -393,6 +406,8 @@ impl WebView {
         self.discard_frames();
         self.runs = Arc::default();
         self.runs_signature = 0;
+        self.links = Arc::default();
+        self.click_events.clear();
         self.selection = None;
         self.failed = false;
         // Invalidate whatever the worker is (or has just finished) rendering
@@ -469,7 +484,7 @@ impl WebView {
     /// collects whatever the worker has finished since the last call, and
     /// hands it new work when the page or the widget's width/DPI changed.
     pub fn show(&mut self, ui: &mut egui::Ui) -> Vec<WebViewEvent> {
-        let events = self.poll_worker();
+        self.poll_worker();
 
         let dpi = ui.ctx().pixels_per_point();
         let avail_width = ui.available_width().max(1.0);
@@ -499,7 +514,7 @@ impl WebView {
         let output = area.show(ui, |ui| self.show_page(ui));
         self.scroll_y = output.state.offset.y;
 
-        events
+        std::mem::take(&mut self.click_events)
     }
 
     /// The selected text, as a copy should read, or `None` if nothing is
@@ -551,11 +566,16 @@ impl WebView {
         let to_doc = |pos: egui::Pos2| (pos - rect.min).to_pos2();
         let shift = ui.input(|i| i.modifiers.shift);
 
-        if resp.hovered() || resp.dragged() {
-            let over_text = ui
-                .input(|i| i.pointer.hover_pos())
-                .is_some_and(|p| self.runs.is_text_at(to_doc(p)));
-            if over_text || resp.dragged() {
+        if resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        } else if resp.hovered()
+            && let Some(p) = ui.input(|i| i.pointer.hover_pos()).map(to_doc)
+        {
+            // A link is a hand even where it is text (or an image, which is
+            // not text at all); other text is an I-beam.
+            if self.links.href_at(p).is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            } else if self.runs.is_text_at(p) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
             }
         }
@@ -605,14 +625,8 @@ impl WebView {
                 }
             } else {
                 self.selection = None;
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    let _ = self.tx.send(Job::HitTest(HitTestJob {
-                        html: self.html.clone(),
-                        width: self.frame_layout_width,
-                        scale: self.frame_scale,
-                        x: pos.x - rect.left(),
-                        y: pos.y - rect.top(),
-                    }));
+                if let Some(href) = resp.interact_pointer_pos().and_then(|p| self.links.href_at(to_doc(p))) {
+                    self.click_events.push(WebViewEvent::LinkClicked(href.to_string()));
                 }
             }
         }
@@ -770,9 +784,10 @@ impl WebView {
         self.dirty = false;
     }
 
-    /// Take the text table of a new frame.
-    fn accept_runs(&mut self, runs: Arc<TextRunTable>) {
+    /// Take the text and link tables of a new frame.
+    fn accept_runs(&mut self, runs: Arc<TextRunTable>, links: Arc<LinkTable>) {
         self.runs = runs;
+        self.links = links;
         // A new layout of the same text (a resize or images arriving) keeps
         // the selection: carets are run indexes, and the
         // same words come out in the same order. Different text (another
@@ -784,17 +799,15 @@ impl WebView {
         }
     }
 
-    /// Apply everything the worker has produced so far. Returns the link
-    /// clicks among it.
-    fn poll_worker(&mut self) -> Vec<WebViewEvent> {
-        let mut events = Vec::new();
+    /// Apply everything the worker has produced so far.
+    fn poll_worker(&mut self) {
         loop {
             match self.rx.try_recv() {
                 Ok(Output::List(frame)) if frame.id == self.submitted_id => {
                     self.frame_size = frame.list.size;
                     self.frame_layout_width = frame.layout_width;
                     self.frame_scale = frame.scale;
-                    self.accept_runs(frame.runs.clone());
+                    self.accept_runs(frame.runs.clone(), frame.links.clone());
                     self.list = Some(frame);
                 }
                 Ok(Output::Stats { id, elapsed }) if id == self.submitted_id => self.last_render = Some(elapsed),
@@ -802,7 +815,6 @@ impl WebView {
                     self.rendering = false;
                     self.failed = !ok && !self.has_frame();
                 }
-                Ok(Output::Link(url)) => events.push(WebViewEvent::LinkClicked(url)),
                 // A frame/completion for a superseded job.
                 Ok(_) => {}
                 Err(TryRecvError::Empty) => break,
@@ -816,7 +828,6 @@ impl WebView {
                 }
             }
         }
-        events
     }
 }
 
@@ -825,7 +836,6 @@ impl WebView {
 /// UI thread -> worker.
 enum Job {
     Render(RenderJob),
-    HitTest(HitTestJob),
 }
 
 struct RenderJob {
@@ -839,16 +849,6 @@ struct RenderJob {
     reset_images: bool,
 }
 
-struct HitTestJob {
-    html: Arc<String>,
-    /// The layout width of the frame that was clicked, egui points.
-    width: f32,
-    scale: f32,
-    /// Click position within the frame, egui points.
-    x: f32,
-    y: f32,
-}
-
 /// Worker -> UI thread.
 enum Output {
     /// A finished (or intermediate) display list of the page.
@@ -858,8 +858,6 @@ enum Output {
     /// The render job `id` has nothing more to send. `ok` is false when the
     /// document could not be rendered at all.
     Done { id: u64, ok: bool },
-    /// An anchor was clicked.
-    Link(String),
 }
 
 // ─── Worker ──────────────────────────────────────────────────────────────────
@@ -925,7 +923,6 @@ impl Worker {
             // render matters (the UI ignores older ones' frames anyway).
             let mut render: Option<RenderJob> = None;
             let mut reset_images = false;
-            let mut hit_tests = Vec::new();
             for job in std::iter::once(first).chain(jobs.try_iter()) {
                 match job {
                     Job::Render(r) => {
@@ -935,15 +932,11 @@ impl Worker {
                         reset_images |= r.reset_images;
                         render = Some(r);
                     }
-                    Job::HitTest(h) => hit_tests.push(h),
                 }
             }
             if let Some(mut r) = render {
                 r.reset_images = reset_images;
                 self.render(&r);
-            }
-            for h in &hit_tests {
-                self.hit_test(h);
             }
         }
     }
@@ -1071,15 +1064,6 @@ impl Worker {
     fn emit_frame(&mut self, id: u64, width: f32, scale: f32, content_height: f32) {
         let output = self.engine().frame(id, width, scale, content_height);
         self.send(output);
-    }
-
-    /// Report the anchor under a click, if any. Needs the same layout the
-    /// clicked frame had, so it runs on the engine that drew it.
-    fn hit_test(&mut self, job: &HitTestJob) {
-        let (width, scale) = (job.width.max(1.0), job.scale.max(0.1));
-        if let Some(url) = self.engine().hit_test(&job.html, width, scale, job.x, job.y) {
-            self.send(Output::Link(url));
-        }
     }
 }
 
@@ -1431,22 +1415,17 @@ mod tests {
     }
 
     #[test]
-    fn a_click_on_a_link_reports_its_url_via_the_worker() {
+    fn a_frame_carries_the_links_of_the_page_it_shows() {
         let (out_tx, out_rx) = mpsc::channel();
-        let mut worker = Worker::new(
-            egui::Context::default(),
-            Arc::new(DefaultHandler),
-            out_tx,
-            Arc::new(AtomicU64::new(1)),
-        );
+        let mut worker = Worker::new(egui::Context::default(), Arc::new(DefaultHandler), out_tx, Arc::new(AtomicU64::new(1)));
         let html = Arc::new(
-            r#"<body style="margin:0"><a href="https://example.com/x" style="display:block;height:40px">go</a></body>"#
-                .to_string(),
+            r#"<body style="margin:0"><a href="https://example.com/x" style="display:block;height:40px">go</a></body>"#.to_string(),
         );
-        worker.hit_test(&HitTestJob { html: html.clone(), width: 200.0, scale: 1.0, x: 5.0, y: 5.0 });
-        assert!(matches!(out_rx.try_recv(), Ok(Output::Link(url)) if url == "https://example.com/x"));
-        worker.hit_test(&HitTestJob { html, width: 200.0, scale: 1.0, x: 5.0, y: 300.0 });
-        assert!(out_rx.try_recv().is_err(), "a click on empty space is not a link click");
+        worker.render(&RenderJob { id: 1, html, width: 200.0, scale: 1.0, reset_images: true });
+        let outputs: Vec<Output> = out_rx.try_iter().collect();
+        let links = &last_frame(&outputs).links;
+        assert_eq!(links.href_at(egui::pos2(5.0, 5.0)), Some("https://example.com/x"));
+        assert_eq!(links.href_at(egui::pos2(5.0, 300.0)), None, "empty space is not a link");
     }
 
     #[test]
@@ -1495,6 +1474,8 @@ mod tests {
         commands: Vec<egui::OutputCommand>,
         /// Link clicks the view reported.
         links: Vec<String>,
+        /// The mouse cursor the last frame asked for.
+        cursor: egui::CursorIcon,
         /// An egui text field shown above the view, to test focus.
         field: Option<String>,
         field_id: egui::Id,
@@ -1515,6 +1496,7 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
                 commands: Vec::new(),
                 links: Vec::new(),
+                cursor: egui::CursorIcon::Default,
                 field: with_field.then(String::new),
                 field_id: egui::Id::new("test-field"),
             };
@@ -1566,6 +1548,15 @@ mod tests {
             self.links.extend(links);
             out.textures_delta.clear();
             self.commands.extend(out.platform_output.commands);
+            self.cursor = out.platform_output.cursor_icon;
+        }
+
+        /// The cursor shown with the pointer at document point `p`.
+        fn cursor_at(&mut self, p: egui::Pos2) -> egui::CursorIcon {
+            let pos = self.at(p);
+            self.frame(vec![egui::Event::PointerMoved(pos)], egui::Modifiers::NONE);
+            self.frame(vec![], egui::Modifiers::NONE);
+            self.cursor
         }
 
         /// Screen position of a point in document space.
@@ -1673,10 +1664,24 @@ mod tests {
         let mut h = Harness::new(html, false);
         h.drag(h.left_of("click"), h.right_of("now"));
         assert_eq!(h.selected().as_deref(), Some("click here now"));
-        // The worker would answer a hit test within moments: give it the chance.
-        std::thread::sleep(Duration::from_millis(500));
         h.frame(vec![], egui::Modifiers::NONE);
         assert!(h.links.is_empty(), "a drag must not open the link: {:?}", h.links);
+    }
+
+    #[test]
+    fn a_link_shows_a_hand_and_other_text_an_i_beam() {
+        let html = r#"<body style="margin:0"><p style="margin:0">plain <a href="https://example.com/x">link words</a> tail</p><p style="margin:20px 0 0"><a href="https://example.com/i"><img width="60" height="30"></a></p></body>"#;
+        let mut h = Harness::new(html, false);
+        let (plain, link, tail) = (h.run("plain").rect, h.run("link").rect, h.run("tail").rect);
+        assert_eq!(h.cursor_at(plain.center()), egui::CursorIcon::Text, "plain text is an I-beam");
+        assert_eq!(h.cursor_at(link.center()), egui::CursorIcon::PointingHand, "a link is a hand");
+        assert_eq!(h.cursor_at(link.left_center() + egui::vec2(1.0, 0.0)), egui::CursorIcon::PointingHand, "even at its very start");
+        assert_eq!(h.cursor_at(link.right_center() - egui::vec2(1.0, 0.0)), egui::CursorIcon::PointingHand, "and its very end");
+        assert_eq!(h.cursor_at(tail.center()), egui::CursorIcon::Text, "text after the link is an I-beam again");
+        // An image is not text, but as a link it is still a hand.
+        let below = egui::pos2(30.0, tail.bottom() + 20.0 + 15.0);
+        assert_eq!(h.cursor_at(below), egui::CursorIcon::PointingHand, "an image link is a hand");
+        assert_eq!(h.cursor_at(egui::pos2(300.0, below.y)), egui::CursorIcon::Default, "empty space is the default cursor");
     }
 
     #[test]
