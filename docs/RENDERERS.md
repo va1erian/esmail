@@ -145,8 +145,7 @@ runs). A selection survives a backend switch (same text, same runs).
 ## Not done / ideas
 
 - Make the measuring-font rebuild incremental (see the measurements above).
-- Find-in-page and a hand cursor over links / "Copy link address" (both need
-  link rectangles in the run table; see #27).
+- Find-in-page and "Copy link address" (the `LinkTable` has the rectangles).
 - Fix the three upstream bugs above in `litehtml-rs`; at that point the Pixbuf
   backend's gradients and fonts match.
 - Decide the default, then consider dropping litehtml's `pixbuf` feature:

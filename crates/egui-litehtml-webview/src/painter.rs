@@ -42,7 +42,7 @@ use litehtml::{
 };
 
 use crate::fonts::{FAMILY_PREFIX, FONT_PREFIX, FontBook};
-use crate::{Engine, Output, TextRunTable};
+use crate::{Engine, LinkTable, Output, TextRunTable};
 
 /// Height reported to litehtml as the viewport's. See the Pixbuf backend's
 /// `INITIAL_CANVAS_HEIGHT` for why `vh` is a problem there; here it is simply
@@ -124,6 +124,8 @@ pub(crate) struct ListFrame {
     pub scale: f32,
     /// Where the text is, for selection (see [`TextRunTable`]).
     pub runs: Arc<TextRunTable>,
+    /// Where the links are, for clicks and the hover cursor.
+    pub links: Arc<LinkTable>,
 }
 
 // ─── Painting (UI thread) ───────────────────────────────────────────────────
@@ -408,7 +410,6 @@ pub(crate) struct PainterContainer {
     images: HashMap<String, ImageEntry>,
     pending_images: Vec<(String, bool)>,
     requested_images: HashSet<String>,
-    last_anchor_click: Option<String>,
     ctx: egui::Context,
 }
 
@@ -426,7 +427,6 @@ impl PainterContainer {
             images: HashMap::new(),
             pending_images: Vec::new(),
             requested_images: HashSet::new(),
-            last_anchor_click: None,
             ctx: ctx.clone(),
         }
     }
@@ -449,7 +449,6 @@ impl PainterContainer {
         self.viewport = Position { x: 0.0, y: 0.0, width, height: VIEWPORT_HEIGHT };
         self.cmds.clear();
         self.families.clear();
-        self.last_anchor_click = None;
         self.book.borrow_mut().begin_pass();
     }
 
@@ -812,9 +811,9 @@ impl DocumentContainer for PainterContainer {
 
     fn set_caption(&mut self, _caption: &str) {}
 
-    fn on_anchor_click(&mut self, url: &str) {
-        self.last_anchor_click = Some(url.to_string());
-    }
+    // Clicks are resolved on the UI thread from the link table (see
+    // `LinkTable`), so litehtml is never asked to dispatch one.
+    fn on_anchor_click(&mut self, _url: &str) {}
 
     fn set_clip(&mut self, pos: Position, _radius: BorderRadiuses) {
         // Radius ignored: egui clips to rectangles.
@@ -874,11 +873,13 @@ pub(crate) struct PainterEngine {
     container: PainterContainer,
     /// The text of the page as of the last draw pass; sent with each frame.
     runs: Arc<TextRunTable>,
+    /// The links of the page as of the last draw pass; sent with each frame.
+    links: Arc<LinkTable>,
 }
 
 impl PainterEngine {
     pub(crate) fn new(ctx: &egui::Context) -> Self {
-        Self { container: PainterContainer::new(ctx), runs: Arc::default() }
+        Self { container: PainterContainer::new(ctx), runs: Arc::default(), links: Arc::default() }
     }
 }
 
@@ -916,6 +917,7 @@ impl Engine for PainterEngine {
         let t_record = t.elapsed();
         let t = std::time::Instant::now();
         self.runs = Arc::new(TextRunTable::collect(&doc, &measure));
+        self.links = Arc::new(LinkTable::collect(&doc));
         log::debug!(
             "painter draw_pass: layout={t_layout:?} record={t_record:?} text_runs={:?} ({})",
             t.elapsed(),
@@ -935,19 +937,8 @@ impl Engine for PainterEngine {
             layout_width: width,
             scale,
             runs: self.runs.clone(),
+            links: self.links.clone(),
         }))
-    }
-
-    fn hit_test(&mut self, html: &str, width: f32, scale: f32, x: f32, y: f32) -> Option<String> {
-        self.container.begin(width, scale);
-        let Ok(mut doc) = Document::from_html(html, &mut self.container, None, Some(EMAIL_MASTER_CSS)) else {
-            return None;
-        };
-        let _ = doc.render(width);
-        doc.on_lbutton_down(x, y, x, y);
-        doc.on_lbutton_up(x, y, x, y);
-        drop(doc);
-        self.container.last_anchor_click.take()
     }
 }
 
@@ -960,7 +951,6 @@ mod tests {
 
     struct Rendered {
         list: Arc<DisplayList>,
-        engine: PainterEngine,
     }
 
     fn render(html: &str) -> Rendered {
@@ -968,7 +958,7 @@ mod tests {
         let mut engine = PainterEngine::new(&ctx);
         let height = engine.draw_pass(html, 300.0, 1.0).expect("parses");
         let Some(Output::List(frame)) = engine.frame(1, 300.0, 1.0, height, 2048) else { panic!("no list frame") };
-        Rendered { list: frame.list, engine }
+        Rendered { list: frame.list }
     }
 
     fn rects(list: &DisplayList) -> Vec<(Rect, Color32)> {
@@ -1132,11 +1122,14 @@ mod tests {
     }
 
     #[test]
-    fn a_click_on_a_link_reports_its_url() {
-        let mut r = render(r#"<body style="margin:0"><a href="https://example.com/x" style="display:block;height:40px">go</a></body>"#);
+    fn a_frame_carries_the_links_of_the_page() {
         let html = r#"<body style="margin:0"><a href="https://example.com/x" style="display:block;height:40px">go</a></body>"#;
-        assert_eq!(r.engine.hit_test(html, 300.0, 1.0, 5.0, 5.0).as_deref(), Some("https://example.com/x"));
-        assert_eq!(r.engine.hit_test(html, 300.0, 1.0, 5.0, 300.0), None);
+        let ctx = egui::Context::default();
+        let mut engine = PainterEngine::new(&ctx);
+        let h = engine.draw_pass(html, 300.0, 1.0).unwrap();
+        let Some(Output::List(frame)) = engine.frame(1, 300.0, 1.0, h, 2048) else { panic!() };
+        assert_eq!(frame.links.href_at(pos2(5.0, 5.0)), Some("https://example.com/x"));
+        assert_eq!(frame.links.href_at(pos2(5.0, 300.0)), None);
     }
 
     #[test]

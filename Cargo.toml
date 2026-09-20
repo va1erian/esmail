@@ -25,7 +25,10 @@ egui_glow = "0.36.2"
 # commit older than that bump. The same `master` also has the fix for
 # `PixbufContainer::draw_image` drawing images at their natural size instead of
 # their laid-out size (cropped / mis-sized `<img width=..>` and backgrounds).
-litehtml = { git = "https://github.com/va1erian/litehtml-rs.git", features = ["pixbuf", "email"] }
+# The `element-tag-attr` branch is `master` plus `Element::tag_name()` and
+# `Element::attr()`, which the link table (links.rs) needs to read each anchor's
+# `href` off the laid-out document. Go back to `master` once it is merged.
+litehtml = { git = "https://github.com/va1erian/litehtml-rs.git", branch = "element-tag-attr", features = ["pixbuf", "email"] }
 
 # Async / IO
 tokio = { version = "1", features = ["full"] }
