@@ -17,8 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libs
 # Cargo needs every workspace member's Cargo.toml present to resolve the
 # lockfile even though `-p mail-mock-server` below only *compiles* this one
 # package -- `mail-mock-server` doesn't depend on `esmail` or
-# `egui-servo-webview`, so their (much heavier, Servo-pulling) source is
-# never actually built, just parsed as manifests. Build context is the repo
+# `egui-litehtml-webview`, so their source is never actually built, just
+# parsed as manifests. Build context is the repo
 # root (see docker-compose.yml's `context: .`) for exactly this reason; see
 # also this repo's root `.dockerignore`, which keeps that context from
 # including the multi-gigabyte cargo `target/` directory.

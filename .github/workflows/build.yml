@@ -19,12 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      # See ci.yml's build-linux job for why this list is short: litehtml's
-      # `cc`-crate build only needs a C/C++ compiler + pkg-config, libssl-dev
-      # is for native-tls (unrelated to Servo/litehtml), and libdbus-1-dev is
-      # for keyring's Linux secret-service backend (also unrelated). The long
-      # Servo-era list (cmake, nasm, clang/llvm-dev, X11/Vulkan/Mesa/GL,
-      # freetype/harfbuzz/glib, gstreamer, python3) is gone.
+      # See ci.yml's build-linux job for why this list is short.
       - name: Install dependencies
         run: |
           sudo apt-get update

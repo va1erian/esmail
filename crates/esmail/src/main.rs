@@ -24,18 +24,15 @@ use tokio::sync::mpsc;
 /// litehtml has no navigation concept at all (a message body view never
 /// "navigates" anywhere) -- every link click unconditionally becomes a
 /// [`egui_litehtml_webview::WebViewEvent::LinkClicked`], opened in the
-/// system browser (see below), which is the same behavior the Servo-backed
-/// predecessor had (it always denied in-view navigation and reported it the
-/// same way), just without a policy decision left to make.
+/// system browser (see below), with no policy decision left to make.
 ///
 /// Remote `http(s)` images are blocked unless `allow_remote` is set, which
 /// the "Load remote images" button flips for the message currently showing.
 /// This is the real blocking mechanism B5 calls for — markup alone can't
 /// stop a network fetch, so `render.rs` leaves every remote URL in the
 /// message's HTML exactly as it was, and this is what actually decides
-/// whether the request happens at all. Unlike the Servo-backed predecessor
-/// (which had its own browser-engine network stack to allow/deny), litehtml
-/// has none, so when a remote image *is* allowed, this handler fetches it
+/// whether the request happens at all. litehtml has no network stack of its
+/// own, so when a remote image *is* allowed, this handler fetches it
 /// itself with `ureq` and hands the bytes back via
 /// `InterceptOutcome::Serve` — there is no "let the engine fetch it"
 /// option to fall back on.
@@ -108,18 +105,13 @@ struct Banner {
 }
 
 struct EsMailApp {
-    // Field order was drop order under the Servo-backed predecessor (the
-    // view had to be torn down before the engine backing it). litehtml's
-    // `WebViewHost` owns no engine/GL state any view actually depends on at
-    // drop time, so this no longer matters -- kept in this order anyway for
-    // minimal diff churn.
     web_view: WebView,
     /// Creates views; see `egui_litehtml_webview::WebViewHost`'s own doc for
     /// why this is little more than a texture-id counter now. Kept as a
-    /// field (rather than a local dropped right after `new_view`) for the
-    /// same reason it existed under the Servo-backed predecessor: a second
-    /// view (a compose preview, say) would be created from this same host,
-    /// so its lifetime should match the app's, not just the constructor's.
+    /// field (rather than a local dropped right after `new_view`) because a
+    /// second view (a compose preview, say) would be created from this same
+    /// host, so its lifetime should match the app's, not just the
+    /// constructor's.
     /// Unread today since nothing currently creates a second view --
     /// allowed explicitly rather than silently dropping the field.
     #[allow(dead_code)]
@@ -425,8 +417,7 @@ impl EsMailApp {
         // One host per window; a second view (a compose preview, say) would
         // come from this same host. litehtml's `pixbuf` backend needs
         // nothing from `cc` (no window handle, no GL context -- see
-        // egui-litehtml-webview's `WebViewHost` doc), unlike the Servo-backed
-        // predecessor's `WebViewHost::from_eframe`, so this is infallible.
+        // egui-litehtml-webview's `WebViewHost` doc), so this is infallible.
         let web_view_host = WebViewHost::new();
         let message_view_handler = Arc::new(MessageViewHandler::new());
         let web_view = web_view_host.new_view(
@@ -1452,10 +1443,6 @@ impl eframe::App for EsMailApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // litehtml's `pixbuf` backend has no engine/event loop to drive --
-        // unlike the Servo-backed predecessor, there is nothing to do here
-        // once per frame before the views are drawn.
-
         self.screenshotter.update(ui.ctx(), !self.web_view.is_rendering());
 
         // Window-geometry persistence (B9): keep the latest known outer rect
@@ -2344,11 +2331,6 @@ fn preview_demo_html() -> String {
 
 /// Install the logger.
 ///
-/// Was also quietening Servo's own known-benign log chatter
-/// (`webrender::device::gl`, `profile_traits::mem`) by default under the
-/// Servo-backed predecessor; neither crate is linked any more (litehtml's
-/// `pixbuf` backend is pure CPU, no GPU/compositor layer of its own to log
-/// from), so that filtering was dropped rather than kept as a no-op.
 /// `fontdb` (a `cosmic-text` dependency, still linked) can still complain
 /// about individual malformed fonts installed on the system, which says
 /// nothing about this application -- `RUST_LOG` overrides the default if

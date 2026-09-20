@@ -15,8 +15,7 @@ egui_glow = "0.36.2"
 
 # HTML/CSS rendering engine for message bodies (litehtml migration -- see
 # PLAN.md). JS-less by design: no legitimate mail client executes JS in HTML
-# email anyway, and dropping the JS engine (Servo) is what makes the binary
-# dramatically smaller. `va1erian/litehtml-rs` carries a Windows/MSVC build
+# email anyway, and having no JS engine is what keeps the binary small. `va1erian/litehtml-rs` carries a Windows/MSVC build
 # fix on top of upstream `franzos/litehtml-rs` -- not yet released upstream,
 # hence the git dep. Its `master` also bumps the vendored C++ litehtml to
 # `va1erian/litehtml`'s `memoize-table-cell-measurement`. That memoization is
@@ -60,11 +59,7 @@ tray-icon = { version = "0.24", default-features = false }
 winrt-notification = "0.5"
 
 # Storage / secrets
-# Used to be pinned to exactly 0.37 to unify with servo-storage's rusqlite
-# (libsqlite3-sys sets `links = "sqlite3"`, so only one copy may exist in the
-# dependency graph). That constraint no longer applies now that servo/
-# servo-storage are gone -- `esmail` is the only crate in the workspace that
-# depends on rusqlite (confirmed via `cargo tree -i libsqlite3-sys`), so a
+# `esmail` is the only crate in the workspace that depends on rusqlite, so a
 # plain lower bound is enough.
 rusqlite = { version = ">=0.37", features = ["bundled"] }
 keyring = "3.2"
@@ -80,9 +75,8 @@ log = "0.4"
 env_logger = "0.11"
 base64 = "0.22"
 # Screenshot dumps and message-body inline images. `["png"]` was pinned
-# narrower only because that's what Servo happened to pull in -- litehtml
-# doesn't constrain this at all, and attachments/inline images are commonly
-# jpeg/gif too.
+# narrower than the formats attachments and inline images commonly use
+# (jpeg/gif too).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 # Synchronous HTTP client. litehtml has no network layer of its own by
 # design (see the `litehtml` dependency above) -- this is what main.rs uses

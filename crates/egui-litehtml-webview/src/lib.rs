@@ -1,17 +1,13 @@
 //! `egui-litehtml-webview` -- a reusable egui widget that renders HTML/CSS
 //! message bodies via [litehtml](https://github.com/litehtml/litehtml)
-//! (through the `va1erian/litehtml-rs` Rust bindings), replacing the earlier
-//! `egui-servo-webview` (full Servo browser engine).
+//! (through the `va1erian/litehtml-rs` Rust bindings).
 //!
-//! # Why litehtml, not Servo
+//! # Why litehtml
 //!
-//! No legitimate mail client executes JavaScript in HTML email, so carrying
-//! a whole JS-capable browser engine just to lay out message bodies was
-//! always more than the job needed. litehtml is a JS-less HTML/CSS layout
-//! and rendering engine -- dropping the JS engine (and everything Servo
-//! pulls in to support it) is what makes the resulting binary dramatically
-//! smaller. See `PLAN.md`'s migration section for the full rationale and the
-//! measured before/after binary size.
+//! No legitimate mail client executes JavaScript in HTML email, so a full
+//! JS-capable browser engine is more than laying out message bodies needs.
+//! litehtml is a JS-less HTML/CSS layout and rendering engine, which keeps
+//! the resulting binary small.
 //!
 //! # Design: a render worker thread
 //!
@@ -133,11 +129,9 @@ const MAX_PASSES: usize = 3;
 
 /// What to load in the webview.
 ///
-/// Only an in-memory HTML string is supported. The prior Servo-backed crate
-/// also had `Url` (navigate the engine directly) and `HtmlWithBase`
-/// (resolve relative links/resources against a base URL) variants; neither
-/// is needed here. litehtml has no network layer of its own by design, so
-/// there is nothing "navigate to a URL" could mean at this layer -- the one
+/// Only an in-memory HTML string is supported. There are no `Url` or
+/// `HtmlWithBase` variants: litehtml has no network layer of its own by
+/// design, so there is nothing "navigate to a URL" could mean at this layer -- the one
 /// caller that wants that (`esmail`'s `ESMAIL_PREVIEW=<http url>` dev path)
 /// fetches synchronously with `ureq` and hands the result in as `Html`
 /// instead. Nothing in `esmail` today uses relative links/resources against
@@ -156,8 +150,7 @@ pub enum WebViewEvent {
     /// concept of its own -- there is nothing to allow/deny -- so every
     /// anchor click unconditionally becomes this event; the host is always
     /// the one that decides what to do with it (open in the system browser,
-    /// etc.), same as how the Servo-backed predecessor's `MessageViewHandler`
-    /// always denied in-view navigation and reported it this way too.
+    /// etc.).
     ///
     /// Arrives a little after the click, not synchronously: working out
     /// which link (if any) sits under the pointer needs a layout pass, which
@@ -168,8 +161,8 @@ pub enum WebViewEvent {
 /// One resource load litehtml's layout discovered it wants: an image `src`
 /// found while parsing/laying out the document. Deliberately minimal --
 /// litehtml hands this crate just a URL string per pending image, not a
-/// full HTTP request object the way Servo's `WebResourceRequest` did, so
-/// there is no request method/headers/redirect info to carry here.
+/// full HTTP request object, so there is no request method/headers/redirect
+/// info to carry here.
 pub struct ImageRequest {
     /// The image URL as it appeared in the document's markup (already
     /// resolved from `cid:` to a `data:` URL upstream by `esmail`'s
@@ -205,9 +198,8 @@ pub enum InterceptOutcome {
 /// host wants to change while a view is alive (e.g. an "allow remote
 /// images" switch) needs interior mutability, such as an `AtomicBool`.
 ///
-/// Unlike the Servo-backed predecessor's `WebViewHandler`, there is no
-/// `navigation` method: litehtml has no navigation concept at all (see
-/// [`WebViewEvent::LinkClicked`]'s doc), so there is nothing left to decide
+/// There is no `navigation` method: litehtml has no navigation concept at all
+/// (see [`WebViewEvent::LinkClicked`]'s doc), so there is nothing to decide
 /// there.
 pub trait WebViewHandler: Send + Sync {
     /// Called for every image URL the document's layout wants loaded, other
@@ -229,7 +221,6 @@ impl WebViewHandler for DefaultHandler {}
 
 /// Creates [`WebView`]s.
 ///
-/// Dramatically simpler than the Servo-backed predecessor's `WebViewHost`:
 /// litehtml's `pixbuf` backend renders entirely on the CPU, so there is no
 /// engine to own, no window handle, and no GL context to set up. This type
 /// still exists (rather than a bare associated function on `WebView`) to
@@ -243,10 +234,8 @@ pub struct WebViewHost {
 }
 
 impl WebViewHost {
-    /// Create a host. Takes nothing: unlike the Servo-backed predecessor's
-    /// `WebViewHost::new`/`from_eframe` (which needed a window/display
-    /// handle to set up a rendering context), litehtml's CPU-only `pixbuf`
-    /// backend needs nothing from the host window at all.
+    /// Create a host. Takes nothing: litehtml's CPU-only `pixbuf` backend
+    /// needs nothing from the host window (no window handle, no GL context).
     pub fn new() -> Self {
         Self::default()
     }
@@ -447,12 +436,9 @@ impl WebView {
         }
 
         // The whole document is rendered up front at its full content
-        // height -- unlike the Servo-backed predecessor, which had to poll a
-        // JS bridge and paint a hand-rolled overlay scrollbar (issue #15)
-        // because Servo exposed no scroll-position getter/setter at all. A
-        // plain `ScrollArea` around a normally-sized allocation gets a native
-        // scrollbar and native wheel-scroll for free. The picture is a grid
-        // of tiles (a GPU texture has a maximum side length, and a long
+        // height, so a plain `ScrollArea` around a normally-sized allocation
+        // gets a native scrollbar and native wheel-scroll for free. The
+        // picture is a grid of tiles (a GPU texture has a maximum side length, and a long
         // message is taller than that), painted edge to edge.
         egui::ScrollArea::vertical()
             .id_salt(&self.texture_name)
