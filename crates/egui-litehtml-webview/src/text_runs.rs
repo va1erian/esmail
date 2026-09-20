@@ -62,6 +62,17 @@ pub struct TextRunTable {
 }
 
 impl TextRunTable {
+    /// A hash of the runs' text in order, ignoring where they are: equal
+    /// before and after a re-layout, different for a different message.
+    pub fn text_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for r in &self.runs {
+            r.text.hash(&mut h);
+        }
+        h.finish()
+    }
+
     /// Walk `doc` (which must have been laid out) and record its text.
     ///
     /// `measure` is `PixbufContainer::text_measure_fn`, captured before the
