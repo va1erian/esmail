@@ -36,6 +36,15 @@ pub struct TextRun {
     /// the boundary before each character falls, and finally the run's end.
     /// Monotonically non-decreasing; the last one is `rect.width()`.
     pub offsets: Vec<f32>,
+    /// The box of the nearest block-level ancestor (the paragraph, table cell
+    /// or list item this text lives in). Runs of the same block compare equal;
+    /// a change means a hard break (paragraph, cell, list item) rather than
+    /// the text merely wrapping.
+    pub block: egui::Rect,
+    /// How many forced line breaks (`<br>`, or a newline in `<pre>` text)
+    /// sit between the previous run and this one. Within one block, a run on a
+    /// new line with none of these is just the text wrapping.
+    pub breaks_before: u8,
 }
 
 impl TextRun {
@@ -66,12 +75,36 @@ impl TextRunTable {
         // Explicit stack, children pushed in reverse, so the pop order is
         // document order without recursing (nesting can be deep).
         let mut stack: Vec<(Element<'_>, usize)> = vec![(root, 0)];
+        let mut breaks = 0u8;
         while let Some((el, depth)) = stack.pop() {
             if el.is_text() {
-                if let Some(run) = run_for(&el, measure) {
-                    runs.push(run);
+                match run_for(&el, measure) {
+                    Some(mut run) => {
+                        // Breaks are counted up to the next word: a blank run
+                        // (a space) in between must not swallow them.
+                        if !run.text.trim().is_empty() {
+                            // (Zero-size leaves such as `<head>` come before
+                            // the first word; there is nothing to break from.)
+                            let pending = std::mem::take(&mut breaks);
+                            run.breaks_before = if runs.is_empty() { 0 } else { pending };
+                        }
+                        runs.push(run);
+                    }
+                    // A newline in `<pre>` text is a zero-width text element.
+                    None if el.get_text().contains('\n') && el.placement().width <= 0.0 => {
+                        breaks = breaks.saturating_add(1);
+                    }
+                    None => {}
                 }
                 continue;
+            }
+            // `<br>` is an element with no children, no inline boxes and
+            // (unlike `<img>`, `<hr>` or an empty `<div>`) no size at all.
+            if el.children_count() == 0 && el.inline_boxes_count() == 0 {
+                let p = el.placement();
+                if p.width <= 0.0 && p.height <= 0.0 {
+                    breaks = breaks.saturating_add(1);
+                }
             }
             if depth >= MAX_DEPTH {
                 continue;
@@ -84,6 +117,21 @@ impl TextRunTable {
         }
         Self { runs }
     }
+}
+
+/// The nearest ancestor that is not an inline element (inline elements have
+/// per-line boxes; blocks do not).
+fn block_rect(el: &Element<'_>) -> egui::Rect {
+    let mut current = el.parent();
+    while let Some(parent) = current {
+        if parent.inline_boxes_count() == 0 {
+            let p = parent.placement();
+            return egui::Rect::from_min_size(egui::pos2(p.x, p.y), egui::vec2(p.width, p.height));
+        }
+        current = parent.parent();
+    }
+    let p = el.placement();
+    egui::Rect::from_min_size(egui::pos2(p.x, p.y), egui::vec2(p.width, p.height))
 }
 
 fn run_for(el: &Element<'_>, measure: &dyn Fn(&str, FontHandle) -> f32) -> Option<TextRun> {
@@ -120,6 +168,8 @@ fn run_for(el: &Element<'_>, measure: &dyn Fn(&str, FontHandle) -> f32) -> Optio
         rect: egui::Rect::from_min_size(egui::pos2(p.x, p.y), egui::vec2(p.width, p.height)),
         text,
         offsets,
+        block: block_rect(el),
+        breaks_before: 0,
     })
 }
 
@@ -163,6 +213,37 @@ mod tests {
             300.0,
         );
         assert_eq!(joined(&t), "shown");
+    }
+
+    #[test]
+    fn runs_know_which_block_they_belong_to() {
+        let t = table_for(
+            "<body><p>Hello <b>big</b> world</p><p>next paragraph</p></body>",
+            300.0,
+        );
+        let blocks: Vec<_> = t.runs.iter().filter(|r| !r.text.trim().is_empty()).map(|r| (r.text.as_str(), r.block)).collect();
+        // Inline <b> does not start a new block; the second <p> does.
+        assert_eq!(blocks[0].1, blocks[1].1);
+        assert_eq!(blocks[1].1, blocks[2].1);
+        assert_ne!(blocks[2].1, blocks[3].1);
+        assert_eq!(blocks[3].1, blocks[4].1);
+    }
+
+    #[test]
+    fn forced_line_breaks_are_counted_on_the_word_after_them() {
+        let t = table_for("<body><p>x<br>y <br><br>z w</p><pre>a
+b
+
+c</pre></body>", 300.0);
+        let breaks = |w: &str| t.runs.iter().find(|r| r.text == w).unwrap().breaks_before;
+        assert_eq!((breaks("x"), breaks("y"), breaks("z"), breaks("w")), (0, 1, 2, 0));
+        assert_eq!((breaks("a"), breaks("b"), breaks("c")), (0, 1, 2));
+    }
+
+    #[test]
+    fn an_empty_span_or_an_image_is_not_a_line_break() {
+        let t = table_for("<body><p>x<span></span>y <img width=10 height=10>z<hr>w</p></body>", 300.0);
+        assert!(t.runs.iter().all(|r| r.breaks_before == 0), "{:?}", t.runs.iter().map(|r| (&r.text, r.breaks_before)).collect::<Vec<_>>());
     }
 
     #[test]

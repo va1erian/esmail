@@ -90,7 +90,9 @@ use litehtml::html::decode_data_uri;
 use litehtml::pixbuf::PixbufContainer;
 use litehtml::{Document, DrawContext};
 
+mod selection;
 mod text_runs;
+pub use selection::{Selection, TextPos};
 pub use text_runs::{TextRun, TextRunTable};
 
 /// Height (logical points) the pixel canvas starts at, before any message has
