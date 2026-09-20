@@ -90,6 +90,9 @@ use litehtml::html::decode_data_uri;
 use litehtml::pixbuf::PixbufContainer;
 use litehtml::{Document, DrawContext};
 
+mod text_runs;
+pub use text_runs::{TextRun, TextRunTable};
+
 /// Height (logical points) the pixel canvas starts at, before any message has
 /// been measured.
 ///
@@ -285,6 +288,7 @@ impl WebViewHost {
             reset_images: true,
             rendering: false,
             failed: spawned.is_err(),
+            runs: Arc::default(),
         }
     }
 }
@@ -358,6 +362,8 @@ pub struct WebView {
     rendering: bool,
     /// The worker reported that the document could not be rendered at all.
     failed: bool,
+    /// Where the text is in the current frame (see [`TextRunTable`]).
+    runs: Arc<TextRunTable>,
 }
 
 impl WebView {
@@ -374,6 +380,7 @@ impl WebView {
         let WebViewSource::Html(html) = source;
         self.html = Arc::new(html);
         self.textures.clear();
+        self.runs = Arc::default();
         self.failed = false;
         // Invalidate whatever the worker is (or has just finished) rendering
         // for the *previous* page right now, not when `show()` next submits
@@ -415,6 +422,13 @@ impl WebView {
     /// content height at the width it was laid out at.
     pub fn content_size(&self) -> Option<egui::Vec2> {
         (!self.textures.is_empty()).then_some(self.frame_size)
+    }
+
+    /// Where the text of the frame currently shown is, in document points
+    /// (the frame's own coordinate space, origin at its top-left). Empty until
+    /// the first frame arrives.
+    pub fn text_runs(&self) -> &TextRunTable {
+        &self.runs
     }
 
     /// Draw the view into `ui` (inside its own scroll area) and return any
@@ -526,6 +540,7 @@ impl WebView {
                     self.frame_size = frame.size_points;
                     self.frame_layout_width = frame.layout_width;
                     self.frame_scale = frame.scale;
+                    self.runs = frame.runs;
                     self.textures.truncate(frame.tiles.len());
                     for (i, tile) in frame.tiles.into_iter().enumerate() {
                         match self.textures.get_mut(i) {
@@ -617,6 +632,8 @@ struct Frame {
     size_points: egui::Vec2,
     layout_width: f32,
     scale: f32,
+    /// The text of the page as laid out for this picture.
+    runs: Arc<TextRunTable>,
 }
 
 /// One rectangle of a [`Frame`]. A GPU texture has a maximum side length
@@ -691,6 +708,8 @@ struct Worker {
     /// full parse+layout+draw pass that growing it forces. Only grows, when
     /// freshly-drawn content turns out not to fit.
     container_height: f32,
+    /// The text of the page as of the last draw pass; sent with each frame.
+    runs: Arc<TextRunTable>,
     /// Cumulative count of `load_image_data` calls -- diagnostic only,
     /// logged per job. `PixbufContainer`'s decoded-image cache has no
     /// eviction API, so this is a proxy for how large it has grown.
@@ -717,6 +736,7 @@ impl Worker {
             out,
             latest_id,
             container_height: INITIAL_CANVAS_HEIGHT as f32,
+            runs: Arc::default(),
             total_images_loaded: 0,
             reset_images_next: false,
         }
@@ -871,6 +891,9 @@ impl Worker {
     /// is taller than `max_height` the (pointless) paint is skipped and the
     /// caller is expected to grow the canvas and call again.
     fn layout_and_draw(&mut self, html: &str, width: f32, max_height: f32) -> Option<(f32, bool)> {
+        // Captured before the `Document` takes its mutable borrow of the
+        // container; used to record the text while the `Document` is alive.
+        let measure = self.container.text_measure_fn();
         let t_parse = Instant::now();
         // `master_css: None` is deliberate, not an oversight: the vendored
         // litehtml C++ core only falls back to its own **built-in** master
@@ -909,8 +932,14 @@ impl Worker {
         doc.draw(DrawContext::default(), 0.0, 0.0, None);
         let t_paint = t_paint.elapsed();
 
+        let t_runs = Instant::now();
+        self.runs = Arc::new(TextRunTable::collect(&doc, &measure));
+        let t_runs = t_runs.elapsed();
+
         log::debug!(
-            "layout_and_draw: parse={t_parse:?} render(layout)={t_render:?} draw(paint)={t_paint:?}",
+            "layout_and_draw: parse={t_parse:?} render(layout)={t_render:?} draw(paint)={t_paint:?} \
+             text_runs={t_runs:?} ({})",
+            self.runs.runs.len(),
         );
         Some((height, true))
     }
@@ -966,6 +995,7 @@ impl Worker {
             size_points: egui::vec2(w as f32 / scale, rows as f32 / scale),
             layout_width: width,
             scale,
+            runs: self.runs.clone(),
         }));
     }
 
@@ -1372,6 +1402,44 @@ mod tests {
         }
         assert!(view.textures.len() >= 3);
         assert!(view.content_size().unwrap().y >= 5000.0);
+    }
+
+    #[test]
+    fn a_frame_carries_the_text_runs_of_the_page_it_shows() {
+        let outputs = render_in_process(
+            r#"<body style="margin:0"><p>Hello world</p><p style="display:none">secret</p></body>"#,
+            300.0,
+            Arc::new(DefaultHandler),
+        );
+        let text: String = last_frame(&outputs).runs.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(text, "Hello world");
+    }
+
+    #[test]
+    fn a_view_exposes_the_runs_of_the_current_frame_and_forgets_them_on_load() {
+        let ctx = egui::Context::default();
+        let host = WebViewHost::new();
+        let mut view = host.new_view(&ctx, WebViewConfig::new(WebViewSource::Html("<p>one two</p>".to_string())));
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))),
+            ..Default::default()
+        };
+        assert!(view.text_runs().runs.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            ctx.run_ui(input(), |ui| {
+                view.show(ui);
+            }).textures_delta.clear();
+            if !view.is_rendering() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "render never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let text: String = view.text_runs().runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(text, "one two");
+        view.load(WebViewSource::Html("<p>other</p>".to_string()));
+        assert!(view.text_runs().runs.is_empty(), "the old page's runs must not outlive it");
     }
 
     #[test]
