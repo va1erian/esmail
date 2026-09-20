@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use egui_litehtml_webview::{TextRunTable, WebView, WebViewConfig, WebViewHost, WebViewSource};
+use egui_litehtml_webview::{Backend, TextRunTable, WebView, WebViewConfig, WebViewHost, WebViewSource};
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
@@ -37,18 +37,30 @@ fn fixtures() -> Vec<(String, Vec<u8>)> {
     all
 }
 
-/// What one full layout + paint of `html` at `width` points took, and the
-/// content size it produced. Gives up (fails the test) after `limit`.
+/// What one full layout + paint of `html` at `width` points took under the
+/// default backend, and the content size it produced. Gives up (fails the
+/// test) after `limit`.
 fn render_headless(html: String, width: f32, limit: Duration) -> (Duration, egui::Vec2) {
-    let (elapsed, size, _) = render_headless_with_runs(html, width, limit);
+    render_headless_with(html, width, limit, Backend::default())
+}
+
+/// [`render_headless`] under a chosen backend.
+fn render_headless_with(html: String, width: f32, limit: Duration, backend: Backend) -> (Duration, egui::Vec2) {
+    let (elapsed, size, _) = render_headless_with_runs(html, width, limit, backend);
     (elapsed, size)
 }
 
-/// As [`render_headless`], also returning where the page's text ended up.
-fn render_headless_with_runs(html: String, width: f32, limit: Duration) -> (Duration, egui::Vec2, TextRunTable) {
+/// As [`render_headless_with`], also returning where the page's text ended up.
+fn render_headless_with_runs(
+    html: String,
+    width: f32,
+    limit: Duration,
+    backend: Backend,
+) -> (Duration, egui::Vec2, TextRunTable) {
     let ctx = egui::Context::default();
     let host = WebViewHost::new();
-    let mut view: WebView = host.new_view(&ctx, WebViewConfig::new(WebViewSource::Html(html)));
+    let mut view: WebView =
+        host.new_view(&ctx, WebViewConfig::new(WebViewSource::Html(html)).with_backend(backend));
     let input = || egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 800.0))),
         // Left at headless egui's 2048px texture limit on purpose: this
@@ -134,8 +146,14 @@ fn meilleurtaux_lays_out_in_bounded_time_at_a_plausible_height() {
 
 #[test]
 fn meilleurtaux_text_run_table_covers_the_visible_text_in_reading_order() {
+    for backend in [Backend::Pixbuf, Backend::Painter] {
+        text_run_table_covers_the_visible_text_in_reading_order(backend);
+    }
+}
+
+fn text_run_table_covers_the_visible_text_in_reading_order(backend: Backend) {
     let html = esmail::render::render_message(&fixture("meilleurtaux.eml"));
-    let (_, size, table) = render_headless_with_runs(html, 700.0, Duration::from_secs(120));
+    let (_, size, table) = render_headless_with_runs(html, 700.0, Duration::from_secs(120), backend);
     assert!(table.runs.len() > 100, "only {} runs", table.runs.len());
 
     // The same copy the HTML-level test looks for is present as runs, in
@@ -174,8 +192,16 @@ fn meilleurtaux_text_run_table_covers_the_visible_text_in_reading_order() {
 
 #[test]
 fn meilleurtaux_select_all_copies_readable_text() {
+    // Copy is geometry over the run table, so it must read the same whichever
+    // engine (and so whichever fonts) laid the page out.
+    for backend in [Backend::Pixbuf, Backend::Painter] {
+        select_all_copies_readable_text(backend);
+    }
+}
+
+fn select_all_copies_readable_text(backend: Backend) {
     let html = esmail::render::render_message(&fixture("meilleurtaux.eml"));
-    let (_, _, table) = render_headless_with_runs(html, 700.0, Duration::from_secs(120));
+    let (_, _, table) = render_headless_with_runs(html, 700.0, Duration::from_secs(120), backend);
     let copied = table.selection_text(&table.select_all().expect("the page has text"));
 
     // Paragraphs are separated by a blank line, in reading order.
@@ -222,6 +248,26 @@ Encadrement renforcé des paiements en plusieurs fois."
     assert!(copied.trim() == copied);
 }
 
+/// The two backends run the same litehtml layout; only text measurement (and
+/// so, at the margins, line breaks) differs -- and it can differ a lot, since
+/// each picks its own fonts (Pixbuf falls back to the platform default for a
+/// `font-family` list, the painter resolves it). So this is a sanity band, not
+/// an equality: a collapsed layout is ~100pt and a runaway one is huge. On the
+/// machine this was written on they agree to within about 1%.
+#[test]
+fn both_backends_lay_the_fixture_out_to_a_similar_height() {
+    let html = esmail::render::render_message(&fixture("meilleurtaux.eml"));
+    for width in [400.0, 700.0, 1100.0] {
+        let limit = Duration::from_secs(120);
+        let (_, pixbuf) = render_headless_with(html.clone(), width, limit, Backend::Pixbuf);
+        let (_, painter) = render_headless_with(html.clone(), width, limit, Backend::Painter);
+        eprintln!("meilleurtaux.eml @{width}pt: pixbuf {:.0}pt tall, painter {:.0}pt tall", pixbuf.y, painter.y);
+        assert!((painter.x - width).abs() < 2.0, "painter laid out at the wrong width: {}", painter.x);
+        let ratio = painter.y / pixbuf.y;
+        assert!((0.75..1.33).contains(&ratio), "@{width}pt: painter {:.0}pt vs pixbuf {:.0}pt", painter.y, pixbuf.y);
+    }
+}
+
 /// Timing across widths, for comparing changes. `--include-ignored` to run.
 #[test]
 #[ignore = "benchmark: prints timings, asserts nothing about them"]
@@ -231,8 +277,14 @@ fn bench_fixtures_across_widths() {
         let html = esmail::render::render_message(&raw);
         eprintln!("{name}: render_message (parse + sanitize) {:?}", t.elapsed());
         for width in [400.0, 700.0, 1100.0] {
-            let (elapsed, size) = render_headless(html.clone(), width, Duration::from_secs(600));
-            eprintln!("{name} @{width}pt: {elapsed:?} (layout+paint incl. worker start), content {:.0}pt tall", size.y);
+            for backend in [Backend::Pixbuf, Backend::Painter] {
+                let (elapsed, size) = render_headless_with(html.clone(), width, Duration::from_secs(600), backend);
+                eprintln!(
+                    "{name} @{width}pt {:>7}: {elapsed:?} (layout+paint incl. worker start), content {:.0}pt tall",
+                    backend.name(),
+                    size.y
+                );
+            }
         }
     }
 }

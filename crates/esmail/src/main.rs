@@ -6,7 +6,7 @@ use esmail::{compose, config, db, idle_watch, imap, notify, render, screenshot, 
 use esmail::tray;
 
 use egui_litehtml_webview::{
-    ImageRequest, InterceptOutcome, WebView, WebViewConfig, WebViewHandler, WebViewHost,
+    Backend, ImageRequest, InterceptOutcome, WebView, WebViewConfig, WebViewHandler, WebViewHost,
     WebViewSource,
 };
 use imap::{ImapActor, ImapCommand, ImapEvent, MailHeader};
@@ -121,6 +121,9 @@ struct EsMailApp {
     /// opened. See [`MessageViewHandler`].
     message_view_handler: Arc<MessageViewHandler>,
     screenshotter: screenshot::Screenshotter,
+    /// The renderer the window title currently names (`None` until the first
+    /// frame sets it).
+    title_backend: Option<Backend>,
     /// Show only the webview, with no IMAP account. See ESMAIL_PREVIEW.
     preview: bool,
     imap_tx: mpsc::Sender<ImapCommand>,
@@ -420,9 +423,18 @@ impl EsMailApp {
         // egui-litehtml-webview's `WebViewHost` doc), so this is infallible.
         let web_view_host = WebViewHost::new();
         let message_view_handler = Arc::new(MessageViewHandler::new());
+        // Which engine paints message bodies: `ESMAIL_RENDERER=pixbuf` (tiny-skia,
+        // the default) or `painter` (egui's own painter). F9 flips it live.
+        let backend = match std::env::var("ESMAIL_RENDERER") {
+            Ok(name) => Backend::from_name(&name).unwrap_or_else(|| {
+                log::warn!("ESMAIL_RENDERER={name:?} is not `pixbuf` or `painter`; using the default");
+                Backend::default()
+            }),
+            Err(_) => Backend::default(),
+        };
         let web_view = web_view_host.new_view(
             &cc.egui_ctx,
-            WebViewConfig::new(source).with_handler(message_view_handler.clone()),
+            WebViewConfig::new(source).with_handler(message_view_handler.clone()).with_backend(backend),
         );
 
         // Skipped in preview/screenshot mode: HANDOFF.md's automated
@@ -453,6 +465,7 @@ impl EsMailApp {
             web_view,
             message_view_handler,
             screenshotter: screenshot::Screenshotter::from_env(),
+            title_backend: None,
             preview: preview.is_some(),
             imap_tx: imap_cmd_tx,
             imap_rx: imap_evt_rx,
@@ -1445,6 +1458,20 @@ impl eframe::App for EsMailApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.screenshotter.update(ui.ctx(), !self.web_view.is_rendering());
 
+        // F9: flip the message renderer between the two engines, to compare
+        // them on the message in front of you.
+        if ui.ctx().input(|i| i.key_pressed(egui::Key::F9)) {
+            let next = self.web_view.backend().other();
+            log::info!("message renderer: {}", next.name());
+            self.web_view.set_backend(next);
+        }
+        // The window title names the renderer in use (set on change only).
+        let backend = self.web_view.backend();
+        if self.title_backend != Some(backend) {
+            self.title_backend = Some(backend);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(format!("esMail \u{2014} {}", backend.name())));
+        }
+
         // Window-geometry persistence (B9): keep the latest known outer rect
         // around every frame (cheap -- just a field write, no I/O), and
         // write it to config.toml exactly once when a real close is going
@@ -1482,6 +1509,23 @@ impl eframe::App for EsMailApp {
                     log::info!("preview: link clicked -> {url}");
                 }
             });
+            // Which engine drew this, and how long it took: makes a screenshot
+            // (or a glance) say what it is a picture of.
+            let badge = format!(
+                "{} \u{b7} {} \u{b7} F9 switches",
+                self.web_view.backend().name(),
+                self.web_view
+                    .last_render_time()
+                    .map_or_else(|| "rendering...".to_string(), |t| format!("{} ms", t.as_millis())),
+            );
+            egui::Area::new(egui::Id::new("renderer_badge"))
+                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-20.0, -8.0))
+                .interactable(false)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.label(egui::RichText::new(badge).monospace().small());
+                    });
+                });
             return;
         }
 
