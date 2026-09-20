@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use egui_litehtml_webview::{WebView, WebViewConfig, WebViewHost, WebViewSource};
+use egui_litehtml_webview::{TextRunTable, WebView, WebViewConfig, WebViewHost, WebViewSource};
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
@@ -40,6 +40,12 @@ fn fixtures() -> Vec<(String, Vec<u8>)> {
 /// What one full layout + paint of `html` at `width` points took, and the
 /// content size it produced. Gives up (fails the test) after `limit`.
 fn render_headless(html: String, width: f32, limit: Duration) -> (Duration, egui::Vec2) {
+    let (elapsed, size, _) = render_headless_with_runs(html, width, limit);
+    (elapsed, size)
+}
+
+/// As [`render_headless`], also returning where the page's text ended up.
+fn render_headless_with_runs(html: String, width: f32, limit: Duration) -> (Duration, egui::Vec2, TextRunTable) {
     let ctx = egui::Context::default();
     let host = WebViewHost::new();
     let mut view: WebView = host.new_view(&ctx, WebViewConfig::new(WebViewSource::Html(html)));
@@ -69,7 +75,7 @@ fn render_headless(html: String, width: f32, limit: Duration) -> (Duration, egui
     }
     let elapsed = started.elapsed();
     let size = view.content_size().expect("a frame was produced");
-    (elapsed, size)
+    (elapsed, size, view.text_runs().clone())
 }
 
 // ─── meilleurtaux.eml ───────────────────────────────────────────────────────
@@ -124,6 +130,46 @@ fn meilleurtaux_lays_out_in_bounded_time_at_a_plausible_height() {
         "content height {} pt is implausible for this message",
         size.y
     );
+}
+
+#[test]
+fn meilleurtaux_text_run_table_covers_the_visible_text_in_reading_order() {
+    let html = esmail::render::render_message(&fixture("meilleurtaux.eml"));
+    let (_, size, table) = render_headless_with_runs(html, 700.0, Duration::from_secs(120));
+    assert!(table.runs.len() > 100, "only {} runs", table.runs.len());
+
+    // The same copy the HTML-level test looks for is present as runs, in
+    // that order down the page.
+    let text: String = table.runs.iter().map(|r| r.text.as_str()).collect();
+    let mut last_y = f32::MIN;
+    for phrase in [
+        "Rentrée 2026",
+        "Les nouveautés à connaître avant de financer vos projets",
+        "Je découvre les taux",
+        "Auto : acheter ou louer, comment choisir ?",
+    ] {
+        // Words and the spaces between them are separate runs, so join them
+        // (as a copy would) and search the whole thing.
+        assert!(text.contains(phrase), "the run table is missing {phrase:?}");
+        let first_word = phrase.split(' ').next().unwrap();
+        let run = table.runs.iter().find(|r| r.text == first_word).unwrap();
+        assert!(run.rect.min.y >= last_y - 1.0, "{phrase:?} is out of reading order");
+        last_y = run.rect.min.y;
+    }
+
+    // Every word sits inside the page and has offsets that agree with its
+    // text; hidden text (the preheader) never got in. Whitespace runs are
+    // exempt from the bounds: litehtml keeps collapsed whitespace boxes
+    // (e.g. after the last block) that can hang a line below the page.
+    for r in &table.runs {
+        if r.text.trim().is_empty() {
+            continue;
+        }
+        assert!(r.rect.min.x >= -1.0 && r.rect.max.x <= size.x + 1.0, "{:?} spills sideways: {:?}", r.text, r.rect);
+        assert!(r.rect.min.y >= 0.0 && r.rect.max.y <= size.y + 1.0, "{:?} is off the page: {:?}", r.text, r.rect);
+        assert_eq!(r.offsets.len(), r.text.chars().count() + 1);
+        assert!(r.offsets.windows(2).all(|w| w[0] <= w[1]));
+    }
 }
 
 /// Timing across widths, for comparing changes. `--include-ignored` to run.
