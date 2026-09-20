@@ -15,7 +15,7 @@ image.workspace = true
 # versions cosmic-text (the Pixbuf backend's text stack) already pulls in, so
 # these add no new crates to the graph.
 fontdb = { version = "0.16", default-features = false, features = ["std", "fs", "memmap"] }
-ttf-parser = { version = "0.20", default-features = false, features = ["std"] }
+ttf-parser = { version = "0.20", default-features = false, features = ["std", "variable-fonts"] }
 
 [dev-dependencies]
 eframe.workspace = true

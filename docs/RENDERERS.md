@@ -44,6 +44,15 @@ remote images already downloaded are not fetched again.
   the platform default face (Segoe UI here; a serif at `font-weight:500`, visibly
   wrong). The painter resolves the list entry by entry with CSS weight/style
   matching. `fonts::tests` and `painter::tests` cover this.
+- **Fonts that are not the default one.** Beyond plain family names, the painter
+  finds the *legacy* names mail actually uses (`Segoe UI Semibold`, `Calibri
+  Light`, `Arial Black`: `fontdb` only indexes the typographic family), applies
+  `font-weight` to **variable** fonts through their `wght` axis (`Bahnschrift`,
+  `Segoe UI Variable`), and reads a trailing weight word on an unknown name as a
+  weight of the base family (`Bahnschrift Light`; an uninstalled weight such as
+  `Open Sans Light` draws in the nearest installed weight of `Open Sans` rather
+  than skipping to the next family in the list, which a browser would do).
+  Without these, each of those names fell through to Arial.
 - **`text-decoration`.** litehtml only passes underline / line-through as font
   flags and never draws them; `PixbufContainer` never reads them, so **links are
   not underlined**. The painter draws underline, line-through and overline.
