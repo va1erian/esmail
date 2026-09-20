@@ -62,8 +62,10 @@ with no account, captures, and exits.
 ## Things worth knowing
 
 - `egui::Panel::top` is current; `TopBottomPanel` is deprecated.
-- Link clicks and hit tests resolve on the render thread, a frame or more after
-  the click.
+- Link clicks and the hand cursor resolve on the UI thread from the frame's
+  `LinkTable` (recorded in the draw pass, like the text runs), so a click is
+  reported by the same `show()` call that saw it. Needs litehtml-rs's
+  `element-tag-attr` branch (`Element::tag_name()` / `attr()`); see Cargo.toml.
 - The mock server only implements the IMAP/SMTP commands the tests needed
   (see `imap_server.rs`'s module doc). If your change sends a new command or
   fetch shape, extend the mock server first.
@@ -118,8 +120,8 @@ Things learned that are not obvious from the code:
 - Building the table costs ~26 ms on a ~220 ms release render of the
   Meilleurtaux fixture (per-character measuring); it shrinks with #28.
 
-Not done: hand cursor over links and "Copy link address" (need link rectangles,
-the same table work as #27), keeping a selection across a re-layout that
+Not done: "Copy link address" (the `LinkTable` from #27 now has what it needs),
+keeping a selection across a re-layout that
 changes the words (only identical text is kept), and no manual check on a real
 window with a real mouse yet (the tests drive synthetic egui input; a
 screenshot with everything selected looked right).
