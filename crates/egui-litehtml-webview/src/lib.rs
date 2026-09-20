@@ -79,6 +79,19 @@
 //! message would fail to upload), each its own egui texture, painted edge to
 //! edge.
 //!
+//! # Two backends, side by side
+//!
+//! [`Backend::Pixbuf`] is everything described above. [`Backend::Painter`]
+//! keeps the same worker, job queue, superseding and image pipeline but swaps
+//! what happens to litehtml's layout: instead of rasterizing into a bitmap,
+//! the worker measures text with egui's own font stack and *records a display
+//! list* (rects, gradient meshes, glyph runs, image quads, clips), which the UI
+//! thread paints with `egui::Painter` every frame, culled to the visible
+//! region. No canvas, no tiles, no flattening onto white; text is crisp at any
+//! DPI. See `painter.rs` and `fonts.rs`. Both are always compiled in and
+//! selectable per view ([`WebViewConfig::with_backend`],
+//! [`WebView::set_backend`]) so a page can be compared under each.
+//!
 //! # Sanitization stays the host's job
 //!
 //! litehtml's `email` feature includes its own `prepare_html`/
@@ -93,11 +106,14 @@
 
 pub use url;
 
-use std::collections::VecDeque;
+mod fonts;
+mod painter;
+
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use litehtml::email::EMAIL_MASTER_CSS;
 use litehtml::html::decode_data_uri;
@@ -236,13 +252,62 @@ pub trait WebViewHandler: Send + Sync {
 struct DefaultHandler;
 impl WebViewHandler for DefaultHandler {}
 
+// ─── Backend ─────────────────────────────────────────────────────────────────
+
+/// Which engine turns litehtml's layout into pixels for a view.
+///
+/// Both are always compiled in and can be switched per view at runtime
+/// ([`WebViewConfig::with_backend`], [`WebView::set_backend`]), so the same
+/// page can be compared under each. See the crate docs for the design of each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Backend {
+    /// litehtml's `PixbufContainer`: tiny-skia + cosmic-text rasterize the
+    /// page into a bitmap on the worker thread, shown as GPU textures.
+    #[default]
+    Pixbuf,
+    /// egui's own painter: the worker lays the page out (measuring text with
+    /// egui's fonts) and records a display list, which the UI thread paints
+    /// every frame.
+    Painter,
+}
+
+impl Backend {
+    /// The other one.
+    pub fn other(self) -> Self {
+        match self {
+            Backend::Pixbuf => Backend::Painter,
+            Backend::Painter => Backend::Pixbuf,
+        }
+    }
+
+    /// `"pixbuf"` or `"painter"`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Pixbuf => "pixbuf",
+            Backend::Painter => "painter",
+        }
+    }
+
+    /// Parse a name as written in an environment variable: `pixbuf` /
+    /// `tiny-skia` / `skia`, or `painter` / `egui`, in any case.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "pixbuf" | "tiny-skia" | "tinyskia" | "skia" => Some(Backend::Pixbuf),
+            "painter" | "egui" => Some(Backend::Painter),
+            _ => None,
+        }
+    }
+}
+
 // ─── WebViewHost ─────────────────────────────────────────────────────────────
 
 /// Creates [`WebView`]s.
 ///
-/// litehtml's `pixbuf` backend renders entirely on the CPU, so there is no
-/// engine to own, no window handle, and no GL context to set up. This type
-/// still exists (rather than a bare associated function on `WebView`) to
+/// Neither [`Backend`] needs an engine to own, a window handle or a GL context:
+/// [`Backend::Pixbuf`] renders entirely on the CPU, and [`Backend::Painter`] only
+/// needs the views' `egui::Context` (it installs the fonts its pages use into
+/// it, next to whatever the host set up; the names it adds are unique per view,
+/// so any number of views can share one context). This type still exists (rather than a bare associated function on `WebView`) to
 /// keep the call shape `esmail`'s `main.rs` already uses -- one host per
 /// window, producing any number of views -- even though today it is little
 /// more than an id counter so two views in the same window don't collide on
@@ -253,8 +318,8 @@ pub struct WebViewHost {
 }
 
 impl WebViewHost {
-    /// Create a host. Takes nothing: litehtml's CPU-only `pixbuf` backend
-    /// needs nothing from the host window (no window handle, no GL context).
+    /// Create a host. Takes nothing: neither backend needs anything from the
+    /// host window (no window handle, no GL context).
     pub fn new() -> Self {
         Self::default()
     }
@@ -279,8 +344,9 @@ impl WebViewHost {
             .name(format!("litehtml-worker-{view_id}"))
             .spawn(move || {
                 // Created here, not on the caller's thread: PixbufContainer
-                // is !Send. It also loads system fonts, which is slow
-                // enough that it should not block the UI at startup either.
+                // is !Send. (The engines themselves are created lazily, on
+                // the first job that needs them: loading system fonts is slow
+                // enough that it should not block the UI at startup either.)
                 Worker::new(worker_ctx, handler, out_tx, worker_latest).run(job_rx);
             });
         if let Err(e) = &spawned {
@@ -289,11 +355,14 @@ impl WebViewHost {
 
         WebView {
             html: Arc::new(html),
+            backend: config.backend,
             tx: job_tx,
             rx: out_rx,
             latest_id,
             submitted_id: 0,
             textures: Vec::new(),
+            list: None,
+            fonts_requested: None,
             texture_name: format!("egui_litehtml_webview_{view_id}"),
             frame_size: egui::Vec2::ZERO,
             frame_layout_width: 1.0,
@@ -307,6 +376,10 @@ impl WebViewHost {
             runs: Arc::default(),
             runs_signature: 0,
             selection: None,
+            last_render: None,
+            scroll_y: 0.0,
+            pending_scroll: None,
+            content_shown: false,
         }
     }
 }
@@ -320,19 +393,27 @@ pub struct WebViewConfig {
     /// Which images this view is allowed to load. `None` uses
     /// [`DefaultHandler`]'s behaviour: no image is ever fetched.
     pub handler: Option<Arc<dyn WebViewHandler>>,
+    /// Which engine paints the view. Defaults to [`Backend::Pixbuf`].
+    pub backend: Backend,
 }
 
 impl WebViewConfig {
     /// A config that loads `source`, with the default (no images fetched)
-    /// policy.
+    /// policy and the default [`Backend`].
     pub fn new(source: WebViewSource) -> Self {
-        Self { source, handler: None }
+        Self { source, handler: None, backend: Backend::default() }
     }
 
     /// Use `handler` for this view's image-loading decisions instead of the
     /// default policy.
     pub fn with_handler(mut self, handler: Arc<dyn WebViewHandler>) -> Self {
         self.handler = Some(handler);
+        self
+    }
+
+    /// Paint with `backend` instead of the default.
+    pub fn with_backend(mut self, backend: Backend) -> Self {
+        self.backend = backend;
         self
     }
 }
@@ -345,6 +426,8 @@ impl WebViewConfig {
 pub struct WebView {
     /// The HTML currently loaded. Shared with the worker's jobs.
     html: Arc<String>,
+    /// The engine painting this view.
+    backend: Backend,
     tx: Sender<Job>,
     rx: Receiver<Output>,
     /// Id of the newest render job, shared with the worker so it can notice
@@ -353,18 +436,24 @@ pub struct WebView {
     /// Id of the newest render job this view submitted; frames with any
     /// other id are stale and ignored.
     submitted_id: u64,
-    /// The current frame, one texture per tile (see [`Tile`]). Reused across
-    /// frames when the tile count is unchanged; reallocating per frame would
-    /// be wasteful. Empty until the first frame arrives.
+    /// [`Backend::Pixbuf`]: the current frame, one texture per tile (see
+    /// [`Tile`]). Reused across frames when the tile count is unchanged;
+    /// reallocating per frame would be wasteful. Empty until the first frame
+    /// arrives.
     textures: Vec<TileTexture>,
+    /// [`Backend::Painter`]: the current display list.
+    list: Option<painter::ListFrame>,
+    /// The font definitions last handed to the context, and the pass they were
+    /// handed over in (see [`WebView::ensure_fonts`]).
+    fonts_requested: Option<(Arc<egui::epaint::text::FontDefinitions>, u64)>,
     /// Unique per view, so two views cannot collide on one egui texture.
     texture_name: String,
     /// What the current frame should be displayed as, in egui points.
     frame_size: egui::Vec2,
-    /// The layout width the current texture was rendered at, in points --
+    /// The layout width the current frame was rendered at, in points --
     /// hit tests must be laid out at the same width to line up.
     frame_layout_width: f32,
-    /// `pixels_per_point` the current texture was rendered at.
+    /// `pixels_per_point` the current frame was rendered at.
     frame_scale: f32,
     /// The width/DPI of the newest render job submitted, to notice when the
     /// widget has since changed size.
@@ -387,6 +476,14 @@ pub struct WebView {
     runs_signature: u64,
     /// The selected text, as carets into `runs`.
     selection: Option<Selection>,
+    /// How long the worker took over the newest finished render job.
+    last_render: Option<Duration>,
+    /// Vertical scroll offset as of the last `show()`, points.
+    scroll_y: f32,
+    /// Scroll offset to apply on the next `show()`.
+    pending_scroll: Option<f32>,
+    /// The current page has been allocated in the scroll area at least once.
+    content_shown: bool,
 }
 
 impl WebView {
@@ -402,7 +499,7 @@ impl WebView {
     pub fn load(&mut self, source: WebViewSource) {
         let WebViewSource::Html(html) = source;
         self.html = Arc::new(html);
-        self.textures.clear();
+        self.discard_frames();
         self.runs = Arc::default();
         self.runs_signature = 0;
         self.selection = None;
@@ -435,6 +532,48 @@ impl WebView {
         self.dirty = true;
     }
 
+    /// Which engine is painting this view.
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    /// Switch engines and re-render the current page with the new one. The
+    /// old picture is dropped straight away (as in [`WebView::load`]).
+    pub fn set_backend(&mut self, backend: Backend) {
+        if backend == self.backend {
+            return;
+        }
+        // Come back to the same spot (comparing engines is the point of
+        // switching): the placeholder shown meanwhile has no content, so egui
+        // would otherwise clamp the offset to 0.
+        self.pending_scroll.get_or_insert(self.scroll_y);
+        self.backend = backend;
+        self.discard_frames();
+        self.failed = false;
+        self.submitted_id += 1;
+        self.latest_id.store(self.submitted_id, Ordering::SeqCst);
+        self.reset_images = true;
+        self.dirty = true;
+    }
+
+    /// How long the worker took over the newest finished render (parse +
+    /// layout + paint / record, image passes included), or `None` before the
+    /// first one. For comparing backends.
+    pub fn last_render_time(&self) -> Option<Duration> {
+        self.last_render
+    }
+
+    /// The vertical scroll offset, in points, as of the last [`WebView::show`].
+    pub fn scroll_offset(&self) -> f32 {
+        self.scroll_y
+    }
+
+    /// Scroll to `y` points on the next [`WebView::show`] that has a page to
+    /// scroll (so it may be called before the first render has finished).
+    pub fn set_scroll_offset(&mut self, y: f32) {
+        self.pending_scroll = Some(y);
+    }
+
     /// Whether the worker has (or is about to have) work outstanding for
     /// the current page. Useful for hosts that want to wait for the page to
     /// settle, e.g. before taking a screenshot.
@@ -446,7 +585,7 @@ impl WebView {
     /// until the first frame has arrived. Its height is the document's
     /// content height at the width it was laid out at.
     pub fn content_size(&self) -> Option<egui::Vec2> {
-        (!self.textures.is_empty()).then_some(self.frame_size)
+        self.has_frame().then_some(self.frame_size)
     }
 
     /// Where the text of the frame currently shown is, in document points
@@ -475,46 +614,26 @@ impl WebView {
         }
 
         // The whole document is rendered up front at its full content
-        // height, so a plain `ScrollArea` around a normally-sized allocation
-        // gets a native scrollbar and native wheel-scroll for free. The
-        // picture is a grid of tiles (a GPU texture has a maximum side length, and a long
-        // message is taller than that), painted edge to edge.
-        egui::ScrollArea::vertical()
-            .id_salt(&self.texture_name)
-            .show(ui, |ui| {
-                if self.textures.is_empty() {
-                    if self.failed {
-                        ui.label("Could not render this message.");
-                    } else if self.rendering {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Rendering...");
-                        });
-                    }
-                    return;
-                }
-                let (rect, resp) = ui.allocate_exact_size(self.frame_size, egui::Sense::click_and_drag());
-                let clip = ui.clip_rect();
-                let scale = self.frame_scale;
-                for tile in &self.textures {
-                    let [w, h] = tile.handle.size();
-                    let min = rect.min + egui::vec2(tile.x_px as f32, tile.y_px as f32) / scale;
-                    let tile_rect = egui::Rect::from_min_size(min, egui::vec2(w as f32, h as f32) / scale);
-                    // A long message is many screens of tiles; only paint
-                    // the ones that can be seen.
-                    if tile_rect.intersects(clip) {
-                        ui.painter().image(
-                            tile.handle.id(),
-                            tile_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
-                    }
-                }
-
-                self.paint_selection(ui, rect);
-                self.interact(ui, &resp, rect);
-            });
+        // height -- unlike the Servo-backed predecessor, which had to poll a
+        // JS bridge and paint a hand-rolled overlay scrollbar (issue #15)
+        // because Servo exposed no scroll-position getter/setter at all. A
+        // plain `ScrollArea` around a normally-sized allocation gets a native
+        // scrollbar and native wheel-scroll for free.
+        let mut area = egui::ScrollArea::vertical().id_salt(&self.texture_name);
+        // Held back until the page has been laid out in the scroll area on an
+        // earlier frame: with no content there egui would clamp the offset to 0
+        // and the request would be lost. (A frame can have a picture yet still
+        // show a placeholder -- the Painter backend waits for its fonts.)
+        if self.content_shown
+            && let Some(y) = self.pending_scroll.take()
+        {
+            area = area.vertical_scroll_offset(y);
+        }
+        let output = area.show(ui, |ui| match self.backend {
+            Backend::Pixbuf => self.show_pixbuf(ui),
+            Backend::Painter => self.show_painter(ui),
+        });
+        self.scroll_y = output.state.offset.y;
 
         events
     }
@@ -629,6 +748,7 @@ impl WebView {
                         scale: self.frame_scale,
                         x: pos.x - rect.left(),
                         y: pos.y - rect.top(),
+                        backend: self.backend,
                     }));
                 }
             }
@@ -686,6 +806,116 @@ impl WebView {
         }
     }
 
+    // ── Private: painting ───────────────────────────────────────────────────
+
+    /// Whether there is a picture (or display list) for the current backend.
+    fn has_frame(&self) -> bool {
+        match self.backend {
+            Backend::Pixbuf => !self.textures.is_empty(),
+            Backend::Painter => self.list.is_some(),
+        }
+    }
+
+    fn discard_frames(&mut self) {
+        self.textures.clear();
+        self.list = None;
+        self.fonts_requested = None;
+        self.last_render = None;
+        self.content_shown = false;
+    }
+
+    /// What to show while there is nothing to paint yet.
+    fn show_placeholder(&self, ui: &mut egui::Ui) {
+        if self.failed {
+            ui.label("Could not render this message.");
+        } else if self.rendering {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Rendering...");
+            });
+        }
+    }
+
+    /// [`Backend::Pixbuf`]: the page is a grid of tiles (a GPU texture has a
+    /// maximum side length, and a long message is taller than that), painted
+    /// edge to edge.
+    fn show_pixbuf(&mut self, ui: &mut egui::Ui) {
+        if self.textures.is_empty() {
+            self.show_placeholder(ui);
+            return;
+        }
+        let (rect, resp) = ui.allocate_exact_size(self.frame_size, egui::Sense::click_and_drag());
+        self.content_shown = true;
+        let clip = ui.clip_rect();
+        let scale = self.frame_scale;
+        for tile in &self.textures {
+            let [w, h] = tile.handle.size();
+            let min = rect.min + egui::vec2(tile.x_px as f32, tile.y_px as f32) / scale;
+            let tile_rect = egui::Rect::from_min_size(min, egui::vec2(w as f32, h as f32) / scale);
+            // A long message is many screens of tiles; only paint
+            // the ones that can be seen.
+            if tile_rect.intersects(clip) {
+                ui.painter().image(
+                    tile.handle.id(),
+                    tile_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+        self.paint_selection(ui, rect);
+        self.interact(ui, &resp, rect);
+    }
+
+    /// [`Backend::Painter`]: replay the display list, culled to what is
+    /// visible.
+    fn show_painter(&mut self, ui: &mut egui::Ui) {
+        let Some((list, defs)) = self.list.as_ref().map(|f| (f.list.clone(), f.defs.clone())) else {
+            self.show_placeholder(ui);
+            return;
+        };
+        if !self.ensure_fonts(ui.ctx(), &list.families, &defs) {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading fonts...");
+            });
+            return;
+        }
+        let (rect, resp) = ui.allocate_exact_size(list.size, egui::Sense::click_and_drag());
+        self.content_shown = true;
+        // litehtml only paints where CSS says to; a browser canvas is white.
+        ui.painter().rect_filled(rect, 0.0, egui::Color32::WHITE);
+        painter::paint(&list, ui.painter(), rect.min);
+        self.paint_selection(ui, rect);
+        self.interact(ui, &resp, rect);
+    }
+
+    /// egui panics when asked to lay out a font family it does not know, and
+    /// new fonts only reach it at the start of the next pass. So the list is
+    /// only painted once the context reports every family it uses; until then
+    /// this hands the worker's fonts over and asks for another frame.
+    fn ensure_fonts(
+        &mut self,
+        ctx: &egui::Context,
+        families: &[egui::epaint::text::FontFamily],
+        defs: &Arc<egui::epaint::text::FontDefinitions>,
+    ) -> bool {
+        if painter::fonts_ready(ctx, defs, families) {
+            return true;
+        }
+        let pass = ctx.cumulative_pass_nr();
+        // Install once per set of definitions -- but again if they still have
+        // not shown up a few passes later (the host may have replaced the
+        // context's fonts in between).
+        let stale = self.fonts_requested.as_ref().is_none_or(|(d, at)| !Arc::ptr_eq(d, defs) || pass > at + 3);
+        if stale {
+            painter::install_fonts(ctx, defs);
+            self.fonts_requested = Some((defs.clone(), pass));
+        }
+        ctx.request_repaint();
+        false
+    }
+
     // ── Private: talking to the worker ───────────────────────────────────
 
     /// Queue a render of the current HTML at `width` logical points.
@@ -700,6 +930,7 @@ impl WebView {
             width,
             scale: dpi,
             reset_images: std::mem::take(&mut self.reset_images),
+            backend: self.backend,
         };
         if self.tx.send(Job::Render(job)).is_err() {
             log::error!("egui-litehtml-webview: the render thread is gone");
@@ -713,6 +944,20 @@ impl WebView {
         self.dirty = false;
     }
 
+    /// Take the text table of a new frame (either backend's).
+    fn accept_runs(&mut self, runs: Arc<TextRunTable>) {
+        self.runs = runs;
+        // A new layout of the same text (a resize, images arriving, or the
+        // other backend) keeps the selection: carets are run indexes, and the
+        // same words come out in the same order. Different text (another
+        // message) cannot.
+        let signature = self.runs.text_signature();
+        if signature != self.runs_signature {
+            self.selection = None;
+            self.runs_signature = signature;
+        }
+    }
+
     /// Apply everything the worker has produced so far. Returns the link
     /// clicks among it.
     fn poll_worker(&mut self, ctx: &egui::Context) -> Vec<WebViewEvent> {
@@ -723,16 +968,7 @@ impl WebView {
                     self.frame_size = frame.size_points;
                     self.frame_layout_width = frame.layout_width;
                     self.frame_scale = frame.scale;
-                    self.runs = frame.runs;
-                    // A new layout of the same text (a resize, images
-                    // arriving) keeps the selection: carets are run indexes,
-                    // and the same words come out in the same order. Different
-                    // text (another message) cannot.
-                    let signature = self.runs.text_signature();
-                    if signature != self.runs_signature {
-                        self.selection = None;
-                        self.runs_signature = signature;
-                    }
+                    self.accept_runs(frame.runs);
                     self.textures.truncate(frame.tiles.len());
                     for (i, tile) in frame.tiles.into_iter().enumerate() {
                         match self.textures.get_mut(i) {
@@ -753,9 +989,17 @@ impl WebView {
                         }
                     }
                 }
+                Ok(Output::List(frame)) if frame.id == self.submitted_id => {
+                    self.frame_size = frame.list.size;
+                    self.frame_layout_width = frame.layout_width;
+                    self.frame_scale = frame.scale;
+                    self.accept_runs(frame.runs.clone());
+                    self.list = Some(frame);
+                }
+                Ok(Output::Stats { id, elapsed }) if id == self.submitted_id => self.last_render = Some(elapsed),
                 Ok(Output::Done { id, ok }) if id == self.submitted_id => {
                     self.rendering = false;
-                    self.failed = !ok && self.textures.is_empty();
+                    self.failed = !ok && !self.has_frame();
                 }
                 Ok(Output::Link(url)) => events.push(WebViewEvent::LinkClicked(url)),
                 // A frame/completion for a superseded job.
@@ -765,7 +1009,7 @@ impl WebView {
                     if self.rendering {
                         log::error!("egui-litehtml-webview: the render thread died mid-render");
                         self.rendering = false;
-                        self.failed = self.textures.is_empty();
+                        self.failed = !self.has_frame();
                     }
                     break;
                 }
@@ -792,6 +1036,8 @@ struct RenderJob {
     scale: f32,
     /// Forget which image URLs were already requested before starting.
     reset_images: bool,
+    /// Which engine paints it.
+    backend: Backend,
 }
 
 struct HitTestJob {
@@ -802,12 +1048,18 @@ struct HitTestJob {
     /// Click position within the frame, egui points.
     x: f32,
     y: f32,
+    /// The engine the clicked frame came from (fonts differ, so layout does).
+    backend: Backend,
 }
 
 /// Worker -> UI thread.
 enum Output {
-    /// A finished (or intermediate) picture of the page.
+    /// A finished (or intermediate) bitmap of the page ([`Backend::Pixbuf`]).
     Frame(Frame),
+    /// A finished (or intermediate) display list ([`Backend::Painter`]).
+    List(painter::ListFrame),
+    /// How long render job `id` took overall. Sent just before its `Done`.
+    Stats { id: u64, elapsed: Duration },
     /// The render job `id` has nothing more to send. `ok` is false when the
     /// document could not be rendered at all.
     Done { id: u64, ok: bool },
@@ -853,7 +1105,7 @@ fn tile_ranges(total: usize, max: usize) -> Vec<(usize, usize)> {
 }
 
 /// Composite premultiplied-alpha RGBA in place onto opaque white. See
-/// [`Worker::emit_frame`] for why: `out = src_channel + (255 - alpha)`.
+/// [`PixbufEngine::frame`] for why: `out = src_channel + (255 - alpha)`.
 fn flatten_onto_white(rgba: &mut [u8]) {
     for px in rgba.chunks_exact_mut(4) {
         let alpha = px[3];
@@ -880,19 +1132,34 @@ fn extract_tile(pixels: &[u8], stride_px: usize, x: usize, y: usize, w: usize, h
     egui::ColorImage::from_rgba_premultiplied([w, h], &buf)
 }
 
-// ─── Worker ──────────────────────────────────────────────────────────────────
+// ─── Engines ─────────────────────────────────────────────────────────────────
 
-/// Everything that lives on the worker thread.
-struct Worker {
+/// One way of turning litehtml's layout into something the UI can show. The
+/// worker drives whichever [`Backend`] a job asks for through this; everything
+/// around it (job queue, superseding, image discovery and fetching) is shared.
+trait Engine {
+    /// Forget which image URLs were already requested.
+    fn clear_pending_images(&mut self);
+    /// Image URLs layout discovered that are not loaded yet.
+    fn take_pending_images(&mut self) -> Vec<(String, bool)>;
+    /// Decode `bytes` and remember them as the image at `url`.
+    fn load_image_data(&mut self, url: &str, bytes: &[u8]);
+    /// Lay the document out at `width` points and paint / record it from
+    /// scratch. Returns the content height in points, or `None` if the HTML
+    /// could not be parsed.
+    fn draw_pass(&mut self, html: &str, width: f32, scale: f32) -> Option<f32>;
+    /// What the UI needs to show the last `draw_pass`.
+    fn frame(&mut self, id: u64, width: f32, scale: f32, content_height: f32, max_texture_side: usize) -> Option<Output>;
+    /// The anchor URL under document-local `(x, y)` (points), if any.
+    fn hit_test(&mut self, html: &str, width: f32, scale: f32, x: f32, y: f32) -> Option<String>;
+}
+
+/// [`Backend::Pixbuf`]: litehtml-rs's `PixbufContainer` (tiny-skia, cosmic-text).
+struct PixbufEngine {
     /// Owns the rendered pixels, the fonts and the decoded images. Reused
     /// across jobs (fonts are expensive to load; decoded images are keyed by
     /// URL, so re-opening a message does not re-download its images).
     container: PixbufContainer,
-    handler: Arc<dyn WebViewHandler>,
-    ctx: egui::Context,
-    out: Sender<Output>,
-    /// See [`WebView::latest_id`].
-    latest_id: Arc<AtomicU64>,
     /// The height (logical points) `container`'s pixel buffer is allocated
     /// for -- a *capacity*, not necessarily the content height. Never
     /// shrunk: reusing a too-tall buffer from a previous, longer message
@@ -902,180 +1169,15 @@ struct Worker {
     container_height: f32,
     /// The text of the page as of the last draw pass; sent with each frame.
     runs: Arc<TextRunTable>,
-    /// Cumulative count of `load_image_data` calls -- diagnostic only,
-    /// logged per job. `PixbufContainer`'s decoded-image cache has no
-    /// eviction API, so this is a proxy for how large it has grown.
-    total_images_loaded: u64,
-    /// The previous render job was abandoned (superseded) after litehtml had
-    /// already recorded its image URLs as requested. Those URLs would then
-    /// never be requested again -- the container skips URLs it has seen --
-    /// so the next job must forget them, or a resize mid-load leaves the
-    /// message permanently missing images.
-    reset_images_next: bool,
 }
 
-impl Worker {
-    fn new(
-        ctx: egui::Context,
-        handler: Arc<dyn WebViewHandler>,
-        out: Sender<Output>,
-        latest_id: Arc<AtomicU64>,
-    ) -> Self {
+impl PixbufEngine {
+    fn new(ctx: &egui::Context) -> Self {
         Self {
             container: PixbufContainer::new_with_scale(1, INITIAL_CANVAS_HEIGHT, ctx.pixels_per_point()),
-            handler,
-            ctx,
-            out,
-            latest_id,
             container_height: INITIAL_CANVAS_HEIGHT as f32,
             runs: Arc::default(),
-            total_images_loaded: 0,
-            reset_images_next: false,
         }
-    }
-
-    /// Serve jobs until the [`WebView`] (the only sender) is dropped.
-    fn run(mut self, jobs: Receiver<Job>) {
-        while let Ok(first) = jobs.recv() {
-            // Everything queued while the last job ran: only the newest
-            // render matters (the UI ignores older ones' frames anyway).
-            let mut render: Option<RenderJob> = None;
-            let mut reset_images = false;
-            let mut hit_tests = Vec::new();
-            for job in std::iter::once(first).chain(jobs.try_iter()) {
-                match job {
-                    Job::Render(r) => {
-                        // A dropped job may have been the one asking to
-                        // forget requested URLs (a `load`); its replacement
-                        // (say, a resize) must still do that.
-                        reset_images |= r.reset_images;
-                        render = Some(r);
-                    }
-                    Job::HitTest(h) => hit_tests.push(h),
-                }
-            }
-            if let Some(mut r) = render {
-                r.reset_images = reset_images;
-                self.render(&r);
-            }
-            for h in &hit_tests {
-                self.hit_test(h);
-            }
-        }
-    }
-
-    fn superseded(&self, id: u64) -> bool {
-        self.latest_id.load(Ordering::SeqCst) != id
-    }
-
-    fn send(&self, output: Output) {
-        // Only fails when the view is gone, in which case nobody cares.
-        let _ = self.out.send(output);
-        self.ctx.request_repaint();
-    }
-
-    /// Run one render job; see the crate module doc for the sequence.
-    fn render(&mut self, job: &RenderJob) {
-        let t_total = Instant::now();
-        if job.reset_images || std::mem::take(&mut self.reset_images_next) {
-            self.container.clear_pending_images();
-        }
-        let width = job.width.max(1.0);
-        let scale = job.scale.max(0.1);
-
-        let mut passes = 0;
-        let mut ok = true;
-        let mut fetched = 0usize;
-        while passes < MAX_PASSES {
-            if self.superseded(job.id) {
-                self.reset_images_next = true;
-                return;
-            }
-            let Some(height) = self.draw_pass(&job.html, width, scale) else {
-                ok = false;
-                break;
-            };
-            passes += 1;
-            // Whether this pass's picture has already gone to the UI.
-            let mut emitted = false;
-
-            let pending = self.container.take_pending_images();
-            if pending.is_empty() || passes == MAX_PASSES {
-                self.emit_frame(job.id, width, scale, height);
-                break;
-            }
-
-            let (local, remote): (Vec<String>, Vec<String>) =
-                pending.into_iter().map(|(url, _)| url).partition(|url| url.starts_with("data:"));
-            let mut loaded = self.load_images(local.into_iter().filter_map(|url| {
-                resolve_image_bytes(&url, &*self.handler).map(|bytes| (url, bytes))
-            }).collect());
-
-            if !remote.is_empty() {
-                // Let the user read the text while images download.
-                self.emit_frame(job.id, width, scale, height);
-                emitted = true;
-                let t = Instant::now();
-                let downloaded = fetch_all(remote, &*self.handler, &self.latest_id, job.id);
-                if self.superseded(job.id) {
-                    self.reset_images_next = true;
-                    return;
-                }
-                fetched += downloaded.len();
-                log::debug!("fetched {} remote image(s) in {:?}", downloaded.len(), t.elapsed());
-                loaded |= self.load_images(downloaded);
-            }
-
-            if !loaded {
-                if !emitted {
-                    self.emit_frame(job.id, width, scale, height);
-                }
-                break;
-            }
-            // Images changed what there is to draw (and possibly where):
-            // go around again on a fresh canvas.
-        }
-
-        log::debug!(
-            "render job {}: total={:?} passes={passes} remote_fetched={fetched} html_len={} \
-             container_height={:.0} total_images_loaded={}",
-            job.id, t_total.elapsed(), job.html.len(), self.container_height, self.total_images_loaded,
-        );
-        self.send(Output::Done { id: job.id, ok });
-    }
-
-    /// Decode `images` into the container. Returns whether any loaded.
-    fn load_images(&mut self, images: Vec<(String, Vec<u8>)>) -> bool {
-        let mut any = false;
-        for (url, bytes) in images {
-            self.container.load_image_data(&url, &bytes);
-            self.total_images_loaded += 1;
-            any = true;
-        }
-        any
-    }
-
-    /// Clear the canvas, then lay out and draw the document into it; if the
-    /// content turns out taller than the canvas, grow it and draw once more.
-    /// Returns the content height (logical points), or `None` if the HTML
-    /// could not be parsed.
-    ///
-    /// The canvas is *always* cleared first, even when its size is not
-    /// changing: litehtml's `draw()` only paints where CSS says to, so
-    /// drawing a second pass over the first leaves the first pass's text and
-    /// images visible wherever the layout moved (overlapping text -- seen
-    /// with image-heavy mail, whose second pass lays out differently once
-    /// the images have real sizes). `resize_with_scale` is what resets the
-    /// pixmap to transparent, and it is cheap (an alloc + zero-fill).
-    fn draw_pass(&mut self, html: &str, width: f32, scale: f32) -> Option<f32> {
-        self.resize_container(width, self.container_height, scale);
-        let (height, drawn) = self.layout_and_draw(html, width, self.container_height)?;
-        if drawn {
-            return Some(height);
-        }
-        // Did not fit: grow the canvas and lay out again from scratch.
-        self.resize_container(width, height, scale);
-        Some(self.layout_and_draw(html, width, f32::INFINITY).map_or(height, |(h, _)| h))
     }
 
     /// Parse + lay out + draw into the container's current pixel buffer.
@@ -1145,6 +1247,41 @@ impl Worker {
         self.container.resize_with_scale(w, h, scale);
         self.container_height = height;
     }
+}
+
+impl Engine for PixbufEngine {
+    fn clear_pending_images(&mut self) {
+        self.container.clear_pending_images();
+    }
+
+    fn take_pending_images(&mut self) -> Vec<(String, bool)> {
+        self.container.take_pending_images()
+    }
+
+    fn load_image_data(&mut self, url: &str, bytes: &[u8]) {
+        self.container.load_image_data(url, bytes);
+    }
+
+    /// Clear the canvas, then lay out and draw the document into it; if the
+    /// content turns out taller than the canvas, grow it and draw once more.
+    ///
+    /// The canvas is *always* cleared first, even when its size is not
+    /// changing: litehtml's `draw()` only paints where CSS says to, so
+    /// drawing a second pass over the first leaves the first pass's text and
+    /// images visible wherever the layout moved (overlapping text -- seen
+    /// with image-heavy mail, whose second pass lays out differently once
+    /// the images have real sizes). `resize_with_scale` is what resets the
+    /// pixmap to transparent, and it is cheap (an alloc + zero-fill).
+    fn draw_pass(&mut self, html: &str, width: f32, scale: f32) -> Option<f32> {
+        self.resize_container(width, self.container_height, scale);
+        let (height, drawn) = self.layout_and_draw(html, width, self.container_height)?;
+        if drawn {
+            return Some(height);
+        }
+        // Did not fit: grow the canvas and lay out again from scratch.
+        self.resize_container(width, height, scale);
+        Some(self.layout_and_draw(html, width, f32::INFINITY).map_or(height, |(h, _)| h))
+    }
 
     /// Send the container's current pixels to the UI as a [`Frame`].
     ///
@@ -1166,29 +1303,28 @@ impl Worker {
     /// into tiles no larger than the GPU's maximum texture side (read from
     /// the context, which eframe keeps in step with the GL limit), and each
     /// tile is flattened separately, so no full-size intermediate copy is made.
-    fn emit_frame(&self, id: u64, width: f32, scale: f32, content_height: f32) {
+    fn frame(&mut self, id: u64, width: f32, scale: f32, content_height: f32, max_texture_side: usize) -> Option<Output> {
         let w = self.container.width() as usize;
         let canvas_rows = self.container.height() as usize;
         if w == 0 || canvas_rows == 0 {
-            return;
+            return None;
         }
         let rows = ((content_height * scale).ceil() as usize).clamp(1, canvas_rows);
-        let max_side = self.ctx.input(|i| i.max_texture_side);
         let pixels = self.container.pixels();
         let mut tiles = Vec::new();
-        for (y, h) in tile_ranges(rows, max_side) {
-            for (x, tile_w) in tile_ranges(w, max_side) {
+        for (y, h) in tile_ranges(rows, max_texture_side) {
+            for (x, tile_w) in tile_ranges(w, max_texture_side) {
                 tiles.push(Tile { x_px: x, y_px: y, image: extract_tile(pixels, w, x, y, tile_w, h) });
             }
         }
-        self.send(Output::Frame(Frame {
+        Some(Output::Frame(Frame {
             id,
             tiles,
             size_points: egui::vec2(w as f32 / scale, rows as f32 / scale),
             layout_width: width,
             scale,
             runs: self.runs.clone(),
-        }));
+        }))
     }
 
     /// Feed litehtml a down+up click at document-local `(x, y)` (logical
@@ -1197,17 +1333,246 @@ impl Worker {
     /// enough for litehtml's own hit-testing, no `draw()` needed -- but it
     /// is still a full parse + layout, since no `Document` is kept between
     /// jobs (see the crate module doc).
-    fn hit_test(&mut self, job: &HitTestJob) {
-        let width = job.width.max(1.0);
-        self.resize_container(width, self.container_height, job.scale.max(0.1));
-        let Ok(mut doc) = Document::from_html(&job.html, &mut self.container, None, Some(EMAIL_MASTER_CSS)) else {
-            return;
+    fn hit_test(&mut self, html: &str, width: f32, scale: f32, x: f32, y: f32) -> Option<String> {
+        let width = width.max(1.0);
+        self.resize_container(width, self.container_height, scale.max(0.1));
+        let Ok(mut doc) = Document::from_html(html, &mut self.container, None, Some(EMAIL_MASTER_CSS)) else {
+            return None;
         };
         let _ = doc.render(width);
-        doc.on_lbutton_down(job.x, job.y, job.x, job.y);
-        doc.on_lbutton_up(job.x, job.y, job.x, job.y);
+        doc.on_lbutton_down(x, y, x, y);
+        doc.on_lbutton_up(x, y, x, y);
         drop(doc);
-        if let Some(url) = self.container.take_anchor_click() {
+        self.container.take_anchor_click()
+    }
+}
+
+// ─── Worker ──────────────────────────────────────────────────────────────────
+
+/// Most raw image bytes [`Worker::fetched`] keeps before it starts over.
+const FETCHED_CACHE_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Everything that lives on the worker thread.
+struct Worker {
+    /// Engines are created on first use, on this thread (both are `!Send`).
+    pixbuf: Option<PixbufEngine>,
+    painter: Option<painter::PainterEngine>,
+    handler: Arc<dyn WebViewHandler>,
+    ctx: egui::Context,
+    out: Sender<Output>,
+    /// See [`WebView::latest_id`].
+    latest_id: Arc<AtomicU64>,
+    /// Cumulative count of `load_image_data` calls -- diagnostic only,
+    /// logged per job. Neither engine's decoded-image cache has an eviction
+    /// API, so this is a proxy for how large they have grown.
+    total_images_loaded: u64,
+    /// The previous render job was abandoned (superseded) after litehtml had
+    /// already recorded its image URLs as requested. Those URLs would then
+    /// never be requested again -- the container skips URLs it has seen --
+    /// so the next job must forget them, or a resize mid-load leaves the
+    /// message permanently missing images.
+    reset_images_next: bool,
+    /// Raw bytes of every remote image fetched so far, so that switching
+    /// [`Backend`] (whose engine has its own, empty image cache) does not
+    /// download the page's images a second time.
+    fetched: HashMap<String, Arc<Vec<u8>>>,
+    fetched_bytes: usize,
+}
+
+impl Worker {
+    fn new(
+        ctx: egui::Context,
+        handler: Arc<dyn WebViewHandler>,
+        out: Sender<Output>,
+        latest_id: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            pixbuf: None,
+            painter: None,
+            handler,
+            ctx,
+            out,
+            latest_id,
+            total_images_loaded: 0,
+            reset_images_next: false,
+            fetched: HashMap::new(),
+            fetched_bytes: 0,
+        }
+    }
+
+    /// The engine for `backend`, created on first use. That first use is
+    /// where system fonts get loaded.
+    fn engine(&mut self, backend: Backend) -> &mut dyn Engine {
+        match backend {
+            Backend::Pixbuf => self.pixbuf.get_or_insert_with(|| PixbufEngine::new(&self.ctx)),
+            Backend::Painter => self.painter.get_or_insert_with(|| painter::PainterEngine::new(&self.ctx)),
+        }
+    }
+
+    /// Serve jobs until the [`WebView`] (the only sender) is dropped.
+    fn run(mut self, jobs: Receiver<Job>) {
+        while let Ok(first) = jobs.recv() {
+            // Everything queued while the last job ran: only the newest
+            // render matters (the UI ignores older ones' frames anyway).
+            let mut render: Option<RenderJob> = None;
+            let mut reset_images = false;
+            let mut hit_tests = Vec::new();
+            for job in std::iter::once(first).chain(jobs.try_iter()) {
+                match job {
+                    Job::Render(r) => {
+                        // A dropped job may have been the one asking to
+                        // forget requested URLs (a `load`); its replacement
+                        // (say, a resize) must still do that.
+                        reset_images |= r.reset_images;
+                        render = Some(r);
+                    }
+                    Job::HitTest(h) => hit_tests.push(h),
+                }
+            }
+            if let Some(mut r) = render {
+                r.reset_images = reset_images;
+                self.render(&r);
+            }
+            for h in &hit_tests {
+                self.hit_test(h);
+            }
+        }
+    }
+
+    fn superseded(&self, id: u64) -> bool {
+        self.latest_id.load(Ordering::SeqCst) != id
+    }
+
+    fn send(&self, output: Output) {
+        // Only fails when the view is gone, in which case nobody cares.
+        let _ = self.out.send(output);
+        self.ctx.request_repaint();
+    }
+
+    /// Run one render job; see the crate module doc for the sequence.
+    fn render(&mut self, job: &RenderJob) {
+        let t_total = Instant::now();
+        let backend = job.backend;
+        if job.reset_images || std::mem::take(&mut self.reset_images_next) {
+            self.engine(backend).clear_pending_images();
+        }
+        let width = job.width.max(1.0);
+        let scale = job.scale.max(0.1);
+
+        let mut passes = 0;
+        let mut ok = true;
+        let mut fetched = 0usize;
+        while passes < MAX_PASSES {
+            if self.superseded(job.id) {
+                self.reset_images_next = true;
+                return;
+            }
+            let Some(height) = self.engine(backend).draw_pass(&job.html, width, scale) else {
+                ok = false;
+                break;
+            };
+            passes += 1;
+            // Whether this pass's picture has already gone to the UI.
+            let mut emitted = false;
+
+            let pending = self.engine(backend).take_pending_images();
+            if pending.is_empty() || passes == MAX_PASSES {
+                self.emit_frame(job.id, backend, width, scale, height);
+                break;
+            }
+
+            let (local, remote): (Vec<String>, Vec<String>) =
+                pending.into_iter().map(|(url, _)| url).partition(|url| url.starts_with("data:"));
+            let mut loaded = self.load_images(
+                backend,
+                local
+                    .into_iter()
+                    .filter_map(|url| resolve_image_bytes(&url, &*self.handler).map(|bytes| (url, Arc::new(bytes))))
+                    .collect(),
+            );
+
+            // Images another engine (or an earlier job) already downloaded.
+            let (cached, remote): (Vec<String>, Vec<String>) =
+                remote.into_iter().partition(|url| self.fetched.contains_key(url));
+            let cached: Vec<(String, Arc<Vec<u8>>)> =
+                cached.into_iter().map(|url| { let bytes = self.fetched[&url].clone(); (url, bytes) }).collect();
+            loaded |= self.load_images(backend, cached);
+
+            if !remote.is_empty() {
+                // Let the user read the text while images download.
+                self.emit_frame(job.id, backend, width, scale, height);
+                emitted = true;
+                let t = Instant::now();
+                let downloaded = fetch_all(remote, &*self.handler, &self.latest_id, job.id);
+                if self.superseded(job.id) {
+                    self.reset_images_next = true;
+                    return;
+                }
+                fetched += downloaded.len();
+                log::debug!("fetched {} remote image(s) in {:?}", downloaded.len(), t.elapsed());
+                let downloaded: Vec<(String, Arc<Vec<u8>>)> =
+                    downloaded.into_iter().map(|(url, bytes)| (url, Arc::new(bytes))).collect();
+                self.remember_fetched(&downloaded);
+                loaded |= self.load_images(backend, downloaded);
+            }
+
+            if !loaded {
+                if !emitted {
+                    self.emit_frame(job.id, backend, width, scale, height);
+                }
+                break;
+            }
+            // Images changed what there is to draw (and possibly where):
+            // go around again on a fresh canvas.
+        }
+
+        let elapsed = t_total.elapsed();
+        log::debug!(
+            "render job {} ({}): total={elapsed:?} passes={passes} remote_fetched={fetched} html_len={} \
+             total_images_loaded={}",
+            job.id, backend.name(), job.html.len(), self.total_images_loaded,
+        );
+        self.send(Output::Stats { id: job.id, elapsed });
+        self.send(Output::Done { id: job.id, ok });
+    }
+
+    /// Keep the raw bytes of freshly downloaded images (see [`Worker::fetched`]).
+    fn remember_fetched(&mut self, images: &[(String, Arc<Vec<u8>>)]) {
+        for (url, bytes) in images {
+            if self.fetched_bytes + bytes.len() > FETCHED_CACHE_LIMIT {
+                self.fetched.clear();
+                self.fetched_bytes = 0;
+            }
+            if self.fetched.insert(url.clone(), bytes.clone()).is_none() {
+                self.fetched_bytes += bytes.len();
+            }
+        }
+    }
+
+    /// Decode `images` into `backend`'s engine. Returns whether any loaded.
+    fn load_images(&mut self, backend: Backend, images: Vec<(String, Arc<Vec<u8>>)>) -> bool {
+        let mut any = false;
+        for (url, bytes) in images {
+            self.engine(backend).load_image_data(&url, &bytes);
+            self.total_images_loaded += 1;
+            any = true;
+        }
+        any
+    }
+
+    /// Send `backend`'s current picture of the page to the UI.
+    fn emit_frame(&mut self, id: u64, backend: Backend, width: f32, scale: f32, content_height: f32) {
+        let max_side = self.ctx.input(|i| i.max_texture_side);
+        if let Some(output) = self.engine(backend).frame(id, width, scale, content_height, max_side) {
+            self.send(output);
+        }
+    }
+
+    /// Report the anchor under a click, if any. Needs the same layout the
+    /// clicked frame had, so it runs on the engine that drew it.
+    fn hit_test(&mut self, job: &HitTestJob) {
+        let (width, scale) = (job.width.max(1.0), job.scale.max(0.1));
+        if let Some(url) = self.engine(job.backend).hit_test(&job.html, width, scale, job.x, job.y) {
             self.send(Output::Link(url));
         }
     }
@@ -1380,6 +1745,7 @@ mod tests {
             width,
             scale: 1.0,
             reset_images: true,
+            backend: Backend::Pixbuf,
         });
         out_rx.try_iter().collect()
     }
@@ -1485,7 +1851,7 @@ mod tests {
         let html = Arc::new(
             r#"<body style="margin:0"><img src="https://example.com/a.png" width="20" height="20"></body>"#.to_string(),
         );
-        let job = |id, reset_images| RenderJob { id, html: html.clone(), width: 100.0, scale: 1.0, reset_images };
+        let job = |id, reset_images| RenderJob { id, html: html.clone(), width: 100.0, scale: 1.0, reset_images, backend: Backend::Pixbuf };
         worker.render(&job(1, true));
         worker.render(&job(2, false));
         let outputs: Vec<Output> = out_rx.try_iter().collect();
@@ -1553,7 +1919,7 @@ mod tests {
         let (out_tx, out_rx) = mpsc::channel();
         let mut worker = Worker::new(ctx, Arc::new(DefaultHandler), out_tx, Arc::new(AtomicU64::new(1)));
         let html = r#"<body style="margin:0"><div style="height:5000px;background:#f00"></div><div style="height:10px;background:#00f"></div></body>"#;
-        worker.render(&RenderJob { id: 1, html: Arc::new(html.to_string()), width: 100.0, scale: 1.0, reset_images: true });
+        worker.render(&RenderJob { id: 1, html: Arc::new(html.to_string()), width: 100.0, scale: 1.0, reset_images: true, backend: Backend::Pixbuf });
         let outputs: Vec<Output> = out_rx.try_iter().collect();
         let frame = last_frame(&outputs);
 
@@ -1647,9 +2013,9 @@ mod tests {
             r#"<body style="margin:0"><a href="https://example.com/x" style="display:block;height:40px">go</a></body>"#
                 .to_string(),
         );
-        worker.hit_test(&HitTestJob { html: html.clone(), width: 200.0, scale: 1.0, x: 5.0, y: 5.0 });
+        worker.hit_test(&HitTestJob { html: html.clone(), width: 200.0, scale: 1.0, x: 5.0, y: 5.0, backend: Backend::Pixbuf });
         assert!(matches!(out_rx.try_recv(), Ok(Output::Link(url)) if url == "https://example.com/x"));
-        worker.hit_test(&HitTestJob { html, width: 200.0, scale: 1.0, x: 5.0, y: 300.0 });
+        worker.hit_test(&HitTestJob { html, width: 200.0, scale: 1.0, x: 5.0, y: 300.0, backend: Backend::Pixbuf });
         assert!(out_rx.try_recv().is_err(), "a click on empty space is not a link click");
     }
 
@@ -1687,6 +2053,10 @@ mod tests {
 
     /// A view in a headless egui context that tests poke with pointer and
     /// keyboard events, one frame at a time.
+    /// Selection is geometry over the text-run table, so it has to behave the same
+    /// whichever engine drew the page: every test below runs once per backend.
+    const BACKENDS: [Backend; 2] = [Backend::Pixbuf, Backend::Painter];
+
     struct Harness {
         ctx: egui::Context,
         view: WebView,
@@ -1707,9 +2077,10 @@ mod tests {
     const SCREEN: egui::Vec2 = egui::vec2(400.0, 300.0);
 
     impl Harness {
-        fn new(html: &str, with_field: bool) -> Self {
+        fn new(backend: Backend, html: &str, with_field: bool) -> Self {
             let ctx = egui::Context::default();
-            let view = WebViewHost::new().new_view(&ctx, WebViewConfig::new(WebViewSource::Html(html.to_string())));
+            let view = WebViewHost::new()
+                .new_view(&ctx, WebViewConfig::new(WebViewSource::Html(html.to_string())).with_backend(backend));
             let mut h = Self {
                 ctx,
                 view,
@@ -1860,7 +2231,13 @@ mod tests {
 
     #[test]
     fn dragging_across_text_selects_it() {
-        let mut h = Harness::new(TWO_PARAS, false);
+        for backend in BACKENDS {
+            dragging_across_text_selects_it_on(backend);
+        }
+    }
+
+    fn dragging_across_text_selects_it_on(backend: Backend) {
+        let mut h = Harness::new(backend, TWO_PARAS, false);
         h.drag(h.left_of("alpha"), h.right_of("gamma"));
         assert_eq!(h.selected().as_deref(), Some("alpha beta gamma"));
         assert!(h.view.has_selection());
@@ -1872,8 +2249,14 @@ mod tests {
 
     #[test]
     fn a_drag_starting_on_a_link_selects_instead_of_following_it() {
+        for backend in BACKENDS {
+            a_drag_starting_on_a_link_selects_instead_of_following_it_on(backend);
+        }
+    }
+
+    fn a_drag_starting_on_a_link_selects_instead_of_following_it_on(backend: Backend) {
         let html = r#"<body style="margin:0"><p style="margin:0"><a href="https://example.com/x">click here now</a></p></body>"#;
-        let mut h = Harness::new(html, false);
+        let mut h = Harness::new(backend, html, false);
         h.drag(h.left_of("click"), h.right_of("now"));
         assert_eq!(h.selected().as_deref(), Some("click here now"));
         // The worker would answer a hit test within moments: give it the chance.
@@ -1884,8 +2267,14 @@ mod tests {
 
     #[test]
     fn a_plain_click_on_a_link_still_reports_it_and_clears_the_selection() {
+        for backend in BACKENDS {
+            a_plain_click_on_a_link_still_reports_it_and_clears_the_selection_on(backend);
+        }
+    }
+
+    fn a_plain_click_on_a_link_still_reports_it_and_clears_the_selection_on(backend: Backend) {
         let html = r#"<body style="margin:0"><p style="margin:0"><a href="https://example.com/x">link</a> and other words</p></body>"#;
-        let mut h = Harness::new(html, false);
+        let mut h = Harness::new(backend, html, false);
         h.drag(h.left_of("words"), h.right_of("words"));
         assert!(h.view.has_selection());
         h.click(h.middle_of("link"));
@@ -1900,7 +2289,13 @@ mod tests {
 
     #[test]
     fn double_click_selects_a_word_and_triple_click_the_paragraph() {
-        let mut h = Harness::new(TWO_PARAS, false);
+        for backend in BACKENDS {
+            double_click_selects_a_word_and_triple_click_the_paragraph_on(backend);
+        }
+    }
+
+    fn double_click_selects_a_word_and_triple_click_the_paragraph_on(backend: Backend) {
+        let mut h = Harness::new(backend, TWO_PARAS, false);
         let p = h.middle_of("beta");
         h.click(p);
         h.click(p);
@@ -1911,7 +2306,13 @@ mod tests {
 
     #[test]
     fn shift_click_extends_the_selection() {
-        let mut h = Harness::new(TWO_PARAS, false);
+        for backend in BACKENDS {
+            shift_click_extends_the_selection_on(backend);
+        }
+    }
+
+    fn shift_click_extends_the_selection_on(backend: Backend) {
+        let mut h = Harness::new(backend, TWO_PARAS, false);
         let pa = h.middle_of("alpha");
         h.click(pa);
         h.click(pa); // double-click: "alpha"
@@ -1926,7 +2327,13 @@ mod tests {
 
     #[test]
     fn copy_puts_the_selection_on_the_clipboard() {
-        let mut h = Harness::new(TWO_PARAS, false);
+        for backend in BACKENDS {
+            copy_puts_the_selection_on_the_clipboard_on(backend);
+        }
+    }
+
+    fn copy_puts_the_selection_on_the_clipboard_on(backend: Backend) {
+        let mut h = Harness::new(backend, TWO_PARAS, false);
         let p = h.middle_of("epsilon");
         h.click(p);
         h.click(p);
@@ -1937,7 +2344,13 @@ mod tests {
 
     #[test]
     fn copy_with_nothing_selected_does_nothing() {
-        let mut h = Harness::new(TWO_PARAS, false);
+        for backend in BACKENDS {
+            copy_with_nothing_selected_does_nothing_on(backend);
+        }
+    }
+
+    fn copy_with_nothing_selected_does_nothing_on(backend: Backend) {
+        let mut h = Harness::new(backend, TWO_PARAS, false);
         h.click(h.middle_of("delta"));
         h.frame(vec![egui::Event::Copy], egui::Modifiers::NONE);
         assert!(h.copied().is_empty());
@@ -1945,7 +2358,13 @@ mod tests {
 
     #[test]
     fn ctrl_a_selects_everything_when_the_view_has_focus() {
-        let mut h = Harness::new(TWO_PARAS, false);
+        for backend in BACKENDS {
+            ctrl_a_selects_everything_when_the_view_has_focus_on(backend);
+        }
+    }
+
+    fn ctrl_a_selects_everything_when_the_view_has_focus_on(backend: Backend) {
+        let mut h = Harness::new(backend, TWO_PARAS, false);
         h.click(h.middle_of("delta"));
         let key = egui::Event::Key {
             key: egui::Key::A,
@@ -1960,7 +2379,13 @@ mod tests {
 
     #[test]
     fn copy_belongs_to_a_focused_text_field_not_to_the_selection() {
-        let mut h = Harness::new(TWO_PARAS, true);
+        for backend in BACKENDS {
+            copy_belongs_to_a_focused_text_field_not_to_the_selection_on(backend);
+        }
+    }
+
+    fn copy_belongs_to_a_focused_text_field_not_to_the_selection_on(backend: Backend) {
+        let mut h = Harness::new(backend, TWO_PARAS, true);
         // Select a word in the message...
         let p = h.middle_of("beta");
         h.click(p);
@@ -1975,7 +2400,13 @@ mod tests {
 
     #[test]
     fn clicking_outside_the_view_clears_the_selection() {
-        let mut h = Harness::new(TWO_PARAS, true);
+        for backend in BACKENDS {
+            clicking_outside_the_view_clears_the_selection_on(backend);
+        }
+    }
+
+    fn clicking_outside_the_view_clears_the_selection_on(backend: Backend) {
+        let mut h = Harness::new(backend, TWO_PARAS, true);
         let p = h.middle_of("beta");
         h.click(p);
         h.click(p);
@@ -1987,7 +2418,13 @@ mod tests {
 
     #[test]
     fn the_selection_survives_a_relayout_of_the_same_text_but_not_a_new_page() {
-        let mut h = Harness::new(TWO_PARAS, false);
+        for backend in BACKENDS {
+            the_selection_survives_a_relayout_of_the_same_text_but_not_a_new_page_on(backend);
+        }
+    }
+
+    fn the_selection_survives_a_relayout_of_the_same_text_but_not_a_new_page_on(backend: Backend) {
+        let mut h = Harness::new(backend, TWO_PARAS, false);
         let p = h.middle_of("beta");
         h.click(p);
         h.click(p);
@@ -2003,8 +2440,14 @@ mod tests {
 
     #[test]
     fn dragging_below_the_visible_area_scrolls_the_page_and_keeps_selecting() {
+        for backend in BACKENDS {
+            dragging_below_the_visible_area_scrolls_the_page_and_keeps_selecting_on(backend);
+        }
+    }
+
+    fn dragging_below_the_visible_area_scrolls_the_page_and_keeps_selecting_on(backend: Backend) {
         let many: String = (0..60).map(|i| format!("<p style=\"margin:0 0 10px\">line number {i}</p>")).collect();
-        let mut h = Harness::new(&format!("<body style=\"margin:0\">{many}</body>"), false);
+        let mut h = Harness::new(backend, &format!("<body style=\"margin:0\">{many}</body>"), false);
         assert!(h.view.content_size().unwrap().y > 900.0);
         assert_eq!(h.scroll_offset(), 0.0);
         let start = h.left_of("line");
@@ -2021,5 +2464,250 @@ mod tests {
         let selected = h.selected().unwrap();
         assert!(selected.contains("line number 12"), "{selected:?}");
         h.button(below, false, egui::Modifiers::NONE);
+    }
+
+    #[test]
+    fn a_selection_survives_switching_backend() {
+        // Same text, same runs: the engines differ in fonts, not in what the words are.
+        let mut h = Harness::new(Backend::Pixbuf, TWO_PARAS, false);
+        h.drag(h.left_of("alpha"), h.right_of("gamma"));
+        let before = h.selected();
+        assert_eq!(before.as_deref(), Some("alpha beta gamma"));
+        h.view.set_backend(Backend::Painter);
+        h.settle();
+        assert_eq!(h.view.backend(), Backend::Painter);
+        assert_eq!(h.selected(), before, "the selection was dropped by the switch");
+        h.view.set_backend(Backend::Pixbuf);
+        h.settle();
+        assert_eq!(h.selected(), before);
+    }
+
+    // ── Backend::Painter ────────────────────────────────────────────────
+
+    fn count_text_shapes(out: &egui::FullOutput) -> usize {
+        out.shapes.iter().filter(|s| matches!(s.shape, egui::Shape::Text(_))).count()
+    }
+
+    /// Run `view` headless until it has finished rendering *and* painted at
+    /// least `want` text shapes (the "Loading fonts..." placeholder is one too,
+    /// so a bare "some text" would return too early). Returns how many.
+    fn show_until_text_is_painted(ctx: &egui::Context, view: &mut WebView, width: f32, want: usize) -> usize {
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 400.0))),
+            ..Default::default()
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let mut out = ctx.run_ui(input(), |ui| {
+                view.show(ui);
+            });
+            out.textures_delta.clear();
+            let text = count_text_shapes(&out);
+            if !view.is_rendering() && text >= want {
+                return text;
+            }
+            assert!(Instant::now() < deadline, "never painted {want} text shapes (last count {text})");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn the_painter_backend_waits_for_its_fonts_and_then_paints_text() {
+        // egui panics on a font family it does not know; the view must hold
+        // the display list back until the context has the worker's fonts.
+        let ctx = egui::Context::default();
+        let host = WebViewHost::new();
+        let html = r#"<body style="margin:0"><p style="font-family:Arial,sans-serif;font-size:20px">Hello</p><p>go &#10148;</p></body>"#;
+        let mut view = host.new_view(
+            &ctx,
+            WebViewConfig::new(WebViewSource::Html(html.to_string())).with_backend(Backend::Painter),
+        );
+        assert_eq!(view.backend(), Backend::Painter);
+        // "Hello", "go" and the arrow: three runs.
+        let text = show_until_text_is_painted(&ctx, &mut view, 400.0, 3);
+        assert_eq!(text, 3, "one text shape per recorded run, and no placeholder label left over");
+        assert!(view.textures.is_empty(), "the painter backend uploads no page bitmap");
+        assert!(view.content_size().is_some_and(|s| s.y > 20.0));
+        assert!(view.last_render_time().is_some());
+    }
+
+    #[test]
+    fn switching_backend_re_renders_the_same_page_with_the_other_engine() {
+        let ctx = egui::Context::default();
+        let host = WebViewHost::new();
+        let html = r#"<body style="margin:0"><p style="font-size:20px">Hello</p></body>"#;
+        let mut view = host.new_view(&ctx, WebViewConfig::new(WebViewSource::Html(html.to_string())));
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))),
+            ..Default::default()
+        };
+        let settle = |view: &mut WebView| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                ctx.run_ui(input(), |ui| {
+                    view.show(ui);
+                }).textures_delta.clear();
+                if !view.is_rendering() {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "render never finished");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        settle(&mut view);
+        assert!(!view.textures.is_empty() && view.list.is_none());
+
+        view.set_backend(Backend::Painter);
+        assert!(view.content_size().is_none(), "the old engine's picture is dropped at once");
+        assert!(view.is_rendering());
+        settle(&mut view);
+        assert!(view.textures.is_empty() && view.list.is_some());
+        assert!(view.content_size().is_some());
+
+        view.set_backend(Backend::Pixbuf);
+        settle(&mut view);
+        assert!(!view.textures.is_empty() && view.list.is_none());
+    }
+
+    #[test]
+    fn a_link_click_goes_to_the_engine_that_drew_the_frame() {
+        let (out_tx, out_rx) = mpsc::channel();
+        let mut worker = Worker::new(egui::Context::default(), Arc::new(DefaultHandler), out_tx, Arc::new(AtomicU64::new(1)));
+        let html = Arc::new(
+            r#"<body style="margin:0"><a href="https://example.com/p" style="display:block;height:40px">go</a></body>"#.to_string(),
+        );
+        worker.hit_test(&HitTestJob { html, width: 200.0, scale: 1.0, x: 5.0, y: 5.0, backend: Backend::Painter });
+        assert!(matches!(out_rx.try_recv(), Ok(Output::Link(url)) if url == "https://example.com/p"));
+        assert!(worker.painter.is_some() && worker.pixbuf.is_none(), "only the painter engine was needed");
+    }
+
+    #[test]
+    fn a_downloaded_image_is_not_fetched_again_when_the_other_backend_needs_it() {
+        struct Counting {
+            calls: Mutex<u32>,
+            png: Vec<u8>,
+        }
+        impl WebViewHandler for Counting {
+            fn intercept(&self, _request: &ImageRequest) -> InterceptOutcome {
+                *self.calls.lock().unwrap() += 1;
+                InterceptOutcome::Serve(self.png.clone())
+            }
+        }
+        let handler = Arc::new(Counting { calls: Mutex::new(0), png: decode_data_uri(RED_1X1_PNG).unwrap() });
+        let (out_tx, out_rx) = mpsc::channel();
+        let mut worker = Worker::new(egui::Context::default(), handler.clone(), out_tx, Arc::new(AtomicU64::new(1)));
+        let html = Arc::new(
+            r#"<body style="margin:0"><img src="https://example.com/a.png" width="20" height="20"></body>"#.to_string(),
+        );
+        let job = |id, backend| RenderJob { id, html: html.clone(), width: 100.0, scale: 1.0, reset_images: true, backend };
+        worker.render(&job(1, Backend::Painter));
+        worker.latest_id.store(2, Ordering::SeqCst);
+        worker.render(&job(2, Backend::Pixbuf));
+        assert_eq!(*handler.calls.lock().unwrap(), 1, "the second engine must reuse the first download");
+        let outputs: Vec<Output> = out_rx.try_iter().collect();
+        let frame = last_frame(&outputs);
+        assert_eq!(frame.id, 2);
+        assert_eq!(pixel(frame, 10, 10), [255, 0, 0, 255], "and still draw it");
+    }
+
+    #[test]
+    fn a_scroll_offset_set_before_the_first_render_is_applied_once_there_is_a_page() {
+        for backend in [Backend::Pixbuf, Backend::Painter] {
+            let ctx = egui::Context::default();
+            let host = WebViewHost::new();
+            let html = r#"<body style="margin:0"><div style="height:5000px;background:#eee">tall</div></body>"#;
+            let mut view = host.new_view(&ctx, WebViewConfig::new(WebViewSource::Html(html.to_string())).with_backend(backend));
+            view.set_scroll_offset(700.0);
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 400.0))),
+                ..Default::default()
+            };
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut settled = 0;
+            while settled < 5 {
+                ctx.run_ui(input(), |ui| {
+                    view.show(ui);
+                }).textures_delta.clear();
+                settled = if view.is_rendering() { 0 } else { settled + 1 };
+                assert!(Instant::now() < deadline, "{backend:?}: render never finished");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!((view.scroll_offset() - 700.0).abs() < 1.0, "{backend:?}: scrolled to {}", view.scroll_offset());
+        }
+    }
+
+    #[test]
+    fn the_selection_highlight_is_painted_over_the_painter_backends_display_list() {
+        let ctx = egui::Context::default();
+        let host = WebViewHost::new();
+        let html = r#"<body style="margin:0"><p style="font-size:20px">alpha beta</p></body>"#;
+        let mut view = host.new_view(
+            &ctx,
+            WebViewConfig::new(WebViewSource::Html(html.to_string())).with_backend(Backend::Painter),
+        );
+        // "alpha", a space, "beta".
+        show_until_text_is_painted(&ctx, &mut view, 400.0, 2);
+        assert!(view.selected_text().is_none());
+        view.select_all();
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0))),
+            ..Default::default()
+        };
+        let mut highlight = None;
+        let mut out = ctx.run_ui(input, |ui| {
+            highlight = Some(ui.visuals().selection.bg_fill.gamma_multiply(0.55));
+            view.show(ui);
+        });
+        out.textures_delta.clear();
+        let highlight = highlight.unwrap();
+        let painted: Vec<egui::Rect> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Rect(r) if r.fill == highlight => Some(r.rect),
+                _ => None,
+            })
+            .collect();
+        assert!(!painted.is_empty(), "no highlight rect was painted for a select-all");
+        // And it covers the words (the runs of a line are merged into one rect).
+        // The view sits at the screen's origin here, so document and screen
+        // coordinates coincide.
+        let alpha = view.text_runs().runs.iter().find(|r| r.text == "alpha").unwrap().rect;
+        assert!(painted.iter().any(|r| r.expand(1.0).contains_rect(alpha)), "{painted:?} vs {alpha:?}");
+    }
+
+    #[test]
+    fn switching_backend_keeps_the_scroll_position() {
+        // Comparing engines means looking at the same spot: the placeholder shown
+        // while the other engine renders must not reset the scroll to the top.
+        let ctx = egui::Context::default();
+        let host = WebViewHost::new();
+        let html = r#"<body style="margin:0"><div style="height:5000px;background:#eee">tall</div></body>"#;
+        let mut view = host.new_view(&ctx, WebViewConfig::new(WebViewSource::Html(html.to_string())));
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 400.0))),
+            ..Default::default()
+        };
+        let settle = |view: &mut WebView| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut settled = 0;
+            while settled < 5 {
+                ctx.run_ui(input(), |ui| {
+                    view.show(ui);
+                }).textures_delta.clear();
+                settled = if view.is_rendering() { 0 } else { settled + 1 };
+                assert!(Instant::now() < deadline, "render never finished");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        view.set_scroll_offset(700.0);
+        settle(&mut view);
+        assert!((view.scroll_offset() - 700.0).abs() < 1.0);
+        for backend in [Backend::Painter, Backend::Pixbuf] {
+            view.set_backend(backend);
+            settle(&mut view);
+            assert!((view.scroll_offset() - 700.0).abs() < 1.0, "{backend:?}: scrolled to {}", view.scroll_offset());
+        }
     }
 }

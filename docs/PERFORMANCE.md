@@ -5,6 +5,9 @@ repeated: on the same message after a change, on a new problem email, or on a
 different machine. Everything here is about **one render of a message body**:
 parse -> layout -> paint (litehtml), plus what `esmail` does around it.
 
+This document measures the default **Pixbuf** backend (tiny-skia); for the
+egui-painter backend and how the two compare, see [RENDERERS.md](RENDERERS.md).
+
 Reference numbers are at the [end](#reference-numbers-meilleurtauxeml); compare
 against those, on the same machine, before believing a change helped.
 

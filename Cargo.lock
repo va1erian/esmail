@@ -1019,8 +1019,11 @@ dependencies = [
  "eframe",
  "egui",
  "env_logger",
+ "fontdb",
+ "image",
  "litehtml",
  "log",
+ "ttf-parser 0.20.0",
  "url",
 ]
 
