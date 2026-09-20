@@ -75,7 +75,7 @@ impl TextRunTable {
 
     /// Walk `doc` (which must have been laid out) and record its text.
     ///
-    /// `measure` is `PixbufContainer::text_measure_fn`, captured before the
+    /// `measure` is the container's `text_measure_fn`, captured before the
     /// `Document` took its mutable borrow of the container; it returns widths
     /// in document points.
     pub fn collect(doc: &Document<'_>, measure: &dyn Fn(&str, FontHandle) -> f32) -> Self {
@@ -187,14 +187,11 @@ fn run_for(el: &Element<'_>, measure: &dyn Fn(&str, FontHandle) -> f32) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litehtml::pixbuf::PixbufContainer;
 
-    fn table_for(html: &str, width: f32) -> TextRunTable {
-        let mut container = PixbufContainer::new_with_scale(width as u32, 600, 1.0);
-        let measure = container.text_measure_fn();
-        let mut doc = Document::from_html(html, &mut container, None, None).unwrap();
-        let _ = doc.render(width);
-        TextRunTable::collect(&doc, &measure)
+    fn table_for(html: &str, width: f32) -> std::sync::Arc<TextRunTable> {
+        let mut engine = crate::painter::PainterEngine::new(&egui::Context::default());
+        engine.draw_pass(html, width, 1.0).expect("parses");
+        engine.runs.clone()
     }
 
     fn joined(t: &TextRunTable) -> String {

@@ -10,9 +10,10 @@ exists, why, and what is left. Open work is tracked as GitHub issues
 Three crates in one workspace:
 
 - **`crates/egui-litehtml-webview`** — an egui widget that renders HTML/CSS
-  with [litehtml](https://github.com/va1erian/litehtml-rs) (`pixbuf` backend,
-  pure CPU). JS-less by design: no legitimate mail client executes JS in
-  email, and skipping a JS engine keeps the release binary small (~12 MiB).
+  with [litehtml](https://github.com/va1erian/litehtml-rs) (layout painted with
+  egui's own painter, pure CPU). JS-less by design: no legitimate mail client
+  executes JS in email, and skipping a JS engine keeps the release binary small
+  (~11.5 MiB).
   One `WebViewHost`, any number of `WebView`s.
 - **`crates/esmail`** — the app: `main.rs` (UI), `imap.rs` (IMAP actor plus a
   second body-worker connection), `idle_watch.rs` (IMAP IDLE push), `smtp.rs`,
@@ -25,8 +26,8 @@ Three crates in one workspace:
 
 ### Webview rendering
 
-Each `WebView` owns a render thread holding the (`!Send`) `PixbufContainer`.
-The UI thread sends render jobs and uploads finished frames.
+Each `WebView` owns a render thread holding the (`!Send`) painter engine.
+The UI thread sends render jobs and paints the finished display lists.
 
 - Jobs carry an id; superseded jobs are dropped or abandoned between stages and
   the UI ignores frames that are not the newest. `load()` invalidates
@@ -34,8 +35,8 @@ The UI thread sends render jobs and uploads finished frames.
 - Remote images are fetched up to eight at a time, each with a timeout; a
   text-only frame is sent first when images are involved.
 - `WebViewHandler` is `Send + Sync` with `&self` methods.
-- The frame is cut into tiles no larger than the GPU's `max_texture_side`, so
-  tall messages display.
+- A frame is a display list replayed by egui's painter every frame, culled to
+  the visible region, so tall messages cost only what is on screen.
 - A litehtml `Document` borrows the container and cannot be stored, so it is
   built, used and dropped inside one worker call. Text selection works from a
   `TextRunTable` recorded during the render pass and sent with each frame (word
@@ -43,13 +44,10 @@ The UI thread sends render jobs and uploads finished frames.
   highlight and copy are geometry on the UI thread. Links work the same way: a
   `LinkTable` (`href` + per-line, block and image rectangles of every anchor)
   answers clicks and the hand cursor with a point-in-rectangle lookup (#27).
-- Every draw pass starts from a cleared canvas; the canvas only grows (seeded
-  at 4000 px) because a taller page forces a second parse + layout.
 - Layout speed depends on litehtml-rs `master` (table-cell measurement
-  memoization; without it layout is exponential in table nesting depth) and
-  its `draw_image` fix. Do not pin `Cargo.toml` to an older commit.
-- Measuring and profiling: [docs/PERFORMANCE.md](docs/PERFORMANCE.md),
-  `tools/render-profiler`. Real-world test mail lives in
+  memoization; without it layout is exponential in table nesting depth). Do
+  not pin `Cargo.toml` to an older commit.
+- Measuring: [docs/PERFORMANCE.md](docs/PERFORMANCE.md). Real-world test mail lives in
   `crates/esmail/tests/fixtures/` (redact first; see the README there).
 
 ### Mail client

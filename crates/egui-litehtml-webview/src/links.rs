@@ -117,13 +117,11 @@ fn link_rects<'a>(anchor: &Element<'a>) -> Vec<egui::Rect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litehtml::pixbuf::PixbufContainer;
 
-    fn table_for(html: &str, width: f32) -> LinkTable {
-        let mut container = PixbufContainer::new_with_scale(width as u32, 600, 1.0);
-        let mut doc = Document::from_html(html, &mut container, None, None).unwrap();
-        let _ = doc.render(width);
-        LinkTable::collect(&doc)
+    fn table_for(html: &str, width: f32) -> std::sync::Arc<LinkTable> {
+        let mut engine = crate::painter::PainterEngine::new(&egui::Context::default());
+        engine.draw_pass(html, width, 1.0).expect("parses");
+        engine.links.clone()
     }
 
     #[test]
@@ -168,7 +166,9 @@ mod tests {
             r#"<body style="margin:0"><a href="https://example.com/t"><table><tr><td style="width:100px;height:50px">cell</td></tr></table></a><p>after</p></body>"#,
             300.0,
         );
-        assert_eq!(t.href_at(egui::pos2(50.0, 25.0)), Some("https://example.com/t"));
+        // (The email stylesheet collapses table borders, under which litehtml
+        // ignores the cell's `height`: the box is one line tall, not 50px.)
+        assert_eq!(t.href_at(egui::pos2(50.0, 9.0)), Some("https://example.com/t"));
     }
 
     #[test]

@@ -34,7 +34,7 @@ crates/esmail/tests/render_fixtures.rs    render conformance + timing on real ma
 crates/esmail/tests/fixtures/             redacted .eml test cases (+ README)
 crates/esmail/tests/imap_smtp_integration.rs   drives the app against the mock server
 crates/mail-mock-server/                  in-process IMAP+SMTP server
-docs/PERFORMANCE.md, tools/render-profiler/    measuring and profiling a render
+docs/PERFORMANCE.md                       measuring a render
 ```
 
 ## Verify visual work by looking at it

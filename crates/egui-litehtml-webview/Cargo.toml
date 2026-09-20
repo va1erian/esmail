@@ -11,9 +11,7 @@ litehtml.workspace = true
 url.workspace = true
 log.workspace = true
 image.workspace = true
-# System font discovery for the `Painter` backend (see `src/fonts.rs`). Same
-# versions cosmic-text (the Pixbuf backend's text stack) already pulls in, so
-# these add no new crates to the graph.
+# System font discovery (see `src/fonts.rs`).
 fontdb = { version = "0.16", default-features = false, features = ["std", "fs", "memmap"] }
 ttf-parser = { version = "0.20", default-features = false, features = ["std", "variable-fonts"] }
 
