@@ -172,6 +172,56 @@ fn meilleurtaux_text_run_table_covers_the_visible_text_in_reading_order() {
     }
 }
 
+#[test]
+fn meilleurtaux_select_all_copies_readable_text() {
+    let html = esmail::render::render_message(&fixture("meilleurtaux.eml"));
+    let (_, _, table) = render_headless_with_runs(html, 700.0, Duration::from_secs(120));
+    let copied = table.selection_text(&table.select_all().expect("the page has text"));
+
+    // Paragraphs are separated by a blank line, in reading order.
+    assert!(
+        copied.contains(
+            "Rentrée 2026 :
+
+Les nouveautés à connaître avant de financer vos projets
+
+Je découvre les taux ➔"
+        ),
+        "headline block did not copy as separate paragraphs:
+{copied}"
+    );
+    // A list comes out one item per line.
+    assert!(
+        copied.contains(
+            "Plus de transparence sur le coût réel du crédit.
+Encadrement renforcé des paiements en plusieurs fois."
+        ),
+        "list items were not copied one per line:
+{copied}"
+    );
+    // Text that only wrapped in the layout is one line again.
+    assert!(
+        copied.contains(
+            "La rentrée est souvent synonyme de nouveaux projets : changement de véhicule, travaux dans le logement,"
+        ),
+        "a wrapped paragraph was split at the wrap:
+{copied}"
+    );
+    // Nothing invisible or stray: the hidden preheader is absent, no run of
+    // spaces, no line starting or ending in whitespace, no big vertical gaps.
+    assert!(!copied.contains("  "), "double space in:
+{copied}");
+    assert!(!copied.contains("
+
+
+"), "more than one blank line in:
+{copied}");
+    for line in copied.lines() {
+        assert_eq!(line, line.trim(), "line with stray whitespace: {line:?}");
+    }
+    assert!(copied.trim() == copied);
+}
+
 /// Timing across widths, for comparing changes. `--include-ignored` to run.
 #[test]
 #[ignore = "benchmark: prints timings, asserts nothing about them"]
