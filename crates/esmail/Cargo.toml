@@ -74,7 +74,7 @@ serde_json.workspace = true
 # platform.
 [target.'cfg(windows)'.dependencies]
 tray-icon.workspace = true
-winrt-notification.workspace = true
+windows.workspace = true
 keyring = { workspace = true, features = ["windows-native"] }
 
 # Secret Service (gnome-keyring/kwallet over D-Bus) -- matches the

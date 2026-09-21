@@ -1,7 +1,7 @@
 //! New-mail detection and notification text (B10 in PLAN.md).
 //!
 //! Everything in this module is pure and platform-independent, unlike
-//! `tray.rs` (Windows-only tray icon + toast plumbing). It exists so the
+//! `platform` (the OS-specific tray icon + toast plumbing). It exists so the
 //! logic that decides *whether* to notify and *what* the toast says can be
 //! unit tested without a Windows toast API, a live IMAP server, or even a
 //! GUI -- the same split `search_query.rs`/`db.rs::sync_decision` already
@@ -77,10 +77,9 @@ const MAX_FIELD_LEN: usize = 120;
 /// characters (including `\n`/`\r`) become spaces, runs of whitespace
 /// collapse to one, and the result is truncated with a trailing `…`.
 ///
-/// This is content sanitization, not markup escaping -- `tray.rs`'s
-/// `winrt_notification::Toast` already XML-escapes whatever text it's given
-/// (verified by reading its source: `title()`/`text1()` run content through
-/// `xml::escape::escape_str_attribute`), so a crafted Subject containing
+/// This is content sanitization, not markup escaping -- [`toast_xml`]
+/// XML-escapes whatever text it is given (see its test), so a crafted Subject
+/// containing
 /// `</text><text>` can't break out of the toast's XML. What escaping does
 /// *not* prevent is a subject or sender containing literal newlines/control
 /// bytes from displaying as extra toast lines or otherwise fighting the
@@ -141,6 +140,54 @@ pub fn build_account_notification(label: &str, headers: &[MailHeader]) -> Option
         return Some((title, body));
     }
     Some((format!("{label}: {title}"), body))
+}
+
+/// The toast's launch arguments: what comes back to us when it is clicked, so
+/// the click can open the account the mail arrived in. `account=<id>`,
+/// form-encoded (an account id is `user@host` and may hold any character).
+pub fn launch_arguments(account_id: &str) -> String {
+    url::form_urlencoded::Serializer::new(String::new()).append_pair("account", account_id).finish()
+}
+
+/// The account a clicked toast's launch arguments name -- the inverse of
+/// [`launch_arguments`]. `None` for arguments this app did not produce.
+pub fn account_from_launch_arguments(arguments: &str) -> Option<String> {
+    url::form_urlencoded::parse(arguments.as_bytes())
+        .find(|(key, _)| key == "account")
+        .map(|(_, value)| value.into_owned())
+        .filter(|id| !id.is_empty())
+}
+
+/// Escape text for XML content and double-quoted attribute values. The title
+/// and body carry sender and subject lines from the message itself, so a
+/// crafted header must not be able to break out of the toast's markup.
+fn xml_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The toast XML for a new-mail notification: title and body as two text
+/// lines, the Mail sound, and `launch` set to [`launch_arguments`] so a click
+/// says which account it is about. `title`/`body` are expected to be already
+/// sanitised (see [`build_account_notification`]); they are escaped here.
+pub fn toast_xml(title: &str, body: &str, account_id: &str) -> String {
+    format!(
+        "<toast launch=\"{}\"><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual>\
+         <audio src=\"ms-winsoundevent:Notification.Mail\"/></toast>",
+        xml_escape(&launch_arguments(account_id)),
+        xml_escape(title),
+        xml_escape(body),
+    )
 }
 
 #[cfg(test)]
@@ -257,6 +304,34 @@ mod tests {
         let headers = [header("Bob", "Lunch?")];
         assert_eq!(build_account_notification("  ", &headers), build_notification(&headers));
         assert_eq!(build_account_notification("Work", &[]), None);
+    }
+
+    // ── toast XML and click arguments ───────────────────────────────────
+
+    #[test]
+    fn launch_arguments_round_trip_any_account_id() {
+        for id in ["alice@imap.example.com", "we ird&id=x@h", "ünï@host", "a=b&account=evil@x"] {
+            assert_eq!(account_from_launch_arguments(&launch_arguments(id)).as_deref(), Some(id));
+        }
+    }
+
+    #[test]
+    fn foreign_or_empty_launch_arguments_name_no_account() {
+        assert_eq!(account_from_launch_arguments(""), None);
+        assert_eq!(account_from_launch_arguments("other=1"), None);
+        assert_eq!(account_from_launch_arguments("account="), None);
+    }
+
+    #[test]
+    fn toast_xml_escapes_hostile_headers_and_carries_the_account() {
+        let xml = toast_xml("New mail from <b>\"x\"</b> & co", "</text><audio src=\"evil\"/>", "a@h");
+        // Nothing from the message can open a tag or close an attribute...
+        assert!(!xml.contains("<b>"));
+        assert!(!xml.contains("<audio src=\"evil\""));
+        assert!(xml.contains("&lt;b&gt;&quot;x&quot;&lt;/b&gt; &amp; co"));
+        // ...and the launch attribute says which account a click is about.
+        assert!(xml.starts_with("<toast launch=\"account=a%40h\">"));
+        assert!(xml.ends_with("</toast>"));
     }
 
     // ── sanitize_toast_field (via build_notification) ───────────────────

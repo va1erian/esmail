@@ -1,11 +1,9 @@
 use esmail::{auth, compose, config, db, emoji, imap, oauth, render, screenshot, search_query, secrets, session, smtp};
 mod accounts;
 mod settings;
-/// Tray icon + Windows toast notifications (B10). Windows-only: see
-/// notify.rs's module doc for why the pure detection logic lives separately
-/// and builds everywhere.
-#[cfg(target_os = "windows")]
-use esmail::tray;
+/// Tray icon + new-mail toasts (B10): the OS-specific side lives behind
+/// `platform`, so nothing below names a platform.
+use esmail::platform;
 
 use egui_litehtml_webview::{
     ImageRequest, InterceptOutcome, WebView, WebViewConfig, WebViewHandler, WebViewHost,
@@ -349,17 +347,18 @@ struct EsMailApp {
     download_progress: Option<(u32, u32)>,
 
     /// The tray icon (B10), or `None` if either it couldn't be created (see
-    /// `tray::TrayState::new`'s doc) or this is a preview/screenshot run,
+    /// `platform::TrayState::new`'s doc, or this platform has none) or this is a preview/screenshot run,
     /// where a tray icon would be unwanted background noise for what's
     /// meant to be a one-shot, no-account render. Window-close falls back to
     /// exiting normally whenever this is `None`, rather than hiding a window
     /// with no way to bring it back.
-    #[cfg(target_os = "windows")]
-    tray: Option<tray::TrayState>,
+    tray: Option<platform::TrayState>,
+    /// Account ids of new-mail toasts that were clicked, sent from the thread
+    /// the click arrives on; drained in `handle_tray`.
+    toast_click_rx: mpsc::Receiver<AccountId>,
     /// Set by the tray's "Quit" action; the next close-request is then
     /// allowed to actually close the app instead of being redirected to
     /// "hide to tray". See `EsMailApp::logic`.
-    #[cfg(target_os = "windows")]
     exit_requested: bool,
 }
 
@@ -372,15 +371,28 @@ impl EsMailApp {
         // session also runs its own new-mail watch (B10) as a plain tokio
         // task, not anything hung off `EsMailApp::ui`/`logic`, so toasts
         // keep coming for as long as the process is alive, independent of
-        // whether the main window is visible. See tray.rs for how the window
+        // whether the main window is visible. See platform/windows.rs for how the window
         // survives being "closed".
         let (imap_events_tx, imap_rx) = mpsc::channel(64);
         let (db_cmd_tx, db_cmd_rx) = mpsc::channel(32);
         let (db_evt_tx, db_evt_rx) = mpsc::channel(32);
 
         let egui_ctx = cc.egui_ctx.clone();
+        // A click on a new-mail toast arrives on a thread of the OS's, so it is
+        // only handed over here: the account id goes into a channel (drained in
+        // `handle_tray`) and the window is asked to come forward and repaint.
+        let (toast_click_tx, toast_click_rx) = mpsc::channel(8);
+        platform::set_toast_click_handler({
+            let ctx = egui_ctx.clone();
+            move |account| {
+                let _ = toast_click_tx.try_send(account);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                ctx.request_repaint();
+            }
+        });
         let session_hooks = Hooks {
-            notify: Arc::new(notify_new_mail),
+            notify: Arc::new(platform::show_new_mail_toast),
             repaint: {
                 let ctx = egui_ctx.clone();
                 Arc::new(move || ctx.request_repaint())
@@ -515,9 +527,8 @@ impl EsMailApp {
         // exits on its own -- a tray icon there would be unwanted
         // background noise (and a needless dependency on the tray shell
         // being available) for a run nothing ever clicks on.
-        #[cfg(target_os = "windows")]
         let tray = if preview.is_none() {
-            match tray::TrayState::new() {
+            match platform::TrayState::new() {
                 Ok(t) => Some(t),
                 Err(e) => {
                     log::warn!(
@@ -610,9 +621,8 @@ impl EsMailApp {
             search_all_accounts: false,
             headers_stale: false,
             download_progress: None,
-            #[cfg(target_os = "windows")]
             tray,
-            #[cfg(target_os = "windows")]
+            toast_click_rx,
             exit_requested: false,
             use_oauth,
             oauth_tx,
@@ -1779,13 +1789,26 @@ impl EsMailApp {
     }
 }
 
-/// Windows only (B10): tray icon polling + minimize-to-tray. Kept in its own
-/// `impl` block, called only from `EsMailApp::logic`, so the cfg-gating
-/// needed to keep this out of non-Windows builds stays contained to one
-/// place instead of scattered through the main `ui()`/`impl EsMailApp` code.
-#[cfg(target_os = "windows")]
+/// Tray icon polling + minimize-to-tray (B10), and clicks on new-mail toasts.
+/// Kept in its own `impl` block, called only from `EsMailApp::logic`. On a
+/// platform without a tray `self.tray` is `None` and this does nothing.
 impl EsMailApp {
     fn handle_tray(&mut self, ctx: &egui::Context) {
+        // A clicked toast: open the account the mail arrived in, at the mailbox
+        // being watched, so the new message is right there.
+        while let Ok(account) = self.toast_click_rx.try_recv() {
+            if self.view(&account).is_some() {
+                let mailbox = self
+                    .config
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == account)
+                    .and_then(|a| a.watch_mailbox.clone())
+                    .unwrap_or_else(|| session::DEFAULT_WATCH_MAILBOX.to_string());
+                self.adding_account = false;
+                self.activate(&account, mailbox);
+            }
+        }
         // The tooltip carries the unread total over all accounts.
         let unread: u32 = self.accounts.iter().map(AccountView::total_unread).sum();
         let Some(tray) = &mut self.tray else { return };
@@ -1793,11 +1816,11 @@ impl EsMailApp {
 
         for action in tray.poll_actions() {
             match action {
-                tray::TrayAction::Show => {
+                platform::TrayAction::Show => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                tray::TrayAction::Quit => {
+                platform::TrayAction::Quit => {
                     self.exit_requested = true;
                     // Hidden windows don't organically generate another
                     // close-request -- nothing is clicking their (invisible)
@@ -1836,7 +1859,6 @@ impl eframe::App for EsMailApp {
     /// than in `ui()`. New-mail polling and toast notifications do *not*
     /// need to be here -- see `session::AccountSession`, whose forwarder is a plain tokio task
     /// that runs independent of both `logic()` and `ui()`.
-    #[cfg(target_os = "windows")]
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_tray(ctx);
     }
@@ -1861,10 +1883,11 @@ impl eframe::App for EsMailApp {
                 height: rect.height(),
             });
         }
-        #[cfg(target_os = "windows")]
-        let closing = ui.ctx().input(|i| i.viewport().close_requested()) && self.exit_requested;
-        #[cfg(not(target_os = "windows"))]
-        let closing = ui.ctx().input(|i| i.viewport().close_requested());
+        // With a tray, a close request only hides the window unless Quit was
+        // chosen; without one (no tray on this platform, or it could not be
+        // created) a close request really closes.
+        let closing = ui.ctx().input(|i| i.viewport().close_requested())
+            && (self.tray.is_none() || self.exit_requested);
         if closing && !self.geometry_saved_on_close {
             self.geometry_saved_on_close = true;
             self.save_window_geometry();
@@ -2674,7 +2697,7 @@ const MARK_SEEN_DELAY: std::time::Duration = std::time::Duration::from_millis(12
 /// keep showing toasts -- for as long as the process is alive, independent of
 /// whether the main window is visible. That's what "notifications work even
 /// with the window closed" means in practice: the process (and these tasks)
-/// survives a window close because `tray.rs` turns that close into
+/// survives a window close because the tray (`platform`) turns that close into
 /// hide-to-tray instead of exit.
 fn spawn_account_view(
     account: &AccountConfig,
@@ -2709,19 +2732,6 @@ fn spawn_account_view(
     }
 }
 
-/// Show a new-mail toast on Windows; elsewhere, just log it. B10 is
-/// Windows-only (see PLAN.md §B10) -- this is the one place that
-/// distinction is made, so `session.rs` doesn't need its own
-/// `#[cfg]`.
-fn notify_new_mail(title: &str, body: &str) {
-    #[cfg(target_os = "windows")]
-    tray::show_new_mail_toast(title, body);
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (title, body);
-        log::info!("new mail: {title} -- {body} (desktop notifications are Windows-only, see PLAN.md §B10)");
-    }
-}
 
 /// Save-as, via a native file picker pre-filled with the attachment's own
 /// name. Does nothing if the user cancels the dialog; a write failure is

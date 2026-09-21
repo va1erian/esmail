@@ -20,8 +20,6 @@ pub mod search_query;
 pub mod secrets;
 pub mod session;
 pub mod smtp;
-/// Tray icon + Windows toast notifications (B10). Windows-only: see
-/// notify.rs's module doc for why the pure detection logic lives separately
-/// and builds everywhere.
-#[cfg(target_os = "windows")]
-pub mod tray;
+/// Tray icon and new-mail toasts (B10): the OS-specific implementation is
+/// chosen inside `platform`, see its module doc.
+pub mod platform;

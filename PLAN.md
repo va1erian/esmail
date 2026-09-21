@@ -19,7 +19,7 @@ Three crates in one workspace:
   second body-worker connection), `idle_watch.rs` (IMAP IDLE push), `smtp.rs`,
   `compose.rs`, `db.rs` (SQLite cache + FTS5), `search_query.rs`, `render.rs`
   (parse -> sanitize with `ammonia` -> resolve `cid:`), `config.rs`/`secrets.rs`
-  (TOML config, passwords in the OS keyring), `notify.rs`/`tray.rs` (Windows
+  (TOML config, passwords in the OS keyring), `notify.rs` + `platform/` (Windows
   toasts + tray), `emoji.rs` (coloured Twemoji in the message list; the
   embedded artwork adds about 4.4 MiB to the release binary, and the message
   body webview does not use it).
