@@ -2145,17 +2145,23 @@ impl eframe::App for EsMailApp {
                             };
                             let mut indent = |ui: &mut egui::Ui| {
                                 ui.add_space(row.depth as f32 * 14.0);
+                                // The arrow is drawn, not a "▸"/"▾" character:
+                                // egui's bundled fonts have neither, and they
+                                // came out as a box.
+                                let icon_width = ui.spacing().icon_width;
                                 if row.has_children {
-                                    let arrow = if is_collapsed { "\u{25b8}" } else { "\u{25be}" };
+                                    let (_, response) = ui.allocate_exact_size(egui::vec2(icon_width, icon_width), egui::Sense::click());
+                                    let openness = if is_collapsed { 0.0 } else { 1.0 };
+                                    egui::collapsing_header::paint_default_icon(ui, openness, &response);
                                     let hint = if is_collapsed { "Expand" } else { "Collapse" };
-                                    if ui.add(egui::Button::new(arrow).frame(false).small()).on_hover_text(hint).clicked() {
+                                    if response.on_hover_text(hint).clicked() {
                                         toggled_folder = Some((row.key.clone(), !is_collapsed));
                                     }
                                 } else {
                                     // Keeps leaf labels lined up with the
                                     // labels of their siblings that have an
                                     // arrow.
-                                    ui.add_space(ui.spacing().interact_size.y * 0.75);
+                                    ui.add_space(icon_width + ui.spacing().item_spacing.x);
                                 }
                             };
                             let Some(full_name) = &row.full_name else {
