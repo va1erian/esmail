@@ -14,6 +14,7 @@ pub mod emoji;
 pub mod icons;
 pub mod idle_watch;
 pub mod imap;
+pub mod ipc;
 pub mod notify;
 pub mod oauth;
 pub mod paths;

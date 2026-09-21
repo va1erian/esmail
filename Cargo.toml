@@ -117,6 +117,13 @@ serde_json = "1"
 # the taskbar theme), from the same family as `windows` above and sharing its
 # core crates. Windows-only, see crates/esmail/Cargo.toml.
 windows-registry = "0.6"
+# The local IPC transport between esMail's processes (`ipc/local.rs`): a named
+# pipe on Windows, a Unix domain socket elsewhere, behind one API. Safe Rust on
+# our side; its `SecurityDescriptor::deserialize` is what lets the Windows pipe
+# be restricted to its owner without an `unsafe` block.
+interprocess = { version = "2.4", features = ["tokio"] }
+# UTF-16 strings for that security descriptor (an SDDL string). Windows-only.
+widestring = "1"
 # Embeds the application icon and version info in `esmail.exe` (`build.rs`).
 winresource = "0.1"
 
