@@ -25,8 +25,16 @@ const SECRET_KINDS: [&str; 3] = ["imap", "smtp", "oauth"];
 /// The files esMail creates in a directory it does not exclusively own (one
 /// relocated with `ESMAIL_CONFIG_DIR` / `ESMAIL_DATA_DIR`, which could be any
 /// folder, so it is never deleted wholesale).
-const DATA_FILES: [&str; 7] =
-    ["mails.db", "mails.db-wal", "mails.db-shm", "mails.db-journal", "esmail.lock", "show.request", "quit.request"];
+const DATA_FILES: [&str; 8] = [
+    "mails.db",
+    "mails.db-wal",
+    "mails.db-shm",
+    "mails.db-journal",
+    "esmail.lock",
+    "show.request",
+    "quit.request",
+    crate::ipc::token::TOKEN_FILE_NAME,
+];
 
 /// Where things are, decoupled from the environment so the deletion logic
 /// can be tested against a scratch directory.
