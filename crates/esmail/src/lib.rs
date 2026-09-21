@@ -6,6 +6,7 @@
 
 pub mod compose;
 pub mod config;
+pub mod css;
 pub mod db;
 pub mod idle_watch;
 pub mod imap;
