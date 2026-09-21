@@ -88,7 +88,7 @@ The UI thread sends render jobs and paints the finished display lists.
 | # | What |
 |---|---|
 | #36 | Text selection and copy: landed except "Copy link address"; see HANDOFF.md |
-| #35 | Multiple accounts in one session, new-mail watching for each |
+| #35 | Multiple accounts in one session: landed except a unified inbox and toast click-through |
 | #34 | Compose in a dedicated native window |
 | #32 | Umbrella: render-time breakdown and the path to sub-second |
 | #31 | Optimize dependencies in the dev profile (~15x faster dev renders) |

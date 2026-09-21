@@ -631,7 +631,7 @@ async fn disconnected_session_reconnects_and_serves_the_next_request() {
 
 /// `idle_watch`'s reason to exist: a push should arrive close to
 /// instantly, well inside `RECV_TIMEOUT`, rather than needing
-/// `spawn_new_mail_watch`'s 60-second poll timer to notice. This is the one
+/// the forwarder's 60-second poll timer to notice. This is the one
 /// test in this file for `mail-mock-server`'s `IDLE` handling too --
 /// `imap_server.rs`'s untagged-`EXISTS`-on-delivery push and `idle_watch`'s
 /// client side are really one feature, verified together.
@@ -641,7 +641,7 @@ async fn idle_push_notifies_of_new_mail_without_polling() {
     let h = start_harness(0).await; // 2 fixtures already in INBOX
 
     let (wake_tx, mut wake_rx) = mpsc::channel(4);
-    idle_watch::spawn(
+    let _idle = idle_watch::spawn(
         "localhost".to_string(),
         h.server.imap_addr.port(),
         TEST_USER.to_string(),

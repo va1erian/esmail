@@ -18,6 +18,7 @@ pub mod render;
 pub mod screenshot;
 pub mod search_query;
 pub mod secrets;
+pub mod session;
 pub mod smtp;
 /// Tray icon + Windows toast notifications (B10). Windows-only: see
 /// notify.rs's module doc for why the pure detection logic lives separately

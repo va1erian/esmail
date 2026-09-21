@@ -424,7 +424,7 @@ pub enum ImapCommand {
     /// exactly this UID range as what the cache is missing. Deliberately a
     /// distinct command/event pair from `FetchNewHeaders`/`NewHeaders`
     /// despite doing the identical fetch: those feed B10's new-mail toast
-    /// (`spawn_new_mail_watch` in main.rs builds a notification from every
+    /// (the per-account forwarder in session.rs builds a notification from every
     /// `NewHeaders` it sees), and this fires far more often -- on every
     /// `FetchHeaders` that turns up UIDs the cache hasn't seen yet, which
     /// includes the user's own routine "open INBOX"/"hit refresh". Routing
@@ -1222,7 +1222,7 @@ enum WorkerCommand {
 /// Deliberately its own small connect/reconnect loop rather than sharing
 /// `ImapActor::ensure_connected`: that method emits `ImapEvent::Connected`/
 /// `Disconnected`, which the UI uses to gate the whole "are we logged in"
-/// state (`EsMailApp::is_connected`) and `spawn_new_mail_watch`'s poll
+/// state (`AccountView::state`) and the account forwarder's poll
 /// gate. A worker reconnect blipping that global state on every dropped
 /// body fetch would be misleading -- the *account* is still connected as
 /// far as the user should see, only this one background connection needed

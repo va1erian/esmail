@@ -1,6 +1,6 @@
 //! IMAP `IDLE` (RFC 2177) push watch for new mail -- a dedicated connection
 //! that sends `MailboxChanged` the moment the server pushes anything during
-//! an idle wait, instead of `main.rs`'s `spawn_new_mail_watch` having to
+//! an idle wait, instead of `session.rs`'s per-account forwarder having to
 //! poll on a fixed timer to find out. See PLAN.md's "IMAP push (IDLE)"
 //! section for the design rationale and what B10's polling still covers.
 //!
@@ -20,14 +20,13 @@
 //! what -- new mail, an expunge, a flag change all look the same from here.
 //! This module makes no attempt to tell them apart: `MailboxChanged` just
 //! means "go re-`EXAMINE`", exactly what B10's `ImapCommand::PollMailbox`
-//! already does. `main.rs` wires a `MailboxChanged` the same way it wires a
+//! already does. `session.rs` wires a `MailboxChanged` the same way it wires a
 //! poll-timer tick: send `PollMailbox`, let the existing watermark logic in
 //! `notify.rs` decide whether it was actually new mail.
 
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::auth::Auth;
 
@@ -50,18 +49,28 @@ const CONNECTED_LONG_ENOUGH_TO_RESET_BACKOFF: Duration = Duration::from_secs(60)
 #[derive(Debug)]
 pub struct MailboxChanged;
 
-/// Spawns a task that holds a dedicated `IDLE` connection against `mailbox`
-/// for as long as the process runs, sending [`MailboxChanged`] on `wake_tx`
-/// every time the server pushes something during the idle wait. Reconnects
-/// with exponential backoff on any error -- login failure, TLS/IO error, a
-/// server that doesn't support `IDLE` and answers `BAD` -- since unlike a
-/// one-shot command this has no caller left to report the error to; it just
-/// keeps trying, the same "never leaves the actor stuck" tradeoff
-/// `ImapActor::ensure_connected` documents for its own reconnect loop.
+/// Keeps one account's `IDLE` watch alive. Dropping it cancels the watch:
+/// the task (and with it the dedicated connection) is torn down, so Logout /
+/// Remove account can really stop it, and so can a fresh sign-in that needs
+/// the watch restarted with different credentials.
 ///
-/// Returns the task's handle so a caller that later has *different*
-/// credentials (a fresh sign-in after the old one was revoked) can `abort()`
-/// this watch and spawn a new one. Aborting drops the connection.
+/// The connection is dropped rather than closed with `LOGOUT`; the server
+/// notices the TCP close, which is all an idle-only connection needs.
+#[must_use = "dropping the handle cancels the IDLE watch"]
+pub struct IdleWatch {
+    _cancel: oneshot::Sender<()>,
+}
+
+/// Spawns a task that holds a dedicated `IDLE` connection against `mailbox`
+/// until the returned [`IdleWatch`] is dropped, sending [`MailboxChanged`] on
+/// `wake_tx` every time the server pushes something during the idle wait.
+/// Reconnects with exponential backoff on any error -- login failure, TLS/IO
+/// error, a server that doesn't support `IDLE` and answers `BAD` -- since
+/// unlike a one-shot command this has no caller left to report the error to;
+/// it just keeps trying, the same "never leaves the actor stuck" tradeoff
+/// `ImapActor::ensure_connected` documents for its own reconnect loop. Each
+/// call has its own backoff, so one dead server never delays another
+/// account's watch.
 pub fn spawn(
     host: String,
     port: u16,
@@ -69,21 +78,34 @@ pub fn spawn(
     auth: Auth,
     mailbox: String,
     wake_tx: mpsc::Sender<MailboxChanged>,
-) -> JoinHandle<()> {
+) -> IdleWatch {
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
-        let mut delay = Duration::from_secs(1);
-        loop {
-            let started = Instant::now();
-            if let Err(e) = run(&host, port, &username, &auth, &mailbox, &wake_tx).await {
-                log::warn!("IMAP IDLE watch on {mailbox} lost: {e}");
+        let watch = async {
+            let mut delay = Duration::from_secs(1);
+            loop {
+                let started = Instant::now();
+                if let Err(e) = run(&host, port, &username, &auth, &mailbox, &wake_tx).await {
+                    log::warn!("IMAP IDLE watch on {mailbox} for {username}@{host} lost: {e}");
+                }
+                if wake_tx.is_closed() {
+                    return;
+                }
+                if started.elapsed() >= CONNECTED_LONG_ENOUGH_TO_RESET_BACKOFF {
+                    delay = Duration::from_secs(1);
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(MAX_RECONNECT_DELAY);
             }
-            if started.elapsed() >= CONNECTED_LONG_ENOUGH_TO_RESET_BACKOFF {
-                delay = Duration::from_secs(1);
-            }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(MAX_RECONNECT_DELAY);
+        };
+        // `cancel_rx` resolves as soon as the `IdleWatch` (the sender half)
+        // is dropped, which drops `watch` and its connection with it.
+        tokio::select! {
+            _ = cancel_rx => {}
+            _ = watch => {}
         }
-    })
+    });
+    IdleWatch { _cancel: cancel_tx }
 }
 
 /// Connects, logs in, selects `mailbox`, then idles in a loop until an error
@@ -115,7 +137,7 @@ async fn run(
 
         match response {
             async_imap::extensions::idle::IdleResponse::NewData(_) => {
-                // Send-error means the receiver (main.rs's watch task) is
+                // Send-error means the receiver (the account's forwarder task) is
                 // gone, i.e. the app is shutting down -- nothing left to do
                 // but let this task end along with it.
                 if wake_tx.send(MailboxChanged).await.is_err() {

@@ -428,7 +428,7 @@ async fn idle_watch_authenticates_with_xoauth2_and_still_gets_pushes() {
     let (server, _google, auth) = oauth_setup(GOOD_TOKEN).await;
 
     let (wake_tx, mut wake_rx) = mpsc::channel(4);
-    idle_watch::spawn(
+    let _idle = idle_watch::spawn(
         "localhost".to_string(),
         server.imap_addr.port(),
         TEST_USER.to_string(),
@@ -451,4 +451,111 @@ async fn idle_watch_authenticates_with_xoauth2_and_still_gets_pushes() {
     })
     .await;
     assert!(result.is_ok(), "expected a push over an XOAUTH2-authenticated IDLE connection");
+}
+
+/// Google sign-in works for several accounts at once, next to a password
+/// account: each `AccountSession` has its own `TokenSource` (own refresh
+/// token, own access token), each server accepts only its own account's token,
+/// and each account is notified about its own mail.
+#[tokio::test]
+async fn several_google_accounts_and_a_password_account_run_side_by_side() {
+    use esmail::session::{AccountSession, Hooks, SessionParams};
+
+    skip_unless_ca_trusted!();
+
+    // Three servers, one account each; the Google ones only accept their own token.
+    let mut servers = Vec::new();
+    let mut auths = Vec::new();
+    let mut fakes = Vec::new(); // keep the fake token endpoints alive
+    for (user, token) in [("a@gmail.example", "token-a"), ("b@gmail.example", "token-b")] {
+        let store = mail_mock_server::new_store();
+        {
+            let mut guard = store.lock().unwrap();
+            guard.add_user(user, "unused");
+            guard.add_oauth_token(user, token);
+        }
+        servers.push((user, mail_mock_server::start(store).await.expect("start mock servers")));
+        let google = fake_token_endpoint(move |_| token_json(token, 3600, None)).await;
+        auths.push(Auth::OAuth(TokenSource::from_refresh_token(
+            google.client(),
+            SecretString::from(format!("refresh-{token}")),
+        )));
+        fakes.push(google);
+    }
+    let store = mail_mock_server::new_store();
+    store.lock().unwrap().add_user("c@example.com", "pw-c");
+    servers.push(("c@example.com", mail_mock_server::start(store).await.expect("start mock servers")));
+    auths.push(Auth::password("pw-c"));
+
+    let labels = ["GoogleA", "GoogleB", "Plain"];
+    let events: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let toasts: Arc<Mutex<Vec<String>>> = Arc::default();
+    let (tx, mut rx) = mpsc::channel(64);
+    let sink = events.clone();
+    tokio::spawn(async move {
+        while let Some((account, event)) = rx.recv().await {
+            sink.lock().unwrap().push((account, format!("{event:?}")));
+        }
+    });
+    let toast_sink = toasts.clone();
+    let hooks = Hooks {
+        notify: Arc::new(move |title, _| toast_sink.lock().unwrap().push(title.to_string())),
+        repaint: Arc::new(|| {}),
+    };
+
+    let mut sessions = Vec::new();
+    for (i, label) in labels.iter().enumerate() {
+        let (user, server) = &servers[i];
+        sessions.push(AccountSession::spawn(
+            SessionParams {
+                id: format!("id-{label}"),
+                label: label.to_string(),
+                host: "localhost".to_string(),
+                port: server.imap_addr.port(),
+                username: user.to_string(),
+                auth: auths[i].clone(),
+                watch_mailbox: "INBOX".to_string(),
+            },
+            tx.clone(),
+            hooks.clone(),
+        ));
+    }
+
+    let has = |account: &str, kind: &str| {
+        events.lock().unwrap().iter().any(|(a, k)| a == account && k.starts_with(kind))
+    };
+    timeout(RECV_TIMEOUT, async {
+        while !labels.iter().all(|l| has(&format!("id-{l}"), "Connected") && has(&format!("id-{l}"), "MailboxPolled")) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("all three accounts (two Google, one password) should connect and set a baseline");
+
+    timeout(RECV_TIMEOUT, async {
+        let mut n = 0;
+        while !labels.iter().all(|l| toasts.lock().unwrap().iter().any(|t| t.starts_with(&format!("{l}:")))) {
+            n += 1;
+            for (_, server) in &servers {
+                server.store.lock().unwrap().deliver(
+                    "INBOX",
+                    format!("From: bob@example.com\r\nTo: x\r\nSubject: hello {n}\r\n\r\nhi\r\n").into_bytes(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("every account, Google or not, should be notified of its own mail");
+
+    // Each Google account exchanged its own refresh token, and only that one.
+    for (fake, token) in fakes.iter().zip(["refresh-token-a", "refresh-token-b"]) {
+        let requests = fake.requests.lock().unwrap();
+        assert!(!requests.is_empty(), "the token endpoint for {token} was never used");
+        assert!(
+            requests.iter().all(|r| r.get("refresh_token").map(String::as_str) == Some(token)),
+            "an account presented another account's refresh token"
+        );
+    }
+    drop(sessions);
 }
