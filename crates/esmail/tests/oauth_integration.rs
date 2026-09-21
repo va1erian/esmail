@@ -499,7 +499,7 @@ async fn several_google_accounts_and_a_password_account_run_side_by_side() {
     });
     let toast_sink = toasts.clone();
     let hooks = Hooks {
-        notify: Arc::new(move |title, _| toast_sink.lock().unwrap().push(title.to_string())),
+        notify: Arc::new(move |_, title, _| toast_sink.lock().unwrap().push(title.to_string())),
         repaint: Arc::new(|| {}),
     };
 

@@ -63,8 +63,9 @@ pub struct SessionParams {
     pub watch_mailbox: String,
 }
 
-/// Shows a new-mail toast: `(title, body)`.
-pub type NotifyFn = Arc<dyn Fn(&str, &str) + Send + Sync>;
+/// Shows a new-mail toast: `(account id, title, body)`. The id is what a click
+/// on the toast reports back, so it can open that account.
+pub type NotifyFn = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 /// Asks the UI to repaint.
 pub type RepaintFn = Arc<dyn Fn() + Send + Sync>;
 
@@ -72,7 +73,7 @@ pub type RepaintFn = Arc<dyn Fn() + Send + Sync>;
 /// egui nor the Windows toast API, and tests can observe the toasts.
 #[derive(Clone)]
 pub struct Hooks {
-    /// Show a new-mail toast: `(title, body)`. The title already names the
+    /// Show a new-mail toast: `(account id, title, body)`. The title already names the
     /// account.
     pub notify: NotifyFn,
     /// Ask the UI to repaint because an event was queued for it.
@@ -82,7 +83,7 @@ pub struct Hooks {
 impl Hooks {
     /// Hooks that do nothing, for headless use.
     pub fn none() -> Self {
-        Self { notify: Arc::new(|_, _| {}), repaint: Arc::new(|| {}) }
+        Self { notify: Arc::new(|_, _, _| {}), repaint: Arc::new(|| {}) }
     }
 }
 
@@ -229,7 +230,7 @@ async fn forward_and_watch(
                     }
                     ImapEvent::NewHeaders { mailbox, headers } if *mailbox == watch_mailbox => {
                         if let Some((title, body)) = notify::build_account_notification(&label, headers) {
-                            (hooks.notify)(&title, &body);
+                            (hooks.notify)(&account, &title, &body);
                         }
                     }
                     _ => {}

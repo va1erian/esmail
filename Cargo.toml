@@ -64,14 +64,14 @@ opener = "0.7"
 # the Linux-only gtk/libxdo pulls, which are dead weight on the Windows-only
 # feature this backs. Windows-only dependency -- see crates/esmail/Cargo.toml.
 tray-icon = { version = "0.24", default-features = false }
-# Windows toast notifications for new mail (B10). Deliberately not
-# notify-rust: as published on crates.io it no longer has a Windows backend
-# (dbus/linux, bsd, mac only), despite older docs suggesting otherwise --
-# checked before picking this instead. Escapes toast XML content via xml-rs
-# (verified by reading its source), so a crafted Subject/From header can't
-# break out of the markup. Windows-only dependency -- see
-# crates/esmail/Cargo.toml.
-winrt-notification = "0.5"
+# Windows toast notifications for new mail (B10), called through the WinRT
+# `ToastNotificationManager` API directly. This replaced `winrt-notification`,
+# which is a thin wrapper that hides the toast's `Activated` event -- the one
+# thing needed to open the right account when a toast is clicked. Only the
+# features used are enabled: the toast classes, the XML document they are built
+# from, `TypedEventHandler`, and `RoInitialize` for the threads that show
+# toasts. Windows-only dependency -- see crates/esmail/Cargo.toml.
+windows = { version = "0.62", features = ["UI_Notifications", "Data_Xml_Dom", "Foundation", "Win32_System_WinRT"] }
 
 # Storage / secrets
 # `esmail` is the only crate in the workspace that depends on rusqlite, so a

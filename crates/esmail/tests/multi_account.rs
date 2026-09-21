@@ -76,6 +76,9 @@ impl Server {
 struct Seen {
     events: Arc<Mutex<Vec<(String, String)>>>,
     toasts: Arc<Mutex<Vec<(String, String)>>>,
+    /// The account id each toast was shown for (what a click would report
+    /// back), with its title, in the same order as `toasts`.
+    toast_accounts: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl Seen {
@@ -112,8 +115,12 @@ fn wiring() -> (mpsc::Sender<AccountEvent>, Hooks, Seen) {
         }
     });
     let toasts = seen.toasts.clone();
+    let toast_accounts = seen.toast_accounts.clone();
     let hooks = Hooks {
-        notify: Arc::new(move |title, body| toasts.lock().unwrap().push((title.to_string(), body.to_string()))),
+        notify: Arc::new(move |account, title, body| {
+            toast_accounts.lock().unwrap().push((account.to_string(), title.to_string()));
+            toasts.lock().unwrap().push((title.to_string(), body.to_string()));
+        }),
         repaint: Arc::new(|| {}),
     };
     (tx, hooks, seen)
@@ -304,6 +311,12 @@ async fn four_accounts_each_get_only_their_own_notifications() {
                 "{other} mail leaked into a {owner} toast: {title:?} / {body:?}"
             );
         }
+    }
+    // Each toast carries the id of the account it names, which is what a click
+    // on it reports back to open that account.
+    for (account, title) in seen.toast_accounts.lock().unwrap().iter() {
+        let owner = NAMES.iter().find(|n| title.starts_with(&format!("{n}:"))).expect("toast names an account");
+        assert_eq!(account, &format!("id-{owner}"), "toast {title:?} carries the wrong account id");
     }
     drop(sessions);
 }
