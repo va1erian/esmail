@@ -25,12 +25,17 @@ impl TrayState {
     }
 
     pub fn set_unread(&mut self, _total: u32) {}
+
+    pub fn refresh_icon(&mut self) {}
 }
 
 /// Log the notification; there is no toast to show.
 pub fn show_new_mail_toast(account_id: &str, title: &str, body: &str) {
     log::info!("new mail ({account_id}): {title} -- {body} (desktop notifications are Windows-only, see PLAN.md §B10)");
 }
+
+/// Nothing to record: there are no toasts to attribute.
+pub fn use_own_notification_identity(_registered: bool) {}
 
 /// Toasts are never shown here, so they are never clicked.
 pub fn set_toast_click_handler(_handler: impl Fn(String) + Send + Sync + 'static) {}

@@ -5,6 +5,13 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+  # Installer changes are otherwise only exercised by a release, so a PR that
+  # touches them builds and smoke-tests the installer too.
+  pull_request:
+    paths:
+      - 'installer/**'
+      - 'crates/esmail/assets/**'
+      - '.github/workflows/build.yml'
 
 # The repository's default GITHUB_TOKEN permission is read-only, so the
 # release job has to ask for `contents: write` explicitly -- without it
@@ -16,6 +23,7 @@ jobs:
   build-linux:
     name: Build Linux
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
       
@@ -65,6 +73,68 @@ jobs:
           name: esmail-windows
           path: esmail-windows.zip
 
+      # A small, self-contained setup program (Inno Setup, solid LZMA2 at its
+      # highest level) for people who want Start-menu entries, an entry in
+      # "Apps & features" and a clean uninstall. The portable zip above stays
+      # for those who do not. See installer/esmail.iss.
+      - name: Work out the version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          } else {
+            $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+            $version = "$cargo-dev+$($env:GITHUB_SHA.Substring(0, 7))"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y }
+          if (-not (Test-Path $iscc)) { throw 'Inno Setup is not installed' }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & $env:ISCC "/DAppVersion=${{ steps.version.outputs.version }}" installer\esmail.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Get-ChildItem dist | Format-Table Name, Length
+
+      # Installs into a scratch directory, seeds some user data, then
+      # uninstalls with /PURGE and checks that the program *and* the data are
+      # gone -- the "clean uninstall" promise, exercised for real on every build.
+      - name: Test install, then uninstall with data removal
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem dist\esmail-*-setup.exe).FullName
+          $dir = Join-Path $env:RUNNER_TEMP 'esmail-installed'
+          Start-Process -Wait -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', '/NORESTART', "/DIR=$dir"
+          if (-not (Test-Path "$dir\esmail.exe")) { throw 'installer did not install esmail.exe' }
+
+          $config = "$env:APPDATA\esmail\config"
+          $data = "$env:LOCALAPPDATA\esmail\data"
+          New-Item -ItemType Directory -Force $config, $data | Out-Null
+          Set-Content "$config\config.toml" 'accounts = []'
+          Set-Content "$data\mails.db" 'cache'
+
+          # `_?=` makes the uninstaller run in place and wait, instead of
+          # copying itself to %TEMP% and returning at once.
+          Start-Process -Wait -FilePath "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/PURGE', "_?=$dir"
+
+          if (Test-Path "$dir\esmail.exe") { throw 'uninstall left esmail.exe behind' }
+          if (Test-Path "$env:APPDATA\esmail") { throw 'uninstall left the config directory behind' }
+          if (Test-Path "$env:LOCALAPPDATA\esmail") { throw 'uninstall left the data directory behind' }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: esmail-windows-installer
+          path: dist/esmail-*-setup.exe
+
   create-release:
     name: Create Release
     needs: [build-linux, build-windows]
@@ -85,11 +155,18 @@ jobs:
           name: esmail-windows
           path: ./artifacts/windows
 
+      - name: Download Windows Installer
+        uses: actions/download-artifact@v4
+        with:
+          name: esmail-windows-installer
+          path: ./artifacts/windows-installer
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             ./artifacts/linux/esmail
             ./artifacts/windows/esmail-windows.zip
+            ./artifacts/windows-installer/*.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

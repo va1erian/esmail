@@ -10,16 +10,20 @@ pub mod config;
 pub mod css;
 pub mod db;
 pub mod emoji;
+pub mod icons;
 pub mod idle_watch;
 pub mod imap;
 pub mod notify;
 pub mod oauth;
+pub mod paths;
 pub mod render;
 pub mod screenshot;
 pub mod search_query;
 pub mod secrets;
 pub mod session;
+pub mod shell;
 pub mod smtp;
+pub mod uninstall;
 /// Tray icon and new-mail toasts (B10): the OS-specific implementation is
 /// chosen inside `platform`, see its module doc.
 pub mod platform;

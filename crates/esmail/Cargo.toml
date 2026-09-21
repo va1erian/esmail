@@ -76,6 +76,14 @@ serde_json.workspace = true
 tray-icon.workspace = true
 windows.workspace = true
 keyring = { workspace = true, features = ["windows-native"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # Secret Service (gnome-keyring/kwallet over D-Bus) -- matches the
 # `libdbus-1-dev` package `.github/workflows/build.yml`'s Linux job already
@@ -90,3 +98,8 @@ keyring = { workspace = true, features = ["apple-native"] }
 
 [dev-dependencies]
 mail-mock-server = { path = "../mail-mock-server" }
+
+# `build.rs` only calls into this when targeting Windows; the crate itself is
+# plain Rust and builds everywhere.
+[build-dependencies]
+winresource.workspace = true

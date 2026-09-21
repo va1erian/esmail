@@ -271,14 +271,6 @@ pub fn collapsed_folder_key(account_id: &str, folder_key: &str) -> String {
     format!("{account_id}\t{folder_key}")
 }
 
-fn config_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "esmail").map(|dirs| dirs.config_dir().to_path_buf())
-}
-
-fn config_path() -> Option<PathBuf> {
-    config_dir().map(|dir| dir.join("config.toml"))
-}
-
 /// The old plain-text config file this format replaces, so first-run
 /// migration knows where to look.
 fn legacy_config_path() -> PathBuf {
@@ -290,7 +282,7 @@ impl Config {
     /// Load `config.toml`, or an empty config if it does not exist yet or
     /// fails to parse (rather than refusing to start).
     pub fn load() -> Self {
-        let Some(path) = config_path() else {
+        let Some(path) = crate::paths::config_file() else {
             return Self::default();
         };
         match std::fs::read_to_string(&path) {
@@ -304,7 +296,7 @@ impl Config {
 
     /// Write `config.toml`, creating the config directory if needed.
     pub fn save(&self) -> anyhow::Result<()> {
-        let path = config_path().ok_or_else(|| anyhow::anyhow!("no config directory available"))?;
+        let path = crate::paths::config_file().ok_or_else(|| anyhow::anyhow!("no config directory available"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

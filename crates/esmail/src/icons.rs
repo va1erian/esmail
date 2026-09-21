@@ -1,0 +1,96 @@
+//! The application artwork, embedded in the binary.
+//!
+//! `assets/` holds the sources (`icon.svg`, `tray-icon.svg`) and the rasters
+//! made from them. The Windows executable's own icon (`assets/icon.ico`) is
+//! attached by `build.rs`; this module supplies what the running program
+//! draws itself: the window icon and the tray icon.
+//!
+//! The tray glyph is a single dark colour on a transparent background, so on
+//! a dark taskbar it would be invisible. [`tray_icon`] therefore repaints it
+//! white when asked to -- keeping only the alpha channel, which is all the
+//! artwork's shape lives in.
+
+/// Tray artwork at each size it is provided in, smallest first.
+const TRAY_PNGS: [(u32, &[u8]); 4] = [
+    (16, include_bytes!("../assets/tray-16.png")),
+    (32, include_bytes!("../assets/tray-32.png")),
+    (44, include_bytes!("../assets/tray-44.png")),
+    (64, include_bytes!("../assets/tray-64.png")),
+];
+
+/// The window/taskbar icon: the full-colour application icon.
+pub const WINDOW_ICON_PNG: &[u8] = include_bytes!("../assets/icon-128.png");
+
+/// Straight-alpha RGBA pixels, `width * height * 4` bytes.
+pub struct Rgba {
+    pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+fn decode(png: &[u8]) -> Option<Rgba> {
+    let image = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?.into_rgba8();
+    let (width, height) = image.dimensions();
+    Some(Rgba { pixels: image.into_raw(), width, height })
+}
+
+/// The application icon, for the window.
+pub fn window_icon() -> Option<Rgba> {
+    decode(WINDOW_ICON_PNG)
+}
+
+/// The tray icon for a shell that wants roughly `want_px` pixels (the
+/// system's small-icon size): the smallest provided size that is at least
+/// that big, or the largest if none is. `light_glyph` selects a white glyph,
+/// for a dark taskbar.
+pub fn tray_icon(want_px: u32, light_glyph: bool) -> Option<Rgba> {
+    let (_, png) = TRAY_PNGS.iter().find(|(size, _)| *size >= want_px).unwrap_or(&TRAY_PNGS[TRAY_PNGS.len() - 1]);
+    let mut icon = decode(png)?;
+    if light_glyph {
+        for pixel in icon.pixels.chunks_exact_mut(4) {
+            pixel[0] = 0xff;
+            pixel[1] = 0xff;
+            pixel[2] = 0xff;
+        }
+    }
+    Some(icon)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_icon_decodes_square() {
+        let icon = window_icon().expect("embedded PNG decodes");
+        assert_eq!(icon.width, icon.height);
+        assert_eq!(icon.pixels.len(), (icon.width * icon.height * 4) as usize);
+    }
+
+    #[test]
+    fn tray_icon_picks_the_smallest_size_that_is_big_enough() {
+        assert_eq!(tray_icon(16, false).unwrap().width, 16);
+        assert_eq!(tray_icon(24, false).unwrap().width, 32);
+        assert_eq!(tray_icon(40, false).unwrap().width, 44);
+        assert_eq!(tray_icon(1000, false).unwrap().width, 64);
+    }
+
+    #[test]
+    fn every_embedded_tray_png_has_the_size_it_is_filed_under() {
+        for (size, png) in TRAY_PNGS {
+            let icon = decode(png).unwrap();
+            assert_eq!((icon.width, icon.height), (size, size));
+        }
+    }
+
+    #[test]
+    fn light_glyph_keeps_the_shape_and_whitens_the_colour() {
+        let dark = tray_icon(32, false).unwrap();
+        let light = tray_icon(32, true).unwrap();
+        assert!(dark.pixels.chunks_exact(4).any(|p| p[3] > 0), "glyph is not empty");
+        for (d, l) in dark.pixels.chunks_exact(4).zip(light.pixels.chunks_exact(4)) {
+            assert_eq!(d[3], l[3], "alpha (the shape) is unchanged");
+            assert_eq!(&l[..3], &[0xff, 0xff, 0xff]);
+        }
+    }
+}

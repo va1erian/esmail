@@ -37,3 +37,6 @@ mails.db
 # mail-mock-server's CA cert, written out by `docker compose up mail-mock-server`
 # for a host TLS client to trust — see docker-compose.yml / CA_OUT.
 /tmp/mail-mock-server-ca/
+
+# Installer output (installer/esmail.iss)
+/dist/
