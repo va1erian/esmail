@@ -41,23 +41,9 @@ async fn run_google_sign_in(
     oauth::TokenSource::from_grant(client.clone(), grant)
 }
 
-/// What a saved account signs in with, read from the keyring: its password,
-/// or a token source built from its Google refresh token. `Err` says what is
-/// missing, in words fit for a banner.
-pub(super) fn saved_auth(config: &Config, account: &AccountConfig) -> Result<auth::Auth, String> {
-    match account.auth {
-        config::AuthKind::Password => secrets::get_password(&account.id, "imap")
-            .map(auth::Auth::Password)
-            .ok_or_else(|| "no saved password".to_string()),
-        config::AuthKind::GoogleOAuth => {
-            let client = oauth::google_client(config.google_oauth.as_ref())
-                .ok_or_else(|| "Google sign-in needs an OAuth client id (Settings > Google)".to_string())?;
-            let refresh_token = secrets::get_password(&account.id, "oauth")
-                .ok_or_else(|| "not signed in with Google yet (Settings > Accounts > Sign in)".to_string())?;
-            Ok(auth::Auth::OAuth(oauth::TokenSource::from_refresh_token(client, refresh_token)))
-        }
-    }
-}
+// Reading a saved account's credential lives in the library (`auth`), so the
+// background listener can use it too.
+pub(super) use esmail::auth::saved_auth;
 
 impl EsMailApp {
     /// Fill the login form from a saved account and pull its password back
