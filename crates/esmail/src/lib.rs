@@ -9,6 +9,7 @@ pub mod compose;
 pub mod config;
 pub mod css;
 pub mod db;
+pub mod emoji;
 pub mod idle_watch;
 pub mod imap;
 pub mod notify;

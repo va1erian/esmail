@@ -20,7 +20,9 @@ Three crates in one workspace:
   `compose.rs`, `db.rs` (SQLite cache + FTS5), `search_query.rs`, `render.rs`
   (parse -> sanitize with `ammonia` -> resolve `cid:`), `config.rs`/`secrets.rs`
   (TOML config, passwords in the OS keyring), `notify.rs`/`tray.rs` (Windows
-  toasts + tray).
+  toasts + tray), `emoji.rs` (coloured Twemoji in the message list; the
+  embedded artwork adds about 4.4 MiB to the release binary, and the message
+  body webview does not use it).
 - **`crates/mail-mock-server`** — an in-process IMAP + SMTP server with a
   throwaway TLS CA, used by `crates/esmail/tests/imap_smtp_integration.rs`.
 

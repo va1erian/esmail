@@ -1280,6 +1280,8 @@ dependencies = [
  "tokio-native-tls",
  "toml",
  "tray-icon",
+ "twemoji-assets",
+ "unicode-segmentation",
  "ureq",
  "url",
  "winrt-notification",
@@ -4335,6 +4337,12 @@ name = "ttf-parser"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "17f77d76d837a7830fe1d4f12b7b4ba4192c1888001c7164257e4bc6d21d96b4"
+
+[[package]]
+name = "twemoji-assets"
+version = "1.5.1+17.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6857896b4a287e70f8197ab8fb9d68b3c43bb7ae97595aceaf2d11c21b93d9e9"
 
 [[package]]
 name = "type-map"
