@@ -30,13 +30,13 @@
 //! (`position`, `z-index`, offsets) are deliberately left off the
 //! allowlist — real HTML email doesn't need them for layout, and they're
 //! the one class of CSS that could otherwise overlay convincing fake UI.
-//! **`<style>` blocks are still stripped entirely** (unlike the attribute,
-//! ammonia has no built-in per-property filter for a `<style>` tag's text
-//! content — allowing the tag would mean its CSS passes through
-//! completely unfiltered, defeating the allowlist); this only matters for
-//! mail that relies on class-selector CSS instead of inline styles, which
-//! most real-world HTML email avoids anyway since some mail clients strip
-//! `<style>` blocks outright.
+//! **`<style>` blocks** are kept too, since marketing mail leans on them
+//! (`p{margin}`, `.class{padding}`, `@media` rules), but ammonia treats their
+//! text as opaque and would pass it through unfiltered, so [`crate::css`]
+//! re-parses each block and re-emits only style rules and `@media` rules whose
+//! declarations are on that same allowlist. **Layout attributes** of the HTML 4
+//! table model (`width`, `bgcolor`, `valign`, ...) are allowed as well; see
+//! `TABLE_ATTRIBUTES`.
 //!
 //! [`extract_attachments`] is B6 of PLAN.md: it walks the same parsed
 //! structure for leaf parts that are neither the chosen body nor already
@@ -209,7 +209,11 @@ fn allowed_style_properties() -> std::collections::HashSet<&'static str> {
         "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
         "border", "border-top", "border-right", "border-bottom", "border-left",
         "border-width", "border-style", "border-color", "border-radius",
-        "border-collapse", "border-spacing",
+        "border-top-left-radius", "border-top-right-radius", "border-bottom-left-radius",
+        "border-bottom-right-radius", "border-top-width", "border-right-width",
+        "border-bottom-width", "border-left-width", "border-top-style", "border-right-style",
+        "border-bottom-style", "border-left-style", "border-top-color", "border-right-color",
+        "border-bottom-color", "border-left-color", "border-collapse", "border-spacing",
         "width", "height", "max-width", "max-height", "min-width", "min-height",
         "box-shadow", "box-sizing",
         // Typography
@@ -218,7 +222,7 @@ fn allowed_style_properties() -> std::collections::HashSet<&'static str> {
         "text-indent", "text-shadow", "white-space", "word-break", "word-wrap",
         "overflow-wrap", "word-spacing",
         // Layout (non-positioning)
-        "display", "vertical-align", "float", "clear", "overflow", "table-layout",
+        "display", "visibility", "vertical-align", "float", "clear", "overflow", "table-layout",
         // Misc, low-risk
         "list-style", "list-style-type", "list-style-image", "list-style-position", "cursor",
     ]
@@ -226,8 +230,17 @@ fn allowed_style_properties() -> std::collections::HashSet<&'static str> {
     .collect()
 }
 
+/// Layout attributes of the HTML 4 table model. HTML email is built from
+/// them -- `<table width="600" bgcolor=... cellspacing=0>`, `<td valign=top
+/// width="50%">` -- and ammonia's defaults keep only `align`, so without these a
+/// 600px newsletter column becomes full width and every multi-column row
+/// collapses to its content. All are inert layout/colour data.
+const TABLE_ATTRIBUTES: &[&str] = &["width", "height", "bgcolor", "background", "border", "cellpadding", "cellspacing"];
+const CELL_ATTRIBUTES: &[&str] = &["width", "height", "bgcolor", "background", "valign", "nowrap"];
+
 fn sanitize(html: &str) -> String {
-    ammonia::Builder::default()
+    let mut builder = ammonia::Builder::default();
+    builder
         // `data:` — inline images resolved from `cid:` parts above need it to
         // survive; it's not in ammonia's default scheme allowlist.
         // `cid:` — an *unresolved* reference (no matching part) is left as
@@ -239,21 +252,56 @@ fn sanitize(html: &str) -> String {
         // Allow the `style="..."` attribute (filtered — see
         // allowed_style_properties' doc): without it, marketing/
         // transactional HTML that relies on inline styles for spacing/
-        // color renders as dense, unstyled plain text (see this module's
-        // doc comment's former "known limitation" note). Deliberately
-        // *not* allowing the `<style>` tag itself: ammonia's
-        // `style_properties` filtering only inspects the `style`
-        // attribute — a `<style>` block's text content would pass through
-        // completely unfiltered (ammonia treats it as an opaque text node,
-        // no CSS parsing at all), which would defeat the point of having
-        // an allowlist. Inline `style=` is also what real HTML email
-        // overwhelmingly relies on in the first place (many mail clients
-        // strip `<style>` blocks outright, so senders lean on inline
-        // styles as the portable baseline).
-        .add_generic_attributes(&["style"])
-        .filter_style_properties(allowed_style_properties())
-        .clean(html)
-        .to_string()
+        // color renders as dense, unstyled plain text. `class`/`id` are inert
+        // and are what the `<style>` blocks kept below select on.
+        .add_generic_attributes(&["style", "class", "id"])
+        .add_tag_attributes("table", TABLE_ATTRIBUTES)
+        .add_tag_attributes("tbody", &["valign"])
+        .add_tag_attributes("thead", &["valign"])
+        .add_tag_attributes("tfoot", &["valign"])
+        .add_tag_attributes("tr", &["valign", "bgcolor"])
+        .add_tag_attributes("td", CELL_ATTRIBUTES)
+        .add_tag_attributes("th", CELL_ATTRIBUTES)
+        // ammonia drops the `<title>` tag but keeps its text, which litehtml
+        // would then show as body text (the message's subject, a second time).
+        .add_clean_content_tags(&["title"])
+        // `<style>` is allowed through ammonia only so that `filter_style_blocks`
+        // can filter its CSS afterwards -- ammonia itself passes the text
+        // through unfiltered (see css.rs). Nothing may be returned from here
+        // without going through that step.
+        .add_tags(&["style"])
+        .rm_clean_content_tags(&["style"])
+        .filter_style_properties(allowed_style_properties());
+    filter_style_blocks(&builder.clean(html).to_string())
+}
+
+/// Replace the text of every `<style>` element in `html` (already sanitized,
+/// so tags are lowercase, attribute-free and well nested) with its
+/// [`css::filter_stylesheet`]ed version, dropping elements that end up empty.
+fn filter_style_blocks(html: &str) -> String {
+    const OPEN: &str = "<style>";
+    const CLOSE: &str = "</style>";
+    let allowed = allowed_style_properties();
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + OPEN.len()..];
+        // An unterminated block would run to the end of the document: drop it.
+        let Some(end) = after.find(CLOSE) else {
+            return out;
+        };
+        let css = crate::css::filter_stylesheet(&after[..end], &allowed);
+        // The CSS text must never be able to close the element early.
+        if !css.is_empty() && !css.contains('<') {
+            out.push_str(OPEN);
+            out.push_str(&css);
+            out.push_str(CLOSE);
+        }
+        rest = &after[end + CLOSE.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn wrap_document(body: &str) -> String {
@@ -366,18 +414,60 @@ mod tests {
     }
 
     #[test]
-    fn style_tag_blocks_are_still_stripped_entirely() {
+    fn style_blocks_are_kept_but_only_their_allowlisted_declarations() {
         // Unlike the style attribute, ammonia has no per-property filter for
-        // a <style> tag's text content -- allowing the tag would let its CSS
-        // through completely unfiltered. Left disabled deliberately (see
-        // this module's doc comment). Checks sanitize()'s output directly,
-        // not render_message()'s -- wrap_document() always adds its own
-        // base <style> block, so asserting against the full wrapped
-        // document would trivially "pass" regardless of what this checks.
+        // a <style> tag's text, so `css::filter_stylesheet` does it. Checks
+        // sanitize()'s output directly, not render_message()'s --
+        // wrap_document() always adds its own base <style> block, so asserting
+        // against the full wrapped document would trivially "pass".
+        let cleaned = sanitize(
+            "<style>p { margin: 1em 0; position: fixed } @import url(https://t.example/x.css);              @media (max-width: 480px) { .c { width: 100% !important } }</style><p class=\"c\">hi</p>",
+        );
+        assert!(cleaned.contains("<style>"), "expected {cleaned:?} to keep the style tag");
+        assert!(cleaned.contains("margin:1em 0;"), "{cleaned:?}");
+        assert!(cleaned.contains("@media (max-width: 480px)"), "{cleaned:?}");
+        assert!(!cleaned.contains("position") && !cleaned.contains("@import"), "{cleaned:?}");
+        assert!(cleaned.contains("<p class=\"c\">hi</p>"), "{cleaned:?}");
+    }
+
+    #[test]
+    fn a_style_block_with_nothing_allowed_in_it_disappears() {
         let cleaned = sanitize("<style>body { position: fixed; }</style><p>hi</p>");
-        assert!(!cleaned.contains("<style"), "expected {cleaned:?} to drop the style tag");
-        assert!(!cleaned.contains("position"), "expected {cleaned:?} to drop its CSS text");
+        assert!(!cleaned.contains("<style"), "expected {cleaned:?} to drop the empty style tag");
+        assert!(!cleaned.contains("position"));
         assert!(cleaned.contains("<p>hi</p>"));
+    }
+
+    #[test]
+    fn style_blocks_cannot_smuggle_markup_out_of_the_style_element() {
+        for html in [
+            "<style>p { color: red }</style><script>alert(1)</script>",
+            "<style><!--</style><script>alert(1)</script>--></style>",
+            "<style>p { background-image: url(\"</style><img src=x onerror=alert(1)>\") }</style>",
+        ] {
+            let cleaned = sanitize(html).to_ascii_lowercase();
+            assert!(!cleaned.contains("<script") && !cleaned.contains("onerror"), "{html:?} -> {cleaned:?}");
+        }
+    }
+
+    #[test]
+    fn table_layout_attributes_survive() {
+        let cleaned = sanitize(
+            r##"<table width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#fff" align="center"><tr valign="top"><td width="50%" valign="top" bgcolor="#eee" height="3" class="a" id="b">x</td></tr></table>"##,
+        );
+        for attr in [
+            r#"width="600""#, r#"cellpadding="0""#, r#"cellspacing="0""#, r#"border="0""#, r##"bgcolor="#fff""##,
+            r#"width="50%""#, r#"valign="top""#, r#"height="3""#, r#"class="a""#, r#"id="b""#,
+        ] {
+            assert!(cleaned.contains(attr), "expected {attr} in {cleaned:?}");
+        }
+    }
+
+    #[test]
+    fn a_title_element_does_not_leak_its_text_into_the_body() {
+        let html = render_message(&message("Content-Type: text/html", "<title>Version en ligne</title><p>body</p>"));
+        assert!(!html.contains("Version en ligne"), "{html:?}");
+        assert!(html.contains("<p>body</p>"));
     }
 
     #[test]

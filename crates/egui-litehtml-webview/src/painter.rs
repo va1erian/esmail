@@ -47,6 +47,25 @@ use crate::{LinkTable, Output, TextRunTable};
 /// height, so `60vh` means the same thing on every render.
 const VIEWPORT_HEIGHT: f32 = 800.0;
 
+/// litehtml's own UA stylesheet, restated (see the file's header for why).
+const LITEHTML_MASTER_CSS: &str = include_str!("litehtml_master.css");
+
+/// The user-agent stylesheet: litehtml's defaults, then the email rules
+/// (`body{margin:0}`, `p{margin:0}`, `td{padding:0}`, `table{border-collapse}`
+/// ...), then litehtml's `table{text-align:left}` reset that `from_html` only
+/// adds to *its* default.
+///
+/// It must go in the **master** slot. The other one, `user_styles`, is applied
+/// *after* the document's own `<style>` blocks, so those rules override the
+/// message's CSS: a message's `p{margin:1em 0}` or `td.pad{padding:20px}` lost
+/// to the UA's `p{margin:0}` / `td{padding:0}`. Master rules are applied first,
+/// which is what "user agent" means, so the message wins and presentational
+/// attributes (`cellpadding`, `bgcolor`, ...) sit above them.
+fn ua_sheet() -> &'static str {
+    static SHEET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SHEET.get_or_init(|| format!("{LITEHTML_MASTER_CSS}\n{EMAIL_MASTER_CSS}\ntable {{ text-align: left; }}\n"))
+}
+
 /// Most tiles of a repeated background image drawn along one axis / in total.
 const MAX_TILES_PER_AXIS: usize = 2048;
 const MAX_TILES: usize = 20_000;
@@ -903,7 +922,7 @@ impl PainterEngine {
         self.container.begin(width, scale);
         // Captured before the `Document` takes its mutable borrow.
         let measure = self.container.text_measure_fn();
-        let mut doc = match Document::from_html(html, &mut self.container, None, Some(EMAIL_MASTER_CSS)) {
+        let mut doc = match Document::from_html(html, &mut self.container, Some(ua_sheet()), None) {
             Ok(doc) => doc,
             Err(e) => {
                 log::warn!("egui-litehtml-webview: failed to parse message HTML: {e}");
@@ -1025,6 +1044,38 @@ mod tests {
     fn strikethrough_and_overline_are_drawn_too() {
         let r = render(r#"<body style="margin:0"><s>gone</s> <span style="text-decoration:overline">over</span></body>"#);
         assert_eq!(rects(&r.list).len(), 2);
+    }
+
+    /// `(x, y, font size)` of every text run, in paint order.
+    fn text_origins(list: &DisplayList) -> Vec<(f32, f32, f32)> {
+        list.cmds
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Text { origin, slot, .. } => Some((origin.x, origin.y, slot.id.size)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ua_sheet_gives_email_defaults_and_keeps_litehtmls_own() {
+        // Email rules: paragraphs are flush, the body has no margin.
+        let flush = text_origins(&render("<p>one</p><p>two</p>").list);
+        assert_eq!((flush[0].0, flush[1].1 - flush[0].1 < 25.0), (0.0, true), "{flush:?}");
+        // litehtml's rules survive being restated: headings are bigger, <b> is bold.
+        let sizes = text_origins(&render("<p>plain</p><h1>head</h1>").list);
+        assert!(sizes[1].2 > sizes[0].2 * 1.5, "h1 should be larger than body text: {sizes:?}");
+    }
+
+    #[test]
+    fn ua_sheet_yields_to_the_documents_own_css() {
+        // The bug: the email sheet was applied after author CSS, so this
+        // `margin` (and `padding` below) lost to `p{margin:0}` / `td{padding:0}`.
+        let r = render("<style>p { margin: 30px 0 }</style><p>one</p><p>two</p>");
+        let t = text_origins(&r.list);
+        assert!(t[1].1 - t[0].1 > 40.0, "author p margin ignored: {t:?}");
+        let r = render("<style>td { padding: 25px }</style><table><tr><td>cell</td></tr></table>");
+        assert!(text_origins(&r.list)[0].0 >= 25.0, "author td padding ignored");
     }
 
     #[test]

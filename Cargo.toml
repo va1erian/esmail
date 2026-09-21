@@ -46,6 +46,9 @@ async-imap = { version = "0.9", default-features = false, features = ["runtime-t
 mailparse = "0.15"
 # HTML sanitization for message bodies before they reach the webview (B5).
 ammonia = "4"
+# Parses the CSS of a message's `<style>` blocks so they can be filtered (css.rs).
+# Same major version ammonia itself uses for `style=""` attributes.
+cssparser = { version = "0.37", default-features = false }
 # Attachment save-as / open-with (B6).
 rfd = "0.15"
 opener = "0.7"
