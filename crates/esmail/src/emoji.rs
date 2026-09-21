@@ -114,9 +114,22 @@ pub fn paint(ctx: &egui::Context, painter: &egui::Painter, galley: &egui::Galley
         let side = glyph.advance_width.min(row.row.size.y);
         let center = galley_pos + row.pos.to_vec2() + egui::vec2(glyph.pos.x + glyph.advance_width / 2.0, row.row.size.y / 2.0);
         let rect = egui::Rect::from_center_size(center, egui::vec2(side, side));
-        let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        painter.image(texture.id(), rect, whole, egui::Color32::WHITE);
+        paint_texture(painter, &texture, rect);
     }
+}
+
+/// Draw one emoji's artwork filling `rect`, for a place that is not a line of
+/// text (an icon). Returns whether it was drawn: `false` for an emoji the
+/// artwork set does not know, so the caller can fall back to something else.
+pub fn paint_in_rect(ctx: &egui::Context, painter: &egui::Painter, rect: egui::Rect, emoji: &str) -> bool {
+    let Some(texture) = texture(ctx, emoji) else { return false };
+    paint_texture(painter, &texture, rect);
+    true
+}
+
+fn paint_texture(painter: &egui::Painter, texture: &egui::TextureHandle, rect: egui::Rect) {
+    let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    painter.image(texture.id(), rect, whole, egui::Color32::WHITE);
 }
 
 /// The glyph at `index` of `row`, provided it is still a placeholder. When a
@@ -180,6 +193,13 @@ mod tests {
         // Dropping unapplied texture deltas trips a debug assertion.
         output.textures_delta.clear();
         galley.expect("the pass ran")
+    }
+
+    #[test]
+    fn the_envelope_used_as_the_account_icon_has_artwork() {
+        // `main.rs` draws this as each account's icon; without artwork it would
+        // quietly fall back to a plain dot.
+        assert!(artwork("\u{2709}\u{fe0f}").is_some());
     }
 
     #[test]

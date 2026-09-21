@@ -268,7 +268,10 @@ impl EsMailApp {
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.colored_label(color, "\u{25cf}");
+                        // A drawn dot, not a "●" character: egui's bundled
+                        // fonts have no such glyph and it shows as a box.
+                        let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 4.5, color);
                         ui.strong(&account.display_name);
                         ui.weak(format!("{} \u{b7} {}", account.username, auth_label(account.auth)));
                     });

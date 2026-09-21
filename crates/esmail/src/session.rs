@@ -94,11 +94,11 @@ pub struct AccountSession {
     label: String,
     imap_tx: mpsc::Sender<ImapCommand>,
     forwarder: JoinHandle<()>,
-    _idle: idle_watch::IdleWatch,
 }
 
 impl AccountSession {
-    /// Spawn the actor, the `IDLE` watch and the forwarder, and start
+    /// Spawn the actor and the forwarder (which starts the `IDLE` watch once the
+    /// account has connected), and start
     /// connecting. Events come out on `ui_events`, tagged with this
     /// account's id; the connection outcome arrives there as
     /// [`ImapEvent::Connected`] or [`ImapEvent::Error`].
@@ -109,19 +109,7 @@ impl AccountSession {
         let (actor_tx, actor_rx) = mpsc::channel(32);
         ImapActor::spawn(imap_rx, actor_tx);
 
-        // A small buffer is enough: this only ever carries a "go check"
-        // signal, never data, and a missed send just means the next timer
-        // tick catches it instead.
-        let (wake_tx, wake_rx) = mpsc::channel(4);
-        let idle = idle_watch::spawn(
-            host.clone(),
-            port,
-            username.clone(),
-            auth.clone(),
-            watch_mailbox.clone(),
-            wake_tx,
-        );
-
+        let idle = IdleParams { host: host.clone(), port, username: username.clone(), auth: auth.clone() };
         let forwarder = tokio::spawn(forward_and_watch(
             id.clone(),
             label.clone(),
@@ -129,7 +117,7 @@ impl AccountSession {
             actor_rx,
             ui_events,
             imap_tx.clone(),
-            wake_rx,
+            idle,
             hooks,
         ));
 
@@ -137,7 +125,7 @@ impl AccountSession {
         // always the connect. `try_send` cannot fail on a fresh channel.
         let _ = imap_tx.try_send(ImapCommand::Connect { host, port, username, auth });
 
-        Self { id, label, imap_tx, forwarder, _idle: idle }
+        Self { id, label, imap_tx, forwarder }
     }
 
     pub fn id(&self) -> &str {
@@ -158,8 +146,8 @@ impl Drop for AccountSession {
     fn drop(&mut self) {
         // The forwarder holds a clone of `imap_tx`; aborting it releases
         // that clone, and this struct's own sender goes right after, which
-        // closes the actor's command channel and ends it. `_idle` cancels
-        // itself as a field.
+        // closes the actor's command channel and ends it. The `IDLE` watch is
+        // owned by the forwarder, so aborting it cancels that too.
         self.forwarder.abort();
     }
 }
@@ -187,9 +175,17 @@ async fn forward_and_watch(
     mut actor_events: mpsc::Receiver<ImapEvent>,
     ui_events: mpsc::Sender<AccountEvent>,
     imap_tx: mpsc::Sender<ImapCommand>,
-    mut idle_wake: mpsc::Receiver<idle_watch::MailboxChanged>,
+    idle_params: IdleParams,
     hooks: Hooks,
 ) {
+    // A small buffer is enough: this only ever carries a "go check" signal,
+    // never data, and a missed send just means the next timer tick catches it
+    // instead.
+    let (wake_tx, mut idle_wake) = mpsc::channel(4);
+    let mut idle_start = Some((idle_params, wake_tx));
+    // Owned here so it lives exactly as long as this task: aborting the
+    // forwarder (a logout) drops it, which cancels the watch.
+    let mut _idle: Option<idle_watch::IdleWatch> = None;
     let mut connected = false;
     let mut watermark: Option<notify::MailWatermark> = None;
     let mut poll_interval = tokio::time::interval(NEW_MAIL_POLL_INTERVAL);
@@ -206,6 +202,14 @@ async fn forward_and_watch(
                 match &evt {
                     ImapEvent::Connected => {
                         connected = true;
+                        // Started on the first successful connect, once: an
+                        // account that never got in (a wrong password, an
+                        // unreachable server) must not have a background watch
+                        // retrying those credentials every few seconds for as
+                        // long as it stays in the list.
+                        if let Some((p, wake_tx)) = idle_start.take() {
+                            _idle = Some(idle_watch::spawn(p.host, p.port, p.username, p.auth, watch_mailbox.clone(), wake_tx));
+                        }
                         // A fresh connection starts a new baseline -- see
                         // `notify::update_watermark`: the first observation
                         // after one must never itself count as new mail.
@@ -257,4 +261,12 @@ async fn forward_and_watch(
             }
         }
     }
+}
+
+/// Where the forwarder opens the `IDLE` watch once the account has connected.
+struct IdleParams {
+    host: String,
+    port: u16,
+    username: String,
+    auth: Auth,
 }

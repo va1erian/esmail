@@ -298,6 +298,13 @@ impl EsMailApp {
         for kind in ["imap", "smtp", "oauth"] {
             secrets::delete_password(id, kind);
         }
+        // Its cached mail goes with it: otherwise it stays on disk and keeps
+        // turning up in search across accounts.
+        let _ = self.db_tx.try_send(DbCommand::RemoveAccount { account_id: id.to_string() });
+        if self.search_origins.iter().any(|(account, _)| account == id) {
+            self.search_results = None;
+            self.search_origins.clear();
+        }
         self.config.remove_account(id);
         if let Err(e) = self.config.save() {
             log::warn!("could not persist account removal: {e}");

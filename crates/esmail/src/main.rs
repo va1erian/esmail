@@ -1146,6 +1146,10 @@ impl EsMailApp {
     fn disconnect_account(&mut self, account: &str) {
         let label = self.account_label(account);
         self.accounts.retain(|v| v.id() != account);
+        // "All accounts" only exists as a choice with more than one.
+        if self.accounts.len() < 2 {
+            self.search_all_accounts = false;
+        }
         if self.active.as_deref() == Some(account) {
             self.active = None;
             self.headers.clear();
@@ -1442,6 +1446,14 @@ impl EsMailApp {
             return;
         };
         let uid = header.uid;
+        // A hit can come from an account that is saved but not connected. Moving
+        // the reading pane there would leave every action (flags, move, reply)
+        // with no session to run on, so ask for the connection instead.
+        if self.view(&account).is_none() {
+            let label = self.account_label(&account);
+            self.push_banner(format!("{label} is not connected. Connect it under Settings > Accounts to open this message."));
+            return;
+        }
         if self.active.as_deref() != Some(account.as_str()) || self.selected_mailbox != mailbox {
             // The message list still holds the previous mailbox's page;
             // `clear_search` reloads it.
@@ -2195,12 +2207,10 @@ impl eframe::App for EsMailApp {
                 egui::ScrollArea::vertical().id_salt("mailboxes_scroll").show(ui, |ui| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
                         for view in &self.accounts {
-                            let (dot, dot_color) = match &view.state {
-                                ConnState::Connected => ("\u{25cf}", egui::Color32::from_rgb(60, 160, 80)),
-                                ConnState::Connecting | ConnState::Disconnected => {
-                                    ("\u{25cf}", egui::Color32::from_rgb(210, 150, 30))
-                                }
-                                ConnState::Failed(_) => ("\u{25cf}", egui::Color32::from_rgb(180, 40, 40)),
+                            let status_color = match &view.state {
+                                ConnState::Connected => egui::Color32::from_rgb(60, 160, 80),
+                                ConnState::Connecting | ConnState::Disconnected => egui::Color32::from_rgb(210, 150, 30),
+                                ConnState::Failed(_) => egui::Color32::from_rgb(180, 40, 40),
                             };
                             let unread = view.total_unread();
                             let title = if unread > 0 {
@@ -2213,13 +2223,19 @@ impl eframe::App for EsMailApp {
                                 .id_salt(("account_node", view.id()))
                                 .default_open(true)
                                 .icon(move |ui, _openness, response| {
-                                    ui.painter().text(
-                                        response.rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        dot,
-                                        egui::FontId::proportional(12.0),
-                                        dot_color,
-                                    );
+                                    // An envelope (Twemoji, see `emoji.rs`) with
+                                    // the connection status as a dot on its
+                                    // corner. The dot is drawn, not a "●"
+                                    // character: egui's bundled fonts have no
+                                    // such glyph, and it came out as a box.
+                                    let rect = response.rect.expand(2.0);
+                                    if !emoji::paint_in_rect(ui.ctx(), ui.painter(), rect, "\u{2709}\u{fe0f}") {
+                                        ui.painter().circle_filled(response.rect.center(), 4.0, status_color);
+                                        return;
+                                    }
+                                    let center = rect.right_bottom() - egui::vec2(3.0, 3.0);
+                                    ui.painter().circle_filled(center, 4.5, ui.visuals().panel_fill);
+                                    ui.painter().circle_filled(center, 3.0, status_color);
                                 })
                                 .show(ui, |ui| {
                                     match &view.state {
