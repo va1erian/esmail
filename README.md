@@ -1,6 +1,6 @@
 # esMail
 
-A small, fast desktop mail client for IMAP and SMTP, written in Rust.
+A small, fast desktop and 100% vibe-coded mail client for IMAP and SMTP, written in Rust.
 
 - Reads and sends mail over IMAP/SMTP, with several accounts side by side.
 - Renders HTML mail with [litehtml](https://github.com/litehtml/litehtml) instead of an embedded browser: no JavaScript engine, a small binary, and message HTML is sanitised before it is shown.
