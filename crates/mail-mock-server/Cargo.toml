@@ -4,6 +4,7 @@ description = "In-process IMAP + SMTP server for testing esmail against, without
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "mail-mock-server"

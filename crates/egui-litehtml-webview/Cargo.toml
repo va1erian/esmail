@@ -4,6 +4,7 @@ description = "An egui widget that renders HTML/CSS via litehtml. Internal to th
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 egui.workspace = true

@@ -150,3 +150,8 @@ unins000.exe /VERYSILENT /PURGE
 To try the installer locally: `cargo build --release`, then
 `iscc /DAppVersion=0.0.0 installer\esmail.iss` (Inno Setup 6); the result is in
 `dist\`. That folder is git-ignored.
+
+## License
+
+esmail is free software, licensed under the GNU General Public License version 3
+(GPL-3.0-only). See [LICENSE](../../LICENSE).

@@ -4,6 +4,7 @@ description = "IMAP mail client with HTML rendering via an embedded litehtml web
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [lib]
 name = "esmail"
