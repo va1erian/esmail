@@ -2722,9 +2722,11 @@ fn export_file_name(subject: &str, uid: u32) -> String {
 /// gets an accent bar on its left edge, its sender in the strong text colour
 /// (drawn twice, half a pixel apart, as egui ships no bold face) and its
 /// subject in the normal colour; a read row has neither bar nor emphasis, a
-/// normal-colour sender and a dimmed subject. A starred message gets a ★ at
-/// the right end of the sender line. Painted by hand, not with a `Button`,
-/// because a button cannot truncate two differently-styled lines.
+/// normal-colour sender and a dimmed subject. The message's local time sits at
+/// the right end of the sender line and its date at the right end of the
+/// subject line (see `MailHeader::local_date_time`); a starred message gets a
+/// ★ just left of the time. Painted by hand, not with a `Button`, because a
+/// button cannot truncate two differently-styled lines.
 fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::Response {
     const PAD_X: f32 = 10.0;
     const PAD_Y: f32 = 6.0;
@@ -2732,6 +2734,9 @@ fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::
     const LINE_GAP: f32 = 2.0;
     const SENDER_SIZE: f32 = 14.5;
     const SUBJECT_SIZE: f32 = 13.0;
+    const TIMESTAMP_SIZE: f32 = 12.0;
+    /// Space kept between a line's text and whatever is at its right end.
+    const RIGHT_GAP: f32 = 8.0;
 
     let unread = !header.is_seen();
     let visuals = ui.visuals();
@@ -2759,14 +2764,23 @@ fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::
     let star = header
         .is_flagged()
         .then(|| one_line(ui, "\u{2605}", SENDER_SIZE, star_color, f32::INFINITY));
-    let star_width = star.as_ref().map_or(0.0, |g| g.size().x + 4.0);
-    let text_width = (width - ACCENT_BAR_WIDTH - PAD_X * 2.0 - star_width).max(0.0);
+    let (date, time) = match header.local_date_time() {
+        Some((date, time)) => (
+            Some(one_line(ui, &date, TIMESTAMP_SIZE, subject_color, f32::INFINITY)),
+            Some(one_line(ui, &time, TIMESTAMP_SIZE, subject_color, f32::INFINITY)),
+        ),
+        None => (None, None),
+    };
+    let reserved = |galley: &Option<std::sync::Arc<egui::Galley>>| galley.as_ref().map_or(0.0, |g| g.size().x + RIGHT_GAP);
+    let full_width = (width - ACCENT_BAR_WIDTH - PAD_X * 2.0).max(0.0);
+    let sender_width = (full_width - reserved(&time) - reserved(&star)).max(0.0);
+    let subject_width = (full_width - reserved(&date)).max(0.0);
 
     let sender = header.sender_name();
     let sender = if sender.is_empty() { "(unknown sender)" } else { sender.as_str() };
     let subject = if header.subject.is_empty() { "(no subject)" } else { header.subject.as_str() };
-    let sender_galley = one_line(ui, sender, SENDER_SIZE, sender_color, text_width);
-    let subject_galley = one_line(ui, subject, SUBJECT_SIZE, subject_color, text_width);
+    let sender_galley = one_line(ui, sender, SENDER_SIZE, sender_color, sender_width);
+    let subject_galley = one_line(ui, subject, SUBJECT_SIZE, subject_color, subject_width);
 
     let height = PAD_Y * 2.0 + sender_galley.size().y + LINE_GAP + subject_galley.size().y;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
@@ -2789,10 +2803,23 @@ fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::
         if unread {
             painter.galley(sender_pos + egui::vec2(0.5, 0.0), sender_galley.clone(), sender_color);
         }
+        let right = rect.right() - PAD_X;
+        // The smaller timestamps are bottom-aligned to the text they share a
+        // line with, so they sit on its baseline instead of floating at the
+        // top of the line.
+        let time_reserved = reserved(&time);
+        if let Some(time) = time {
+            let y = sender_pos.y + sender_galley.size().y - time.size().y;
+            painter.galley(egui::pos2(right - time.size().x, y), time, subject_color);
+        }
         if let Some(star) = star {
-            painter.galley(egui::pos2(rect.right() - PAD_X - star.size().x, sender_pos.y), star, star_color);
+            painter.galley(egui::pos2(right - time_reserved - star.size().x, sender_pos.y), star, star_color);
         }
         let subject_pos = egui::pos2(text_left, sender_pos.y + sender_galley.size().y + LINE_GAP);
+        if let Some(date) = date {
+            let y = subject_pos.y + subject_galley.size().y - date.size().y;
+            painter.galley(egui::pos2(right - date.size().x, y), date, subject_color);
+        }
         painter.galley(subject_pos, subject_galley, subject_color);
         painter.hline(rect.x_range(), rect.bottom(), separator);
     }
