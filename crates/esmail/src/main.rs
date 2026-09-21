@@ -1,4 +1,4 @@
-use esmail::{auth, compose, config, db, idle_watch, imap, notify, oauth, render, screenshot, search_query, secrets, smtp};
+use esmail::{auth, compose, config, db, emoji, idle_watch, imap, notify, oauth, render, screenshot, search_query, secrets, smtp};
 /// Tray icon + Windows toast notifications (B10). Windows-only: see
 /// notify.rs's module doc for why the pure detection logic lives separately
 /// and builds everywhere.
@@ -2779,8 +2779,12 @@ fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::
     let sender = header.sender_name();
     let sender = if sender.is_empty() { "(unknown sender)" } else { sender.as_str() };
     let subject = if header.subject.is_empty() { "(no subject)" } else { header.subject.as_str() };
-    let sender_galley = one_line(ui, sender, SENDER_SIZE, sender_color, sender_width);
-    let subject_galley = one_line(ui, subject, SUBJECT_SIZE, subject_color, subject_width);
+    // Emoji are laid out as placeholders and painted as coloured images over
+    // them below -- see `emoji.rs`.
+    let sender_text = emoji::prepare(sender);
+    let subject_text = emoji::prepare(subject);
+    let sender_galley = one_line(ui, &sender_text.text, SENDER_SIZE, sender_color, sender_width);
+    let subject_galley = one_line(ui, &subject_text.text, SUBJECT_SIZE, subject_color, subject_width);
 
     let height = PAD_Y * 2.0 + sender_galley.size().y + LINE_GAP + subject_galley.size().y;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
@@ -2803,6 +2807,7 @@ fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::
         if unread {
             painter.galley(sender_pos + egui::vec2(0.5, 0.0), sender_galley.clone(), sender_color);
         }
+        emoji::paint(ui.ctx(), painter, &sender_galley, sender_pos, &sender_text.emoji);
         let right = rect.right() - PAD_X;
         // The smaller timestamps are bottom-aligned to the text they share a
         // line with, so they sit on its baseline instead of floating at the
@@ -2820,7 +2825,8 @@ fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::
             let y = subject_pos.y + subject_galley.size().y - date.size().y;
             painter.galley(egui::pos2(right - date.size().x, y), date, subject_color);
         }
-        painter.galley(subject_pos, subject_galley, subject_color);
+        painter.galley(subject_pos, subject_galley.clone(), subject_color);
+        emoji::paint(ui.ctx(), painter, &subject_galley, subject_pos, &subject_text.emoji);
         painter.hline(rect.x_range(), rect.bottom(), separator);
     }
 

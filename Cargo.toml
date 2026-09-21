@@ -46,6 +46,10 @@ async-imap = { version = "0.9", default-features = false, features = ["runtime-t
 mailparse = "0.15"
 # Local-time formatting of message dates in the list (`MailHeader::local_date_time`).
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Coloured emoji artwork (PNG only; the SVG set needs a rasterizer) and the
+# grapheme segmentation that finds each emoji in a string -- see `emoji.rs`.
+twemoji-assets = { version = "1", default-features = false, features = ["png"] }
+unicode-segmentation = "1"
 # HTML sanitization for message bodies before they reach the webview (B5).
 ammonia = "4"
 # Parses the CSS of a message's `<style>` blocks so they can be filtered (css.rs).
