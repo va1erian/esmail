@@ -130,6 +130,19 @@ pub fn build_notification(headers: &[MailHeader]) -> Option<(String, String)> {
     }
 }
 
+/// [`build_notification`] with the account's label in front of the title
+/// (`Work: New mail from Bob`), so a toast says which account the mail
+/// arrived in once there can be several. An empty label leaves the title
+/// unchanged.
+pub fn build_account_notification(label: &str, headers: &[MailHeader]) -> Option<(String, String)> {
+    let (title, body) = build_notification(headers)?;
+    let label = sanitize_toast_field(label);
+    if label.is_empty() {
+        return Some((title, body));
+    }
+    Some((format!("{label}: {title}"), body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +242,21 @@ mod tests {
         let (title, body) = build_notification(&headers).unwrap();
         assert_eq!(title, "New mail from someone");
         assert_eq!(body, "(no subject)");
+    }
+
+    #[test]
+    fn account_notification_prefixes_the_title_with_the_account_label() {
+        let headers = [header("Bob", "Lunch?")];
+        let (title, body) = build_account_notification("Work", &headers).unwrap();
+        assert_eq!(title, "Work: New mail from Bob");
+        assert_eq!(body, "Lunch?");
+    }
+
+    #[test]
+    fn account_notification_with_a_blank_label_matches_the_plain_one() {
+        let headers = [header("Bob", "Lunch?")];
+        assert_eq!(build_account_notification("  ", &headers), build_notification(&headers));
+        assert_eq!(build_account_notification("Work", &[]), None);
     }
 
     // ── sanitize_toast_field (via build_notification) ───────────────────

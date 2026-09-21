@@ -19,6 +19,8 @@ pub struct TrayState {
     _tray_icon: TrayIcon,
     show_id: MenuId,
     quit_id: MenuId,
+    /// Last unread total put in the tooltip; see `set_unread`.
+    unread: Option<u32>,
 }
 
 /// What the user asked for via the tray icon or its menu, decoded from the
@@ -55,7 +57,21 @@ impl TrayState {
             .with_icon(placeholder_icon()?)
             .build()?;
 
-        Ok(Self { _tray_icon: tray_icon, show_id, quit_id })
+        Ok(Self { _tray_icon: tray_icon, show_id, quit_id, unread: None })
+    }
+
+    /// Show the unread total (summed over every account by the caller) in the
+    /// icon's tooltip. Only touches the shell when the number changed, since
+    /// this is called every frame.
+    pub fn set_unread(&mut self, total: u32) {
+        if self.unread == Some(total) {
+            return;
+        }
+        self.unread = Some(total);
+        let tooltip = if total == 0 { "esMail".to_string() } else { format!("esMail \u{2014} {total} unread") };
+        if let Err(e) = self._tray_icon.set_tooltip(Some(tooltip)) {
+            log::warn!("could not update the tray tooltip: {e}");
+        }
     }
 
     /// Drain every tray-icon-click and menu-click event queued since the

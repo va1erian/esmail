@@ -42,8 +42,10 @@ pub enum DbCommand {
         mailbox: String,
         headers: Vec<MailHeader>,
     },
+    /// Full-text search. `account_id: None` searches every account; either
+    /// way each hit says which account and mailbox it came from.
     Search {
-        account_id: String,
+        account_id: Option<String>,
         query: String,
         mailbox: Option<String>,
     },
@@ -86,7 +88,7 @@ pub enum DbCommand {
 }
 
 pub enum DbEvent {
-    SearchResult { headers: Vec<MailHeader> },
+    SearchResult { hits: Vec<SearchHit> },
     MailFetched { header: MailHeader, body: String },
     /// `FetchMail` (a cached search-result open) found no cached body --
     /// typically because `MAX_CACHED_BODIES`'s LRU cap evicted it since it
@@ -167,9 +169,9 @@ impl DbActor {
                     }
                 }
                 DbCommand::Search { account_id, query, mailbox } => {
-                    match search(&self.conn, &account_id, &query, mailbox.as_deref()) {
-                        Ok(headers) => {
-                            let _ = self.event_tx.blocking_send(DbEvent::SearchResult { headers });
+                    match search(&self.conn, account_id.as_deref(), &query, mailbox.as_deref()) {
+                        Ok(hits) => {
+                            let _ = self.event_tx.blocking_send(DbEvent::SearchResult { hits });
                         }
                         Err(e) => {
                             let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
@@ -399,37 +401,54 @@ fn evict_lru_bodies(conn: &Connection, max_rows: i64) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// One full-text search result, with where it lives: results can now span
+/// accounts and mailboxes, and a `MailHeader` (a UID and some envelope
+/// fields) does not say which.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub account_id: String,
+    pub mailbox: String,
+    pub header: MailHeader,
+}
+
+/// `account_id: None` searches every account's cache (the FTS index is keyed
+/// per account, so this is one query rather than one per account).
 fn search(
     conn: &Connection,
-    account_id: &str,
+    account_id: Option<&str>,
     query: &str,
     mailbox: Option<&str>,
-) -> rusqlite::Result<Vec<MailHeader>> {
-    // `mailbox` is bound as a parameter (not spliced into the SQL string) —
-    // the previous version of this query built the WHERE clause with
-    // `format!("... mailbox = '{}'", mb)`, which let a mailbox name
-    // containing a `'` alter the query. IMAP mailbox names are server-
+) -> rusqlite::Result<Vec<SearchHit>> {
+    // `account_id` and `mailbox` are bound as parameters (not spliced into
+    // the SQL string) -- the previous version of this query built the WHERE
+    // clause with `format!("... mailbox = '{}'", mb)`, which let a mailbox
+    // name containing a `'` alter the query. IMAP mailbox names are server-
     // controlled, so this was reachable from an untrusted source.
     let mut stmt = conn.prepare(
-        "SELECT m.uid, m.subject, m.from_addr, m.to_addr, m.date, m.message_id, m.flags
+        "SELECT m.uid, m.subject, m.from_addr, m.to_addr, m.date, m.message_id, m.flags,
+                m.account_id, m.mailbox
          FROM messages_fts f
          JOIN messages m ON m.account_id = f.account_id
             AND m.mailbox = f.mailbox AND m.uid = f.uid
-         WHERE f.account_id = ?1
+         WHERE (?1 IS NULL OR f.account_id = ?1)
             AND (?2 IS NULL OR f.mailbox = ?2)
             AND messages_fts MATCH ?3
          ORDER BY f.rank",
     )?;
     let rows = stmt.query_map(params![account_id, mailbox, query], |row| {
         let flags_str: String = row.get(6)?;
-        Ok(MailHeader {
-            uid: row.get(0)?,
-            subject: row.get(1)?,
-            from: row.get(2)?,
-            to: row.get(3)?,
-            date: row.get(4)?,
-            message_id: row.get(5)?,
-            flags: parse_flags_column(&flags_str),
+        Ok(SearchHit {
+            account_id: row.get(7)?,
+            mailbox: row.get(8)?,
+            header: MailHeader {
+                uid: row.get(0)?,
+                subject: row.get(1)?,
+                from: row.get(2)?,
+                to: row.get(3)?,
+                date: row.get(4)?,
+                message_id: row.get(5)?,
+                flags: parse_flags_column(&flags_str),
+            },
         })
     })?;
 
@@ -808,9 +827,9 @@ mod tests {
     fn search_finds_a_matching_subject() {
         let conn = test_conn();
         index_mail(&conn, "acc", "INBOX", &test_header(1), "irrelevant body").unwrap();
-        let results = search(&conn, "acc", "\"Subject 1\"", None).unwrap();
+        let results = search(&conn, Some("acc"), "\"Subject 1\"", None).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].uid, 1);
+        assert_eq!(results[0].header.uid, 1);
     }
 
     #[test]
@@ -818,9 +837,28 @@ mod tests {
         let conn = test_conn();
         index_mail(&conn, "acc1", "INBOX", &test_header(1), "body").unwrap();
         index_mail(&conn, "acc2", "INBOX", &test_header(2), "body").unwrap();
-        let results = search(&conn, "acc1", "body", None).unwrap();
+        let results = search(&conn, Some("acc1"), "body", None).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].uid, 1);
+        assert_eq!(results[0].header.uid, 1);
+    }
+
+    #[test]
+    fn search_without_an_account_spans_all_of_them_and_says_where_each_hit_lives() {
+        let conn = test_conn();
+        index_mail(&conn, "acc1", "INBOX", &test_header(1), "needle").unwrap();
+        index_mail(&conn, "acc2", "Archive", &test_header(1), "needle").unwrap();
+        index_mail(&conn, "acc3", "INBOX", &test_header(2), "haystack").unwrap();
+        let mut hits: Vec<(String, String, u32)> = search(&conn, None, "needle", None)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.account_id, h.mailbox, h.header.uid))
+            .collect();
+        hits.sort();
+        // The same UID in two accounts stays two distinct hits.
+        assert_eq!(
+            hits,
+            vec![("acc1".to_string(), "INBOX".to_string(), 1), ("acc2".to_string(), "Archive".to_string(), 1)]
+        );
     }
 
     #[test]
@@ -834,7 +872,7 @@ mod tests {
         // Must not error, and must not match anything (no mailbox has that
         // literal name), rather than the old code's behavior of the quote
         // breaking out of the string and the OR making every row match.
-        let results = search(&conn, "acc", "body", Some(malicious_mailbox)).unwrap();
+        let results = search(&conn, Some("acc"), "body", Some(malicious_mailbox)).unwrap();
         assert_eq!(results.len(), 0);
     }
 

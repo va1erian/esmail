@@ -1,4 +1,6 @@
-use esmail::{auth, compose, config, db, emoji, idle_watch, imap, notify, oauth, render, screenshot, search_query, secrets, smtp};
+use esmail::{auth, compose, config, db, emoji, imap, oauth, render, screenshot, search_query, secrets, session, smtp};
+mod accounts;
+mod settings;
 /// Tray icon + Windows toast notifications (B10). Windows-only: see
 /// notify.rs's module doc for why the pure detection logic lives separately
 /// and builds everywhere.
@@ -9,11 +11,12 @@ use egui_litehtml_webview::{
     ImageRequest, InterceptOutcome, WebView, WebViewConfig, WebViewHandler, WebViewHost,
     WebViewSource,
 };
-use imap::{ImapActor, ImapCommand, ImapEvent, MailHeader};
+use imap::{ImapCommand, ImapEvent, MailHeader};
 use db::{DbActor, DbCommand, DbEvent};
 use config::{AccountConfig, Config};
 use search_query::ParsedQuery;
 use secrecy::SecretString;
+use session::{AccountEvent, AccountId, AccountSession, Hooks, SessionParams};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -104,45 +107,67 @@ struct Banner {
     message: String,
 }
 
-/// The outcome of a "Sign in with Google" browser round trip, sent from the
-/// task that ran it (see `EsMailApp::begin_google_sign_in`) back to the UI.
-/// Carries the account fields as they were when the button was clicked, so
-/// editing the form while the browser is open can't change which account the
-/// freshly authorized token gets attached to.
-enum OAuthMessage {
-    /// The system browser could not be launched; the sign-in is still
-    /// waiting, so the user can open `url` themselves.
-    BrowserUnavailable { url: String },
-    Authorized { host: String, port: u16, username: String, auth: auth::Auth },
+/// The host the "Sign in with Google" option is offered for.
+const GMAIL_IMAP_HOST: &str = "imap.gmail.com";
+
+/// Where one account's connection stands, for the folder pane.
+#[derive(Debug, Clone, PartialEq)]
+enum ConnState {
+    /// The first connect is still in flight.
+    Connecting,
+    Connected,
+    /// The connection dropped; the actor is reconnecting on its own.
+    Disconnected,
+    /// The first connect failed (bad password, unreachable server). The
+    /// session is kept so the failure shows next to the account, and so
+    /// "Reconnect" has something to replace.
     Failed(String),
 }
 
-/// The whole browser round trip: consent page, redirect, code exchange.
-async fn run_google_sign_in(
-    client: &oauth::OAuthClient,
-    username: &str,
-    tx: &mpsc::Sender<OAuthMessage>,
-    ctx: &egui::Context,
-) -> anyhow::Result<Arc<oauth::TokenSource>> {
-    let pending = oauth::begin(client, username).await?;
-    if let Err(e) = opener::open_browser(&pending.url) {
-        log::warn!("could not open the browser for Google sign-in: {e}");
-        let _ = tx.send(OAuthMessage::BrowserUnavailable { url: pending.url.clone() }).await;
-        ctx.request_repaint();
+/// One signed-in account and the state that is per account: the session
+/// (actor + watcher, see `session.rs`), its mailbox tree and its unread
+/// counts. Dropping it is a real logout.
+struct AccountView {
+    session: AccountSession,
+    state: ConnState,
+    /// The mailbox tree (B8), flattened for the folder pane -- see
+    /// `imap::flatten_tree`'s doc for why a flat, owned `Vec` rather than a
+    /// real recursive tree widget.
+    mailbox_rows: Vec<imap::MailboxRow>,
+    /// `STATUS (UNSEEN)` per mailbox (B8), refreshed whenever `Mailboxes`
+    /// arrives and after a flag/move changes what's unread. A mailbox
+    /// missing from this map (rather than present with `0`) means its count
+    /// hasn't been fetched yet, not that it's read.
+    unread_counts: std::collections::HashMap<String, u32>,
+    /// What the session signs in with -- a password, or the account's own
+    /// Google token source. Kept so SMTP sends reuse the very same OAuth
+    /// source (one cached access token per account, not one per connection).
+    auth: auth::Auth,
+    /// For an account added through the form: the config entry and credential
+    /// to save once the connection actually succeeds (not on every click,
+    /// and never for a password the server rejected). `None` for an account
+    /// that came from the saved list.
+    pending_persist: Option<(AccountConfig, auth::Auth)>,
+}
+
+impl AccountView {
+    fn id(&self) -> &str {
+        self.session.id()
     }
-    let grant = pending.finish(client).await?;
-    oauth::TokenSource::from_grant(client.clone(), grant)
-}
 
-/// The Settings window's editable copy of the Google OAuth client, so typing
-/// changes nothing until Save (Cancel just drops it).
-struct SettingsForm {
-    client_id: String,
-    client_secret: String,
-}
+    fn label(&self) -> &str {
+        self.session.label()
+    }
 
-/// The host the "Sign in with Google" option is offered for.
-const GMAIL_IMAP_HOST: &str = "imap.gmail.com";
+    fn total_unread(&self) -> u32 {
+        self.mailbox_rows
+            .iter()
+            .filter_map(|r| r.full_name.as_ref())
+            .filter(|name| name.eq_ignore_ascii_case("INBOX"))
+            .filter_map(|name| self.unread_counts.get(name))
+            .sum()
+    }
+}
 
 struct EsMailApp {
     web_view: WebView,
@@ -164,48 +189,50 @@ struct EsMailApp {
     screenshotter: screenshot::Screenshotter,
     /// Show only the webview, with no IMAP account. See ESMAIL_PREVIEW.
     preview: bool,
-    imap_tx: mpsc::Sender<ImapCommand>,
-    imap_rx: mpsc::Receiver<ImapEvent>,
+    /// Every connected (or connecting) account, in the order they were
+    /// added. Each holds its own `ImapActor`, `IDLE` watch and new-mail
+    /// watermark (see `session.rs`); removing one drops all of them.
+    accounts: Vec<AccountView>,
+    /// The account the message list and reading pane show. `None` until the
+    /// first account has connected, and again once the last one is gone.
+    active: Option<AccountId>,
+    /// Handed (cloned) to each new [`AccountSession`], whose forwarder tags
+    /// what it forwards with the account id.
+    imap_events_tx: mpsc::Sender<AccountEvent>,
+    imap_rx: mpsc::Receiver<AccountEvent>,
+    /// Callbacks every new session gets: the toast and the repaint request.
+    session_hooks: Hooks,
+    /// Show the "Add account" form even though accounts are already
+    /// connected. With no accounts the form is shown regardless.
+    adding_account: bool,
+    /// The account the in-flight SMTP send was issued for, so `Sent` can
+    /// save the copy to *that* account's Sent folder. There is one compose
+    /// window and one send at a time today, which makes a single slot
+    /// enough; a compose-window-per-message design (#34) should carry the
+    /// account on the SMTP event instead.
+    sending_from: Option<AccountId>,
     db_tx: mpsc::Sender<DbCommand>,
     db_rx: mpsc::Receiver<DbEvent>,
     smtp_tx: mpsc::Sender<smtp::SmtpCommand>,
     smtp_rx: mpsc::Receiver<smtp::SmtpEvent>,
-    /// Sender half of the channel `spawn_new_mail_watch`'s task reads
-    /// [`idle_watch::MailboxChanged`] pushes from. Kept on `EsMailApp` so the
-    /// "Connect" button can hand a fresh clone to `idle_watch::spawn` once it
-    /// knows the account's host/username/password — `idle_watch` itself has
-    /// no way to learn those except from the same login form `ImapCommand::
-    /// Connect` already reads them from.
-    idle_wake_tx: mpsc::Sender<idle_watch::MailboxChanged>,
-    /// The running `idle_watch` task, if any. Each Connect replaces it: the
-    /// old one is aborted (which drops its IDLE connection) before a new one
-    /// starts with the new credentials. Both halves matter -- without the
-    /// abort every retry would leave one more IDLE connection running
-    /// forever, and without the replacement a retry after a typo'd password,
-    /// or "Sign in again" after a revoked Google token, would leave the watch
-    /// retrying the old credentials for the rest of the session.
-    idle_watch_task: Option<tokio::task::JoinHandle<()>>,
-
     /// The login form's "Sign in with Google" choice: OAuth2 through the
     /// browser instead of a password. Only offered for Gmail.
     use_oauth: bool,
-    /// What the current (or most recent) connection authenticates with.
-    /// SMTP sends reuse it, so an OAuth account's sends share the IMAP
-    /// connection's cached access token instead of each refreshing their own.
-    current_auth: Option<auth::Auth>,
-    oauth_tx: mpsc::Sender<OAuthMessage>,
-    oauth_rx: mpsc::Receiver<OAuthMessage>,
-    /// The running browser round trip, if any. Aborting it closes its local
-    /// redirect listener, which is how "Cancel" works.
-    oauth_task: Option<tokio::task::JoinHandle<()>>,
-    /// The open Settings window's form, if it is open.
-    settings: Option<SettingsForm>,
+    /// Where the browser round trips report back; see `accounts.rs`.
+    oauth_tx: mpsc::Sender<accounts::OAuthMessage>,
+    oauth_rx: mpsc::Receiver<accounts::OAuthMessage>,
+    /// The running browser round trips, one per account (several accounts can
+    /// be waiting for their consent page at once). Aborting one closes its
+    /// local redirect listener, which is how "Cancel" works.
+    oauth_tasks: std::collections::HashMap<AccountId, tokio::task::JoinHandle<()>>,
+    /// The open Settings window, if it is open. See `settings.rs`.
+    settings: Option<settings::SettingsState>,
 
     /// Saved accounts (host/port/username; no passwords — those are in the OS
     /// keyring, see `secrets`). Persisted to `config.toml`.
     config: Config,
 
-    // UI state
+    // The "Add account" form.
     host: String,
     port: String,
     username: String,
@@ -217,7 +244,6 @@ struct EsMailApp {
     smtp_host: String,
     smtp_port: String,
     status: String,
-    is_connected: bool,
 
     /// First-run wizard (B9): an email address typed on the login screen, to
     /// look up in `config::provider_for_email` and autofill the host/port
@@ -248,15 +274,7 @@ struct EsMailApp {
     /// exiting.
     geometry_saved_on_close: bool,
 
-    /// The mailbox tree (B8), flattened for the left panel's list UI -- see
-    /// `imap::flatten_tree`'s doc for why a flat, owned `Vec` rather than a
-    /// real recursive tree widget.
-    mailbox_rows: Vec<imap::MailboxRow>,
-    /// `STATUS (UNSEEN)` per mailbox (B8), refreshed whenever `Mailboxes`
-    /// arrives and after a flag/move changes what's unread. A mailbox
-    /// missing from this map (rather than present with `0`) means its count
-    /// hasn't been fetched yet, not that it's read.
-    unread_counts: std::collections::HashMap<String, u32>,
+    /// The mailbox open in the message list, within the `active` account.
     selected_mailbox: String,
 
     headers: Vec<MailHeader>,
@@ -318,6 +336,16 @@ struct EsMailApp {
     // Search and Progress
     search_query: String,
     search_results: Option<Vec<MailHeader>>,
+    /// Where each entry of `search_results` lives (account, mailbox), index
+    /// for index. A search can span accounts, and a UID means nothing without
+    /// them. Empty exactly when `search_results` is `None`.
+    search_origins: Vec<(AccountId, String)>,
+    /// Search every account instead of only the active one.
+    search_all_accounts: bool,
+    /// Opening a search hit from another mailbox moved `active` /
+    /// `selected_mailbox` there without reloading `headers`; when the search
+    /// is cleared the message list has to be fetched again.
+    headers_stale: bool,
     download_progress: Option<(u32, u32)>,
 
     /// The tray icon (B10), or `None` if either it couldn't be created (see
@@ -339,34 +367,25 @@ impl EsMailApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         init_logging();
         
-        let (imap_cmd_tx, imap_cmd_rx) = mpsc::channel(32);
-        let (imap_evt_tx, imap_evt_rx) = mpsc::channel(32);
-        
+        // Every account's events arrive here, tagged with the account id by
+        // that account's `AccountSession` forwarder (session.rs). Each
+        // session also runs its own new-mail watch (B10) as a plain tokio
+        // task, not anything hung off `EsMailApp::ui`/`logic`, so toasts
+        // keep coming for as long as the process is alive, independent of
+        // whether the main window is visible. See tray.rs for how the window
+        // survives being "closed".
+        let (imap_events_tx, imap_rx) = mpsc::channel(64);
         let (db_cmd_tx, db_cmd_rx) = mpsc::channel(32);
         let (db_evt_tx, db_evt_rx) = mpsc::channel(32);
 
         let egui_ctx = cc.egui_ctx.clone();
-        
-        // Wrap IMAP events: forward every event to the UI channel (bumping a
-        // repaint), same as before B10 existed. `spawn_new_mail_watch` also
-        // watches this same stream for the new-mail signal (B10) and turns
-        // it into a background poll timer + a toast -- as a plain tokio
-        // task, not anything hung off `EsMailApp::ui`/`logic`, it keeps
-        // running (and can keep showing toasts) for as long as the process
-        // is alive, independent of whether the main window is visible. See
-        // its doc comment and tray.rs for how the window survives being
-        // "closed".
-        let (tx, rx) = mpsc::channel(32);
-        // `idle_watch::spawn` (created once the "Connect" button knows the
-        // account's credentials — see its call site) sends here whenever its
-        // dedicated IDLE connection sees the server push something, so
-        // `spawn_new_mail_watch` can poll immediately instead of waiting for
-        // its own timer. A small buffer is enough: this only ever carries a
-        // "go check" signal, never data, and a missed send just means the
-        // next poll-timer tick catches it instead.
-        let (idle_wake_tx, idle_wake_rx) = mpsc::channel(4);
-        spawn_new_mail_watch(rx, imap_evt_tx, imap_cmd_tx.clone(), egui_ctx.clone(), idle_wake_rx);
-        ImapActor::spawn(imap_cmd_rx, tx);
+        let session_hooks = Hooks {
+            notify: Arc::new(notify_new_mail),
+            repaint: {
+                let ctx = egui_ctx.clone();
+                Arc::new(move || ctx.request_repaint())
+            },
+        };
 
         // Wrap DB events
         let (tx_db, mut rx_db) = mpsc::channel(32);
@@ -514,26 +533,46 @@ impl EsMailApp {
 
         let initial_theme = config.theme;
 
-        Self {
+        // Connect every saved account whose credential the keyring still has
+        // (a password, or a Google refresh token), so all of them are being
+        // watched from the moment the app starts. A preview run has no
+        // accounts by design; an account with no usable credential is left
+        // for the Add account form / Settings, with a note saying why.
+        let mut accounts = Vec::new();
+        let mut startup_notes = Vec::new();
+        if preview.is_none() {
+            for account in &config.accounts {
+                match accounts::saved_auth(&config, account) {
+                    Ok(auth) => {
+                        accounts.push(spawn_account_view(account, auth, None, &imap_events_tx, &session_hooks));
+                    }
+                    Err(reason) => {
+                        log::info!("not connecting {} at startup: {reason}", account.id);
+                        if account.auth == config::AuthKind::GoogleOAuth {
+                            startup_notes.push(format!("{}: {reason}", account.display_name));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut app = Self {
             web_view_host,
             web_view,
             message_view_handler,
             screenshotter: screenshot::Screenshotter::from_env(),
             preview: preview.is_some(),
-            imap_tx: imap_cmd_tx,
-            imap_rx: imap_evt_rx,
+            accounts,
+            active: None,
+            imap_events_tx,
+            imap_rx,
+            session_hooks,
+            adding_account: false,
+            sending_from: None,
             db_tx: db_cmd_tx,
             db_rx: db_evt_rx,
             smtp_tx: smtp_cmd_tx,
             smtp_rx: smtp_evt_rx,
-            idle_wake_tx,
-            idle_watch_task: None,
-            use_oauth,
-            current_auth: None,
-            oauth_tx,
-            oauth_rx,
-            oauth_task: None,
-            settings: None,
             config,
             host: host_str,
             port: port_str,
@@ -542,15 +581,12 @@ impl EsMailApp {
             smtp_host: smtp_host_str,
             smtp_port: smtp_port_str,
             status: initial_status,
-            is_connected: false,
             wizard_email: String::new(),
             banners: Vec::new(),
             next_banner_id: 0,
             theme: initial_theme,
             window_geometry: None,
             geometry_saved_on_close: false,
-            mailbox_rows: Vec::new(),
-            unread_counts: std::collections::HashMap::new(),
             selected_mailbox: "INBOX".to_string(),
             headers: Vec::new(),
             selected_uid: None,
@@ -570,43 +606,95 @@ impl EsMailApp {
             current_body_req: 0,
             search_query: String::new(),
             search_results: None,
+            search_origins: Vec::new(),
+            search_all_accounts: false,
+            headers_stale: false,
             download_progress: None,
             #[cfg(target_os = "windows")]
             tray,
             #[cfg(target_os = "windows")]
             exit_requested: false,
+            use_oauth,
+            oauth_tx,
+            oauth_rx,
+            oauth_tasks: std::collections::HashMap::new(),
+            settings: None,
+        };
+        for note in startup_notes {
+            app.push_banner(note);
         }
+        app
     }
 
+    /// Route what every account's session produced since the last frame.
+    /// Events that change per-account state (mailbox tree, unread counts,
+    /// connection state, cache bookkeeping) apply to the account they name;
+    /// events about the message list and the reading pane only apply while
+    /// that account is the `active` one, since those show one account's
+    /// mailbox at a time.
     fn handle_imap_events(&mut self) {
-        while let Ok(evt) = self.imap_rx.try_recv() {
+        while let Ok((account, evt)) = self.imap_rx.try_recv() {
+            // The account was removed while this was still queued.
+            if self.view(&account).is_none() {
+                continue;
+            }
+            let is_active = self.active.as_deref() == Some(account.as_str());
             match evt {
                 ImapEvent::Connected => {
-                    self.status = "Connected!".to_string();
-                    self.is_connected = true;
-                    self.persist_current_account();
-                    let _ = self.imap_tx.try_send(ImapCommand::FetchMailboxes);
-                    self.fetch_headers(self.selected_mailbox.clone(), 1);
+                    let from_form = self.view(&account).is_some_and(|v| v.pending_persist.is_some());
+                    if let Some(view) = self.view_mut(&account) {
+                        view.state = ConnState::Connected;
+                    }
+                    self.persist_pending(&account);
+                    // An account connecting in the background (a saved one
+                    // at startup, or a reconnect) must not dismiss the Add
+                    // account form someone is typing into; only the account
+                    // that form started does.
+                    if from_form {
+                        self.adding_account = false;
+                    }
+                    self.status = format!("Connected: {}", self.account_label(&account));
+                    self.send_imap_to(&account, ImapCommand::FetchMailboxes);
+                    if self.active.is_none() {
+                        self.activate(&account, "INBOX".to_string());
+                    } else if is_active {
+                        self.fetch_headers(self.selected_mailbox.clone(), 1);
+                    }
                 }
                 ImapEvent::Disconnected => {
-                    self.status = "Connection lost, reconnecting...".to_string();
+                    if let Some(view) = self.view_mut(&account) {
+                        view.state = ConnState::Disconnected;
+                    }
+                    if is_active {
+                        self.status = "Connection lost, reconnecting...".to_string();
+                    }
                 }
                 ImapEvent::Error(e) => {
-                    self.push_banner(format!("IMAP error: {e}"));
+                    if let Some(view) = self.view_mut(&account) {
+                        // A first connect that failed, or a reconnect that gave
+                        // up (a revoked Google sign-in, say): either way the
+                        // account is not going to recover by itself.
+                        if matches!(view.state, ConnState::Connecting | ConnState::Disconnected) {
+                            view.state = ConnState::Failed(e.clone());
+                        }
+                    }
+                    self.push_account_banner(&account, format!("IMAP error: {e}"));
                 }
                 ImapEvent::Mailboxes(mbs) => {
                     // B8: render as a tree (name split on the server's
                     // delimiter, special-use folders first) instead of a
                     // flat alphabetical list.
                     let names: Vec<String> = mbs.iter().map(|m| m.name.clone()).collect();
-                    self.mailbox_rows = imap::flatten_tree(&imap::mailbox_tree(&mbs));
-                    let _ = self.imap_tx.try_send(ImapCommand::FetchUnreadCounts { mailboxes: names });
+                    if let Some(view) = self.view_mut(&account) {
+                        view.mailbox_rows = imap::flatten_tree(&imap::mailbox_tree(&mbs));
+                    }
+                    self.send_imap_to(&account, ImapCommand::FetchUnreadCounts { mailboxes: names });
                 }
                 ImapEvent::Headers { mailbox, headers, page, total_pages, req_id, mailbox_state } => {
                     // Only the most recently issued FetchHeaders' reply is
                     // applied; an older one arriving late (e.g. the mailbox
                     // was changed again before it came back) is dropped.
-                    if req_id == self.current_headers_req && mailbox == self.selected_mailbox {
+                    if is_active && req_id == self.current_headers_req && mailbox == self.selected_mailbox {
                         self.headers = headers;
                         self.current_page = page;
                         self.total_pages = total_pages;
@@ -617,7 +705,7 @@ impl EsMailApp {
                     // `mailbox` should stay current even if this particular
                     // reply is no longer the one the UI is showing.
                     let _ = self.db_tx.try_send(DbCommand::ReportMailboxState {
-                        account_id: self.account_id(),
+                        account_id: account,
                         mailbox,
                         uid_validity: mailbox_state.uid_validity,
                         uid_next: mailbox_state.uid_next,
@@ -635,7 +723,7 @@ impl EsMailApp {
                     // fixed here: a live fallback fetch issued while the
                     // search results list is still showing, from a DB cache
                     // miss -- see the `DbEvent::MailFetchFailed` arm below.)
-                    if req_id == self.current_body_req && self.selected_uid == Some(uid) {
+                    if is_active && req_id == self.current_body_req && self.selected_uid == Some(uid) {
                         self.current_message_html = html.clone();
                         self.web_view.load(WebViewSource::Html(html));
                         self.current_attachments = attachments;
@@ -650,40 +738,52 @@ impl EsMailApp {
                     // so nothing could tell it apart from an unrelated error
                     // and resolve the pending fetch. This is the actual fix
                     // for the "stuck on Loading message..." bug (issue #13).
-                    if req_id == self.current_body_req && self.selected_uid == Some(uid) {
+                    if is_active && req_id == self.current_body_req && self.selected_uid == Some(uid) {
                         let msg = format!("<i>Could not load message: {}</i>", ammonia::clean_text(&error));
                         self.current_message_html = msg.clone();
                         self.web_view.load(WebViewSource::Html(msg));
                     }
-                    self.push_banner(format!("Could not load message: {error}"));
+                    self.push_account_banner(&account, format!("Could not load message: {error}"));
                 }
                 ImapEvent::Exported { path } => {
                     self.status = format!("Exported message to {}", path.display());
                 }
                 ImapEvent::ExportFailed { error } => {
-                    self.push_banner(format!("Could not export message: {error}"));
+                    self.push_account_banner(&account, format!("Could not export message: {error}"));
                 }
                 ImapEvent::DownloadProgress { current, total } => {
-                    self.download_progress = Some((current, total));
-                    if current == total {
-                        self.download_progress = None;
-                        self.status = "Download complete".to_string();
+                    if is_active {
+                        self.download_progress = Some((current, total));
+                        if current == total {
+                            self.download_progress = None;
+                            self.status = "Download complete".to_string();
+                        }
                     }
                 }
                 ImapEvent::MailData { mailbox, header, body } => {
                     let _ = self.db_tx.try_send(DbCommand::IndexMail {
-                        account_id: self.account_id(),
+                        account_id: account,
                         mailbox,
                         header,
                         body,
                     });
                 }
-                ImapEvent::MailboxPolled { .. } | ImapEvent::NewHeaders { .. } => {
-                    // B10's new-mail signal: already consumed by
-                    // `spawn_new_mail_watch` before this event reached the
-                    // UI channel at all (it decides whether to poll again /
-                    // fetch new envelopes / show a toast). Nothing left here
-                    // for the UI to do with either variant.
+                ImapEvent::MailboxPolled { .. } => {
+                    // B10's new-mail signal: already consumed by the
+                    // account's forwarder (session.rs) before this event
+                    // reached the UI channel at all (it decides whether to
+                    // poll again / fetch new envelopes / show a toast).
+                    // Nothing left here for the UI to do.
+                }
+                ImapEvent::NewHeaders { .. } => {
+                    // Same: the forwarder already turned it into a toast.
+                    // What the UI still owes is the unread counts, so an
+                    // account that is not on screen (with several accounts
+                    // most are not) shows its new mail in the folder pane.
+                    let names = self.mailbox_names(&account);
+                    if !names.is_empty() {
+                        self.send_imap_to(&account, ImapCommand::FetchUnreadCounts { mailboxes: names });
+                    }
                 }
                 ImapEvent::Appended { mailbox } => {
                     // B7: confirmation that the just-sent message was saved
@@ -705,7 +805,7 @@ impl EsMailApp {
                     // which is exactly the problem that made this event a
                     // log-only affair up to now.
                     log::warn!("could not save sent message to {mailbox}: {error}");
-                    self.push_banner(format!("Sent, but could not save a copy to {mailbox}: {error}"));
+                    self.push_account_banner(&account, format!("Sent, but could not save a copy to {mailbox}: {error}"));
                 }
                 ImapEvent::HeadersFrom { mailbox, headers } => {
                     // B3: reply to the `FetchHeadersFrom` sent in
@@ -715,7 +815,7 @@ impl EsMailApp {
                     // for why this is a separate event from `NewHeaders`
                     // rather than reusing it.
                     let _ = self.db_tx.try_send(DbCommand::IndexHeaders {
-                        account_id: self.account_id(),
+                        account_id: account,
                         mailbox,
                         headers,
                     });
@@ -724,34 +824,42 @@ impl EsMailApp {
                     // Deliberately not `self.status` -- see the variant's
                     // doc in imap.rs: a background poll failing every 60s
                     // shouldn't overwrite whatever the user is looking at.
-                    log::warn!("background new-mail poll failed: {e}");
+                    log::warn!("background new-mail poll for {account} failed: {e}");
                 }
                 ImapEvent::FlagsUpdated { mailbox, uid, flags, req_id: _ } => {
                     // B8: reflect the server-confirmed flags back into the
                     // visible header list, any active search-results list,
                     // and the local cache. Only touches self.headers/
-                    // self.unread_counts/self.search_results when `mailbox`
-                    // matches what's actually on screen -- both lists only
-                    // ever hold messages from `self.selected_mailbox`
+                    // self.search_results when `mailbox` of the active
+                    // account is what's actually on screen -- both lists
+                    // only ever hold messages from `self.selected_mailbox`
                     // (search is itself scoped to it, see the `Search`
                     // send-site below), so an event for a different mailbox
-                    // finding a same-numbered UID in either list would
-                    // otherwise patch the wrong message's row and skew the
-                    // unread count for a mailbox that wasn't actually
-                    // touched. The DB write below is unaffected by this
-                    // guard: it's already keyed by `mailbox`, so it's
-                    // correct regardless of what's currently displayed.
-                    if mailbox == self.selected_mailbox {
-                        let was_seen = self.headers.iter().find(|h| h.uid == uid).map(|h| h.is_seen());
+                    // (or account) finding a same-numbered UID in either
+                    // list would otherwise patch the wrong message's row.
+                    // The unread count belongs to the event's own account
+                    // and mailbox, and the DB write is keyed by both, so
+                    // both are correct regardless of what's displayed.
+                    let mut was_seen = None;
+                    if is_active && mailbox == self.selected_mailbox {
+                        was_seen = self.headers.iter().find(|h| h.uid == uid).map(|h| h.is_seen());
                         if let Some(header) = self.headers.iter_mut().find(|h| h.uid == uid) {
                             header.flags = flags.clone();
                         }
-                        if let Some(results) = self.search_results.as_mut() {
-                            if let Some(header) = results.iter_mut().find(|h| h.uid == uid) {
+                    }
+                    // Search results can come from any account and mailbox, so
+                    // they are matched on their own origin rather than on what
+                    // is open.
+                    if let Some(results) = self.search_results.as_mut() {
+                        for (i, header) in results.iter_mut().enumerate() {
+                            let origin = self.search_origins.get(i);
+                            if header.uid == uid && origin.is_some_and(|(a, m)| *a == account && *m == mailbox) {
                                 header.flags = flags.clone();
                             }
                         }
-                        if let (Some(was_seen), Some(count)) = (was_seen, self.unread_counts.get_mut(&mailbox)) {
+                    }
+                    if let Some(was_seen) = was_seen {
+                        if let Some(count) = self.view_mut(&account).and_then(|v| v.unread_counts.get_mut(&mailbox)) {
                             let now_seen = flags.iter().any(|f| f.eq_ignore_ascii_case(imap::FLAG_SEEN));
                             if was_seen && !now_seen {
                                 *count += 1;
@@ -761,61 +869,75 @@ impl EsMailApp {
                         }
                     }
                     let _ = self.db_tx.try_send(DbCommand::UpdateFlags {
-                        account_id: self.account_id(),
+                        account_id: account,
                         mailbox,
                         uid,
                         flags,
                     });
                 }
                 ImapEvent::FlagsUpdateFailed { mailbox: _, uid, error, req_id: _ } => {
-                    self.push_banner(format!("Could not update flags on message {uid}: {error}"));
+                    self.push_account_banner(&account, format!("Could not update flags on message {uid}: {error}"));
                 }
                 ImapEvent::Moved { mailbox, uid, dest, req_id: _ } => {
                     // B8: delete-to-Trash/archive succeeded -- drop the
                     // message from the visible list, any active
                     // search-results list, the cache, and any selection it
                     // was part of. See FlagsUpdated above for why the
-                    // header/search-results/unread-count mutations are
-                    // guarded on `mailbox == self.selected_mailbox`.
-                    let was_unread = mailbox == self.selected_mailbox
+                    // header/search-results mutations are guarded on this
+                    // being the active account's selected mailbox.
+                    let on_screen = is_active && mailbox == self.selected_mailbox;
+                    let was_unread = on_screen
                         && self.headers.iter().find(|h| h.uid == uid).map(|h| !h.is_seen()).unwrap_or(false);
-                    if mailbox == self.selected_mailbox {
+                    if on_screen {
                         self.headers.retain(|h| h.uid != uid);
-                        if let Some(results) = self.search_results.as_mut() {
-                            results.retain(|h| h.uid != uid);
-                        }
                     }
-                    self.selected_uids.remove(&uid);
-                    if self.selected_uid == Some(uid) {
-                        self.selected_uid = None;
-                        self.web_view.load(WebViewSource::Html("<i>Message moved.</i>".to_string()));
+                    if let Some(results) = self.search_results.as_mut() {
+                        let origins = std::mem::take(&mut self.search_origins);
+                        let (kept, kept_origins): (Vec<_>, Vec<_>) = results
+                            .drain(..)
+                            .zip(origins)
+                            .filter(|(h, (a, m))| !(h.uid == uid && *a == account && *m == mailbox))
+                            .unzip();
+                        *results = kept;
+                        self.search_origins = kept_origins;
+                    }
+                    if is_active {
+                        self.selected_uids.remove(&uid);
+                        if self.selected_uid == Some(uid) {
+                            self.selected_uid = None;
+                            self.web_view.load(WebViewSource::Html("<i>Message moved.</i>".to_string()));
+                        }
+                        self.status = format!("Moved to {dest}");
                     }
                     if was_unread {
-                        if let Some(count) = self.unread_counts.get_mut(&mailbox) {
-                            *count = count.saturating_sub(1);
-                        }
-                        // The message just landed in `dest` unread -- bump
-                        // its count too if we're already tracking it (it
-                        // may not be yet if FetchUnreadCounts hasn't
-                        // completed), so the sidebar doesn't read "no new
-                        // mail in Archive/Trash" for a message that just
-                        // arrived there.
-                        if let Some(count) = self.unread_counts.get_mut(&dest) {
-                            *count += 1;
+                        if let Some(view) = self.view_mut(&account) {
+                            if let Some(count) = view.unread_counts.get_mut(&mailbox) {
+                                *count = count.saturating_sub(1);
+                            }
+                            // The message just landed in `dest` unread --
+                            // bump its count too if we're already tracking
+                            // it (it may not be yet if FetchUnreadCounts
+                            // hasn't completed), so the sidebar doesn't
+                            // read "no new mail in Archive/Trash" for a
+                            // message that just arrived there.
+                            if let Some(count) = view.unread_counts.get_mut(&dest) {
+                                *count += 1;
+                            }
                         }
                     }
-                    self.status = format!("Moved to {dest}");
                     let _ = self.db_tx.try_send(DbCommand::RemoveMessage {
-                        account_id: self.account_id(),
+                        account_id: account,
                         mailbox,
                         uid,
                     });
                 }
                 ImapEvent::MoveFailed { mailbox: _, uid, error, req_id: _ } => {
-                    self.push_banner(format!("Could not move message {uid}: {error}"));
+                    self.push_account_banner(&account, format!("Could not move message {uid}: {error}"));
                 }
                 ImapEvent::UnreadCounts(counts) => {
-                    self.unread_counts = counts;
+                    if let Some(view) = self.view_mut(&account) {
+                        view.unread_counts = counts;
+                    }
                 }
             }
         }
@@ -824,8 +946,9 @@ impl EsMailApp {
     fn handle_db_events(&mut self) {
         while let Ok(evt) = self.db_rx.try_recv() {
             match evt {
-                DbEvent::SearchResult { headers } => {
-                    self.search_results = Some(headers);
+                DbEvent::SearchResult { hits } => {
+                    self.search_origins = hits.iter().map(|h| (h.account_id.clone(), h.mailbox.clone())).collect();
+                    self.search_results = Some(hits.into_iter().map(|h| h.header).collect());
                 }
                 DbEvent::MailFetched { header, body } => {
                     if self.selected_uid == Some(header.uid) {
@@ -862,19 +985,16 @@ impl EsMailApp {
                     // this event arrives -- fetching from UID 1 repopulates
                     // it under the server's new UIDVALIDITY.
                     //
-                    // `account_id` isn't used to route this -- there is
-                    // exactly one account connected at a time today (see
-                    // `EsMailApp::account_id`'s own doc), so it's implicitly
-                    // always "the" account; kept on the event for when that
-                    // stops being true.
-                    let _ = account_id;
+                    // Routed to the account the plan was made for, which is
+                    // not necessarily the active one: a header fetch for a
+                    // different account may still be answering.
                     match plan {
                         db::SyncPlan::UpToDate => {}
                         db::SyncPlan::FetchFrom { first_new_uid } => {
-                            let _ = self.imap_tx.try_send(ImapCommand::FetchHeadersFrom { mailbox, first_uid: first_new_uid });
+                            self.send_imap_to(&account_id, ImapCommand::FetchHeadersFrom { mailbox, first_uid: first_new_uid });
                         }
                         db::SyncPlan::Resync => {
-                            let _ = self.imap_tx.try_send(ImapCommand::FetchHeadersFrom { mailbox, first_uid: 1 });
+                            self.send_imap_to(&account_id, ImapCommand::FetchHeadersFrom { mailbox, first_uid: 1 });
                         }
                     }
                 }
@@ -902,11 +1022,16 @@ impl EsMailApp {
                     // failure here only logs (via the generic
                     // ImapEvent::Error path), it doesn't reopen the compose
                     // window or otherwise imply the send itself failed,
-                    // since it didn't.
-                    let mailbox = self.special_use_mailbox(imap::SpecialUse::Sent, SENT_MAILBOX);
-                    let _ = self.imap_tx.try_send(ImapCommand::Append { mailbox, raw });
+                    // since it didn't. The copy goes to the account the
+                    // message was sent *from*, into that account's own Sent
+                    // folder (special-use discovery is per account).
+                    if let Some(account) = self.sending_from.take().or_else(|| self.active.clone()) {
+                        let mailbox = self.special_use_mailbox_for(&account, imap::SpecialUse::Sent, SENT_MAILBOX);
+                        self.send_imap_to(&account, ImapCommand::Append { mailbox, raw });
+                    }
                 }
                 smtp::SmtpEvent::Error(e) => {
+                    self.sending_from = None;
                     self.compose_status = format!("Send failed: {e}");
                 }
             }
@@ -921,6 +1046,119 @@ impl EsMailApp {
     fn push_banner(&mut self, message: String) {
         self.next_banner_id += 1;
         self.banners.push(Banner { id: self.next_banner_id, message });
+    }
+
+    /// [`Self::push_banner`] for an error that belongs to one account. Names
+    /// the account once there is more than one, so "IMAP error: login
+    /// failed" says which of them; with a single account the text is what it
+    /// always was.
+    fn push_account_banner(&mut self, account: &str, message: String) {
+        if self.accounts.len() > 1 {
+            let label = self.account_label(account);
+            self.push_banner(format!("{label}: {message}"));
+        } else {
+            self.push_banner(message);
+        }
+    }
+
+    fn view(&self, account: &str) -> Option<&AccountView> {
+        self.accounts.iter().find(|v| v.id() == account)
+    }
+
+    fn view_mut(&mut self, account: &str) -> Option<&mut AccountView> {
+        self.accounts.iter_mut().find(|v| v.id() == account)
+    }
+
+    /// The account's display name, or its id if it is not (or no longer) a
+    /// live session.
+    fn account_label(&self, account: &str) -> String {
+        self.view(account).map_or_else(|| account.to_string(), |v| v.label().to_string())
+    }
+
+    /// Every selectable mailbox of `account` (the ones `FetchUnreadCounts`
+    /// can `STATUS`), from its current mailbox tree.
+    fn mailbox_names(&self, account: &str) -> Vec<String> {
+        self.view(account)
+            .map(|v| v.mailbox_rows.iter().filter_map(|r| r.full_name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Send a command to one account's actor. Dropped if that account has
+    /// been removed -- there is nothing left to answer it.
+    fn send_imap_to(&self, account: &str, cmd: ImapCommand) {
+        if let Some(view) = self.view(account) {
+            let _ = view.session.imap_tx().try_send(cmd);
+        }
+    }
+
+    /// Send a command to the active account's actor (a no-op with no active
+    /// account). Everything the message list and reading pane do goes
+    /// through here, since they only ever show the active account.
+    fn send_imap(&self, cmd: ImapCommand) {
+        if let Some(account) = &self.active {
+            self.send_imap_to(account, cmd);
+        }
+    }
+
+    /// Make `account` the one the message list and reading pane show, open
+    /// `mailbox` in it, and start fetching its first page. Everything that
+    /// belonged to the previous account's list -- selection, search results,
+    /// the open message -- is dropped, since none of it is meaningful in the
+    /// new one.
+    fn activate(&mut self, account: &str, mailbox: String) {
+        let switching = self.active.as_deref() != Some(account);
+        self.active = Some(account.to_string());
+        self.headers_stale = false;
+        if switching {
+            self.search_query.clear();
+            self.search_results = None;
+            self.search_origins.clear();
+            self.headers.clear();
+            self.web_view.load(WebViewSource::Html(String::new()));
+            self.current_message_html.clear();
+            self.current_attachments.clear();
+        }
+        self.selected_mailbox = mailbox.clone();
+        self.selected_uid = None;
+        self.selected_uids.clear();
+        self.select_anchor = None;
+        self.pending_mark_seen = None;
+        self.current_page = 1;
+        self.total_pages = 1;
+        self.fetch_headers(mailbox, 1);
+    }
+
+    /// Real Logout / Remove account: drop the account's session, which stops
+    /// its actor, its body worker and its `IDLE` watch (see
+    /// `AccountSession`'s `Drop`), and leaves every other account alone. If
+    /// it was the active one, the next remaining connected account takes
+    /// over.
+    fn disconnect_account(&mut self, account: &str) {
+        let label = self.account_label(account);
+        self.accounts.retain(|v| v.id() != account);
+        if self.active.as_deref() == Some(account) {
+            self.active = None;
+            self.headers.clear();
+            self.search_results = None;
+            self.search_origins.clear();
+            self.headers_stale = false;
+            self.selected_uid = None;
+            self.selected_uids.clear();
+            self.select_anchor = None;
+            self.pending_mark_seen = None;
+            self.current_message_html.clear();
+            self.current_attachments.clear();
+            self.web_view.load(WebViewSource::Html(String::new()));
+            let next = self
+                .accounts
+                .iter()
+                .find(|v| v.state == ConnState::Connected)
+                .map(|v| v.id().to_string());
+            if let Some(next) = next {
+                self.activate(&next, "INBOX".to_string());
+            }
+        }
+        self.status = format!("Logged out of {label}");
     }
 
     /// Apply `theme` to both `self.config` (so it's saved) and the live
@@ -1005,16 +1243,23 @@ impl EsMailApp {
         }
     }
 
-    /// Identifies the connected account to `db.rs`, in the same
-    /// `username@host` shape [`AccountConfig::new`] uses for its `id` — so
-    /// the cache keys line up with the saved-accounts list even though this
-    /// is derived from the live login form rather than looked up from
-    /// `self.config`.
-    fn account_id(&self) -> String {
-        // Trimmed, like the values a connection is made with, so a stray
-        // space in the form can't make the keyring/config key differ from
-        // the account that actually signed in.
-        format!("{}@{}", self.username.trim(), self.host.trim())
+    /// The id `db.rs` keys the active account's cache on -- `AccountConfig::
+    /// id`, the same `username@host` string the keyring uses -- or `None`
+    /// before any account is active. Every DB command names its account
+    /// explicitly; this is only for the ones the UI itself issues on behalf
+    /// of the message list.
+    fn active_account_id(&self) -> Option<AccountId> {
+        self.active.clone()
+    }
+
+    /// The active account's login name, which doubles as its address --
+    /// empty before any account is active.
+    fn active_username(&self) -> String {
+        self.active
+            .as_deref()
+            .and_then(|id| self.config.accounts.iter().find(|a| a.id == id))
+            .map(|a| a.username.clone())
+            .unwrap_or_default()
     }
 
     /// A fresh request id for `FetchHeaders`/`FetchBody`, mechanically
@@ -1029,14 +1274,14 @@ impl EsMailApp {
     fn fetch_headers(&mut self, mailbox: String, page: u32) {
         let req_id = self.next_req_id();
         self.current_headers_req = req_id;
-        let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox, page, req_id });
+        self.send_imap(ImapCommand::FetchHeaders { mailbox, page, req_id });
     }
 
     /// Send `FetchBody`, recording its request id the same way `fetch_headers` does.
     fn fetch_body(&mut self, mailbox: String, uid: u32) {
         let req_id = self.next_req_id();
         self.current_body_req = req_id;
-        let _ = self.imap_tx.try_send(ImapCommand::FetchBody { mailbox, uid, req_id });
+        self.send_imap(ImapCommand::FetchBody { mailbox, uid, req_id });
     }
 
     /// Save the open message's raw RFC822 source as an `.eml` file, chosen
@@ -1052,7 +1297,7 @@ impl EsMailApp {
             return;
         };
         self.status = format!("Exporting message to {}...", path.display());
-        let _ = self.imap_tx.try_send(ImapCommand::ExportMessage {
+        self.send_imap(ImapCommand::ExportMessage {
             mailbox: self.selected_mailbox.clone(),
             uid: header.uid,
             path,
@@ -1094,11 +1339,13 @@ impl EsMailApp {
             // falls back to a real live fetch through `fetch_body`, which
             // hands out its own fresh id and legitimately updates this.
             self.current_body_req = self.next_req_id();
-            let _ = self.db_tx.try_send(DbCommand::FetchMail {
-                account_id: self.account_id(),
-                mailbox: self.selected_mailbox.clone(),
-                uid,
-            });
+            if let Some(account_id) = self.active_account_id() {
+                let _ = self.db_tx.try_send(DbCommand::FetchMail {
+                    account_id,
+                    mailbox: self.selected_mailbox.clone(),
+                    uid,
+                });
+            }
         } else {
             self.fetch_body(self.selected_mailbox.clone(), uid);
         }
@@ -1129,7 +1376,7 @@ impl EsMailApp {
         let mailbox = self.selected_mailbox.clone();
         for uid in self.action_targets() {
             let req_id = self.next_req_id();
-            let _ = self.imap_tx.try_send(ImapCommand::StoreFlags {
+            self.send_imap(ImapCommand::StoreFlags {
                 mailbox: mailbox.clone(),
                 uid,
                 add: add.clone(),
@@ -1144,11 +1391,65 @@ impl EsMailApp {
     /// active, else `headers`) -- used by `toggle_star_on_selection` so each
     /// message's own state decides its own direction.
     fn is_flagged_uid(&self, uid: u32) -> bool {
-        self.search_results
-            .as_ref()
-            .unwrap_or(&self.headers)
-            .iter()
-            .any(|h| h.uid == uid && h.is_flagged())
+        match &self.search_results {
+            Some(results) => results
+                .iter()
+                .enumerate()
+                .any(|(i, h)| h.uid == uid && h.is_flagged() && self.in_open_context(i)),
+            None => self.headers.iter().any(|h| h.uid == uid && h.is_flagged()),
+        }
+    }
+
+    /// Whether search result `i` lives in the mailbox currently open (the
+    /// `active` account's `selected_mailbox`) -- the context UID-based
+    /// actions and the reading pane refer to.
+    fn in_open_context(&self, i: usize) -> bool {
+        match (&self.active, self.search_origins.get(i)) {
+            (Some(active), Some((account, mailbox))) => account == active && *mailbox == self.selected_mailbox,
+            _ => false,
+        }
+    }
+
+    /// The header of the open message, from the search results when one of
+    /// them is open (it may be in a mailbox `headers` does not hold), else
+    /// from the message list.
+    fn selected_header(&self) -> Option<MailHeader> {
+        let uid = self.selected_uid?;
+        if let Some(results) = &self.search_results {
+            if let Some(h) = results.iter().enumerate().find(|(i, h)| h.uid == uid && self.in_open_context(*i)).map(|(_, h)| h) {
+                return Some(h.clone());
+            }
+        }
+        self.headers.iter().find(|h| h.uid == uid).cloned()
+    }
+
+    /// Open search result `i`: move to its account and mailbox first if it
+    /// lives elsewhere, then open it from the cache like any search result.
+    fn open_search_hit(&mut self, i: usize) {
+        let (Some(header), Some((account, mailbox))) =
+            (self.search_results.as_ref().and_then(|r| r.get(i)), self.search_origins.get(i).cloned())
+        else {
+            return;
+        };
+        let uid = header.uid;
+        if self.active.as_deref() != Some(account.as_str()) || self.selected_mailbox != mailbox {
+            // The message list still holds the previous mailbox's page;
+            // `clear_search` reloads it.
+            self.headers_stale = true;
+            self.active = Some(account);
+            self.selected_mailbox = mailbox;
+        }
+        self.open_message(uid, true);
+    }
+
+    /// Leave search: drop the results, and reload the message list if
+    /// opening a hit moved it to another mailbox meanwhile.
+    fn clear_search(&mut self) {
+        self.search_results = None;
+        self.search_origins.clear();
+        if std::mem::take(&mut self.headers_stale) {
+            self.fetch_headers(self.selected_mailbox.clone(), 1);
+        }
     }
 
     /// Toggle `\Flagged` on every target in [`Self::action_targets`],
@@ -1168,7 +1469,7 @@ impl EsMailApp {
             } else {
                 (vec![imap::FLAG_FLAGGED.to_string()], vec![])
             };
-            let _ = self.imap_tx.try_send(ImapCommand::StoreFlags {
+            self.send_imap(ImapCommand::StoreFlags {
                 mailbox: mailbox.clone(),
                 uid,
                 add,
@@ -1184,7 +1485,7 @@ impl EsMailApp {
         let mailbox = self.selected_mailbox.clone();
         for uid in self.action_targets() {
             let req_id = self.next_req_id();
-            let _ = self.imap_tx.try_send(ImapCommand::MoveMessage {
+            self.send_imap(ImapCommand::MoveMessage {
                 mailbox: mailbox.clone(),
                 uid,
                 dest: dest.to_string(),
@@ -1205,8 +1506,20 @@ impl EsMailApp {
     /// option, so an account whose folders aren't literally named "Sent"/
     /// "Trash"/"Archive" (Gmail's `[Gmail]/Sent Mail`, say) gets its real
     /// folder instead of a spurious new top-level mailbox.
+    ///
+    /// Discovery is per account -- each account has its own mailbox tree --
+    /// so this asks about `account`, not "the" account.
+    fn special_use_mailbox_for(&self, account: &str, want: imap::SpecialUse, default: &str) -> String {
+        let rows = self.view(account).map_or(&[][..], |v| v.mailbox_rows.as_slice());
+        find_special_use_mailbox(rows, want, default)
+    }
+
+    /// [`Self::special_use_mailbox_for`] for the active account.
     fn special_use_mailbox(&self, want: imap::SpecialUse, default: &str) -> String {
-        find_special_use_mailbox(&self.mailbox_rows, want, default)
+        match &self.active {
+            Some(account) => self.special_use_mailbox_for(account, want, default),
+            None => default.to_string(),
+        }
     }
 
     /// Archive every target in [`Self::action_targets`] to the account's
@@ -1223,240 +1536,6 @@ impl EsMailApp {
     fn delete_selection(&mut self) {
         let dest = self.special_use_mailbox(imap::SpecialUse::Trash, TRASH_MAILBOX);
         self.move_selection(&dest);
-    }
-
-    /// Fill the login form from a saved account and pull its password back
-    /// out of the OS keyring, if there is one.
-    fn select_account(&mut self, account: &AccountConfig) {
-        self.host = account.imap_host.clone();
-        self.port = account.imap_port.to_string();
-        self.username = account.username.clone();
-        self.smtp_host = account.smtp_host.clone();
-        self.smtp_port = account.smtp_port.to_string();
-        self.use_oauth = account.auth == config::AuthKind::GoogleOAuth;
-        // An OAuth account has no password to restore; its refresh token is
-        // looked up when Connect is clicked.
-        self.password = if self.use_oauth {
-            String::new()
-        } else {
-            secrets::get_password(&account.id, "imap")
-                .map(|s| secrecy::ExposeSecret::expose_secret(&s).to_string())
-                .unwrap_or_default()
-        };
-    }
-
-    /// Whether the form is currently set to sign in with Google: the box is
-    /// ticked *and* the host is one Google's OAuth actually applies to (the
-    /// box is only shown for Gmail, but stays ticked if the host is edited
-    /// afterwards).
-    fn oauth_active(&self) -> bool {
-        self.use_oauth && self.host.trim() == GMAIL_IMAP_HOST
-    }
-
-    /// Hand `auth` to the IMAP actor for `host`/`port`/`username`, and start
-    /// the IDLE watch alongside it. The one place a connection begins, for a
-    /// typed password and for an OAuth token alike.
-    fn start_connection(&mut self, host: String, port: u16, username: String, auth: auth::Auth) {
-        self.status = "Connecting...".to_string();
-        self.current_auth = Some(auth.clone());
-        let _ = self.imap_tx.try_send(ImapCommand::Connect {
-            host: host.clone(),
-            port,
-            username: username.clone(),
-            auth: auth.clone(),
-        });
-        // A separate, dedicated IDLE connection (see idle_watch's module doc
-        // for why it can't share ImapActor's session) so new-mail detection
-        // is push-based instead of relying only on spawn_new_mail_watch's
-        // poll timer. Started alongside the normal connect rather than only
-        // after `ImapEvent::Connected` arrives: it does its own independent
-        // login/reconnect and simply has nothing to push until it succeeds,
-        // so there is no ordering requirement between the two. Replaces any
-        // earlier watch -- see `idle_watch_task`'s doc.
-        if let Some(previous) = self.idle_watch_task.take() {
-            previous.abort();
-        }
-        self.idle_watch_task = Some(idle_watch::spawn(
-            host,
-            port,
-            username,
-            auth,
-            NEW_MAIL_POLL_MAILBOX.to_string(),
-            self.idle_wake_tx.clone(),
-        ));
-    }
-
-    /// The Connect button. With a password that is just `start_connection`.
-    /// With Google sign-in it reuses the refresh token saved from an earlier
-    /// approval, and only sends the user to the browser when there is none.
-    fn connect_clicked(&mut self, ctx: &egui::Context) {
-        let port: u16 = self.port.parse().unwrap_or(993);
-        // Trimmed: a trailing space would otherwise go out as part of the
-        // XOAUTH2 user and be rejected, though the same account signed in
-        // fine (`begin_google_sign_in` trims) the first time.
-        let host = self.host.trim().to_string();
-        let username = self.username.trim().to_string();
-        if !self.oauth_active() {
-            let auth = auth::Auth::password(self.password.clone());
-            self.start_connection(host, port, username, auth);
-            return;
-        }
-        let Some(client) = self.google_client_or_explain() else { return };
-        match secrets::get_password(&self.account_id(), "oauth") {
-            Some(refresh_token) => {
-                let source = oauth::TokenSource::from_refresh_token(client, refresh_token);
-                self.start_connection(host, port, username, auth::Auth::OAuth(source));
-            }
-            None => self.begin_google_sign_in(ctx),
-        }
-    }
-
-    /// The configured Google OAuth client, or (with a banner saying how to
-    /// configure one) `None`. Google issues tokens only to registered
-    /// applications, so unlike a password this cannot work out of the box --
-    /// see `oauth`'s module doc.
-    fn google_client_or_explain(&mut self) -> Option<oauth::OAuthClient> {
-        let client = oauth::google_client(self.config.google_oauth.as_ref());
-        if client.is_none() {
-            self.push_banner(
-                "Google sign-in needs an OAuth client id: enter it under Settings (top right), or \
-                 set ESMAIL_GOOGLE_CLIENT_ID and ESMAIL_GOOGLE_CLIENT_SECRET. See the esmail README."
-                    .to_string(),
-            );
-        }
-        client
-    }
-
-    /// Open the system browser on Google's consent page and wait, in a
-    /// background task, for the redirect back; the result arrives as an
-    /// [`OAuthMessage`]. Replaces any sign-in already in progress.
-    fn begin_google_sign_in(&mut self, ctx: &egui::Context) {
-        if self.username.trim().is_empty() {
-            self.push_banner("Enter your Gmail address in the Username field first.".to_string());
-            return;
-        }
-        let Some(client) = self.google_client_or_explain() else { return };
-        if let Some(previous) = self.oauth_task.take() {
-            previous.abort();
-        }
-
-        let host = self.host.trim().to_string();
-        let port: u16 = self.port.parse().unwrap_or(993);
-        let username = self.username.trim().to_string();
-        let tx = self.oauth_tx.clone();
-        let ctx = ctx.clone();
-        self.status = "Waiting for Google sign-in in your browser...".to_string();
-        self.oauth_task = Some(tokio::spawn(async move {
-            let message = match run_google_sign_in(&client, &username, &tx, &ctx).await {
-                Ok(source) => OAuthMessage::Authorized { host, port, username, auth: auth::Auth::OAuth(source) },
-                Err(e) => OAuthMessage::Failed(format!("{e:#}")),
-            };
-            let _ = tx.send(message).await;
-            ctx.request_repaint();
-        }));
-    }
-
-    fn handle_oauth_events(&mut self) {
-        while let Ok(message) = self.oauth_rx.try_recv() {
-            match message {
-                OAuthMessage::BrowserUnavailable { url } => {
-                    self.push_banner(format!("Could not open your browser. Open this address to sign in: {url}"));
-                }
-                OAuthMessage::Authorized { host, port, username, auth } => {
-                    self.oauth_task = None;
-                    // The form was editable while the browser was open. The
-                    // token belongs to the account the sign-in was started
-                    // for, and `persist_current_account`/`smtp_account` read
-                    // the form, so put those values back rather than let the
-                    // token be saved under whatever is there now.
-                    self.host = host.clone();
-                    self.port = port.to_string();
-                    self.username = username.clone();
-                    self.start_connection(host, port, username, auth);
-                }
-                OAuthMessage::Failed(error) => {
-                    self.oauth_task = None;
-                    self.status = "Ready".to_string();
-                    self.push_banner(format!("Google sign-in failed: {error}"));
-                }
-            }
-        }
-    }
-
-    /// Persist the account currently in the login form: upsert it into
-    /// `config.toml` and its password into the OS keyring (under both
-    /// `"imap"` and `"smtp"` — B7 sends with the same credentials, since
-    /// `AccountConfig::username` is documented as used for both). Called
-    /// once a connection actually succeeds, not on every keystroke or click.
-    fn persist_current_account(&mut self) {
-        let username = self.username.trim().to_string();
-        let mut account = AccountConfig::new(
-            username.clone(),
-            self.host.trim().to_string(),
-            self.port.parse().unwrap_or(993),
-            username,
-        );
-        // AccountConfig::new only guesses smtp_host/smtp_port; the login
-        // form's fields (pre-filled from that guess, but editable) win.
-        if !self.smtp_host.is_empty() {
-            account.smtp_host = self.smtp_host.clone();
-        }
-        if let Ok(port) = self.smtp_port.parse() {
-            account.smtp_port = port;
-        }
-        // What the connection that just succeeded actually used decides what
-        // is saved -- not the form, which may have been touched since.
-        match &self.current_auth {
-            // No password anywhere: the refresh token is the credential, and
-            // IMAP and SMTP both derive their access tokens from it.
-            Some(auth::Auth::OAuth(source)) => {
-                account.auth = config::AuthKind::GoogleOAuth;
-                if let Err(e) = secrets::set_password(&account.id, "oauth", &source.refresh_token()) {
-                    log::warn!("could not save the Google sign-in to the OS keyring: {e}");
-                }
-                // An account that used to sign in with a password must not
-                // leave that password behind, unused, in the keyring.
-                secrets::delete_password(&account.id, "imap");
-                secrets::delete_password(&account.id, "smtp");
-            }
-            _ => {
-                // ...and the reverse: a live refresh token for an account
-                // that now uses a password.
-                secrets::delete_password(&account.id, "oauth");
-                let password = SecretString::from(self.password.clone());
-                if let Err(e) = secrets::set_password(&account.id, "imap", &password) {
-                    log::warn!("could not save IMAP password to the OS keyring: {e}");
-                }
-                if let Err(e) = secrets::set_password(&account.id, "smtp", &password) {
-                    log::warn!("could not save SMTP password to the OS keyring: {e}");
-                }
-            }
-        }
-        self.config.upsert_account(account);
-        if let Err(e) = self.config.save() {
-            log::warn!("could not persist account config: {e}");
-        }
-    }
-
-    /// Build the SMTP account `smtp.rs` needs to send, from the current
-    /// login form and saved keyring password. `None` if there's no SMTP
-    /// password saved yet — e.g. the very first connection, before
-    /// [`EsMailApp::persist_current_account`] has ever run for this account.
-    fn smtp_account(&self) -> Option<smtp::SmtpAccount> {
-        let account_id = self.account_id();
-        let auth = match &self.current_auth {
-            // The very same token source the IMAP connection uses.
-            Some(auth) if auth.is_oauth() => auth.clone(),
-            _ => auth::Auth::Password(secrets::get_password(&account_id, "smtp")?),
-        };
-        Some(smtp::SmtpAccount {
-            host: self.smtp_host.clone(),
-            port: self.smtp_port.parse().unwrap_or(465),
-            tls: config::TlsMode::Ssl,
-            username: self.username.trim().to_string(),
-            auth,
-            from_address: self.username.trim().to_string(),
-        })
     }
 
     /// Draws the compose window when `self.compose` is `Some`, and handles
@@ -1481,7 +1560,7 @@ impl EsMailApp {
         self.pending_mark_seen = None;
         let mailbox = self.selected_mailbox.clone();
         let req_id = self.next_req_id();
-        let _ = self.imap_tx.try_send(ImapCommand::StoreFlags {
+        self.send_imap(ImapCommand::StoreFlags {
             mailbox,
             uid,
             add: vec![imap::FLAG_SEEN.to_string()],
@@ -1532,14 +1611,18 @@ impl EsMailApp {
             }
         }
         if ctrl_n {
-            self.compose = Some(compose::ComposeState::default());
+            self.compose = Some(compose::ComposeState::default().with_account(self.active_account_id()));
             self.compose_status.clear();
         }
         if next || prev {
             let is_search = self.search_results.is_some();
             let list = self.search_results.as_ref().unwrap_or(&self.headers);
             if !list.is_empty() {
-                let idx = self.selected_uid.and_then(|uid| list.iter().position(|h| h.uid == uid));
+                // In search results the open message is found by UID within
+                // the open mailbox, since UIDs repeat across accounts.
+                let idx = self.selected_uid.and_then(|uid| {
+                    list.iter().enumerate().position(|(i, h)| h.uid == uid && (!is_search || self.in_open_context(i)))
+                });
                 let new_idx = match idx {
                     Some(i) if next => (i + 1).min(list.len() - 1),
                     Some(i) => i.saturating_sub(1), // prev
@@ -1548,7 +1631,11 @@ impl EsMailApp {
                 let uid = list[new_idx].uid;
                 self.selected_uids.clear();
                 self.select_anchor = Some(uid);
-                self.open_message(uid, is_search);
+                if is_search {
+                    self.open_search_hit(new_idx);
+                } else {
+                    self.open_message(uid, false);
+                }
             }
         }
         if enter {
@@ -1558,11 +1645,9 @@ impl EsMailApp {
             }
         }
         if reply {
-            if let Some(uid) = self.selected_uid {
-                if let Some(header) = self.headers.iter().find(|h| h.uid == uid).cloned() {
-                    self.compose = Some(compose::ComposeState::reply(&header, &self.current_message_html));
-                    self.compose_status.clear();
-                }
+            if let Some(header) = self.selected_header() {
+                self.compose = Some(compose::ComposeState::reply(&header, &self.current_message_html).with_account(self.active_account_id()));
+                self.compose_status.clear();
             }
         }
         if archive {
@@ -1573,114 +1658,6 @@ impl EsMailApp {
         }
         if star {
             self.toggle_star_on_selection();
-        }
-    }
-
-    /// Open the Settings window, filled from what is saved.
-    fn open_settings(&mut self) {
-        let saved = self.config.google_oauth.as_ref();
-        self.settings = Some(SettingsForm {
-            client_id: saved.map(|c| c.client_id.clone()).unwrap_or_default(),
-            client_secret: saved.and_then(|c| c.client_secret.clone()).unwrap_or_default(),
-        });
-    }
-
-    /// Draws the Settings window when `self.settings` is `Some`: the Google
-    /// OAuth client id and secret that "Sign in with Google" needs (see
-    /// `oauth`'s module doc for why esmail can't supply its own).
-    fn show_settings_window(&mut self, ctx: &egui::Context) {
-        // Only while the window is open: this reads environment variables,
-        // which is not something to do on every frame of a closed window.
-        if self.settings.is_none() {
-            return;
-        }
-        // Read before the form is borrowed, so the window can say when an
-        // environment variable is overriding what is typed here.
-        let active_source = oauth::google_client_with_source(self.config.google_oauth.as_ref()).map(|(_, source)| source);
-        let Some(form) = &mut self.settings else {
-            return;
-        };
-
-        let mut open = true;
-        let mut save_clicked = false;
-        let mut cancel_clicked = false;
-        egui::Window::new("Settings")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.heading("Sign in with Google");
-                ui.label(
-                    "Lets Gmail accounts sign in through the browser instead of an app password. \
-                     Create a \"Desktop app\" OAuth client in Google Cloud Console and enter its \
-                     credentials here (see the esmail README).",
-                );
-                ui.add_space(6.0);
-                egui::Grid::new("google_oauth_settings").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    ui.label("Client ID");
-                    ui.add(egui::TextEdit::singleline(&mut form.client_id).desired_width(340.0));
-                    ui.end_row();
-                    ui.label("Client secret");
-                    ui.add(egui::TextEdit::singleline(&mut form.client_secret).password(true).desired_width(340.0));
-                    ui.end_row();
-                });
-                ui.add_space(4.0);
-                match active_source {
-                    Some(oauth::ClientSource::Environment) => {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(200, 140, 30),
-                            "The ESMAIL_GOOGLE_CLIENT_ID environment variable is set and takes precedence \
-                             over what is saved here.",
-                        );
-                    }
-                    Some(source) => {
-                        ui.weak(format!("Currently using: {}.", source.label()));
-                    }
-                    None => {
-                        ui.weak("No client configured yet.");
-                    }
-                }
-                ui.weak("Saved in config.toml. Leave the client ID empty to remove it.");
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
-                        save_clicked = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel_clicked = true;
-                    }
-                });
-            });
-
-        if save_clicked {
-            if let Some(form) = self.settings.take() {
-                self.apply_settings(form);
-            }
-        } else if cancel_clicked || !open {
-            self.settings = None;
-        }
-    }
-
-    /// Persist the Settings form into `config.toml`.
-    fn apply_settings(&mut self, form: SettingsForm) {
-        let client_id = form.client_id.trim().to_string();
-        let client_secret = form.client_secret.trim().to_string();
-        self.config.google_oauth = (!client_id.is_empty()).then(|| config::OAuthClientConfig {
-            client_id,
-            client_secret: (!client_secret.is_empty()).then_some(client_secret),
-        });
-        match self.config.save() {
-            Ok(()) => self.status = "Settings saved".to_string(),
-            Err(e) => self.push_banner(format!("Could not save settings: {e}")),
-        }
-        // A first-time user who has just configured a client and is looking
-        // at the Gmail defaults most likely wants Sign in with Google.
-        if self.config.accounts.is_empty()
-            && self.host.trim() == GMAIL_IMAP_HOST
-            && oauth::google_client(self.config.google_oauth.as_ref()).is_some()
-        {
-            self.use_oauth = true;
         }
     }
 
@@ -1697,6 +1674,23 @@ impl EsMailApp {
             .default_size([480.0, 420.0])
             .show(ctx, |ui| {
                 egui::Grid::new("compose_grid").num_columns(2).show(ui, |ui| {
+                    // Which account this is sent from -- and whose Sent
+                    // folder gets the copy. Defaults to the account of the
+                    // message being replied to (else the active one), set
+                    // when the compose window was opened.
+                    ui.label("From:");
+                    let selected = compose
+                        .account_id
+                        .as_deref()
+                        .and_then(|id| self.accounts.iter().find(|v| v.id() == id))
+                        .map_or("(choose an account)", |v| v.label());
+                    egui::ComboBox::from_id_salt("compose_from").selected_text(selected).show_ui(ui, |ui| {
+                        for view in &self.accounts {
+                            ui.selectable_value(&mut compose.account_id, Some(view.id().to_string()), view.label());
+                        }
+                    });
+                    ui.end_row();
+
                     ui.label("To:");
                     ui.add(egui::TextEdit::singleline(&mut compose.to).desired_width(f32::INFINITY));
                     ui.end_row();
@@ -1759,11 +1753,18 @@ impl EsMailApp {
             });
 
         if send_clicked {
-            match self.smtp_account() {
+            let from = self.compose.as_ref().and_then(|c| c.account_id.clone());
+            match from.as_deref().and_then(|id| self.smtp_account_for(id)) {
                 Some(account) => {
                     let compose = self.compose.clone().expect("just matched Some above");
+                    // Remembered so `Sent` saves the copy to this account's
+                    // Sent folder -- see `sending_from`.
+                    self.sending_from = from;
                     let _ = self.smtp_tx.try_send(smtp::SmtpCommand::Send { account, compose });
                     self.compose_status = "Sending…".to_string();
+                }
+                None if from.is_none() => {
+                    self.compose_status = "Choose an account to send from.".to_string();
                 }
                 None => {
                     self.compose_status =
@@ -1785,7 +1786,10 @@ impl EsMailApp {
 #[cfg(target_os = "windows")]
 impl EsMailApp {
     fn handle_tray(&mut self, ctx: &egui::Context) {
-        let Some(tray) = &self.tray else { return };
+        // The tooltip carries the unread total over all accounts.
+        let unread: u32 = self.accounts.iter().map(AccountView::total_unread).sum();
+        let Some(tray) = &mut self.tray else { return };
+        tray.set_unread(unread);
 
         for action in tray.poll_actions() {
             match action {
@@ -1830,7 +1834,7 @@ impl eframe::App for EsMailApp {
     /// tray-icon/menu clicks and the close-to-tray redirect both need to
     /// keep working after the main window is gone, so they live here rather
     /// than in `ui()`. New-mail polling and toast notifications do *not*
-    /// need to be here -- see `spawn_new_mail_watch`, a plain tokio task
+    /// need to be here -- see `session::AccountSession`, whose forwarder is a plain tokio task
     /// that runs independent of both `logic()` and `ui()`.
     #[cfg(target_os = "windows")]
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1885,30 +1889,44 @@ impl eframe::App for EsMailApp {
         self.handle_db_events();
         self.handle_smtp_events();
 
-        if self.is_connected {
+        // The main (folder pane + message list) view is shown as soon as
+        // there is any account at all -- the login form is no longer a gate
+        // -- unless the Add account form has been asked for.
+        let main_view = !self.accounts.is_empty() && !self.adding_account;
+
+        if main_view {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Download All (This Mailbox)").clicked() {
-                        let _ = self.imap_tx.try_send(ImapCommand::BulkDownload { mailbox: self.selected_mailbox.clone() });
+                    if ui.button("Add account…").clicked() {
+                        self.adding_account = true;
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Logout").clicked() {
-                        self.is_connected = false;
-                        self.headers.clear();
-                        self.selected_uid = None;
-                        self.selected_uids.clear();
-                        self.select_anchor = None;
-                        self.pending_mark_seen = None;
-                        self.mailbox_rows.clear();
-                        self.unread_counts.clear();
-                        self.status = "Logged out".to_string();
-                        self.web_view.load(WebViewSource::Html("<h1>Logged out</h1>".to_string()));
+                    if ui.button("Download All (This Mailbox)").clicked() {
+                        self.send_imap(ImapCommand::BulkDownload { mailbox: self.selected_mailbox.clone() });
+                        ui.close();
+                    }
+                    ui.separator();
+                    // Logs out of the *active* account only; every other
+                    // account stays connected and watched. Also stops this
+                    // account's IDLE watch (see `disconnect_account`).
+                    let active_label = self.active.as_deref().map(|id| self.account_label(id));
+                    let logout = match &active_label {
+                        Some(label) => format!("Logout {label}"),
+                        None => "Logout".to_string(),
+                    };
+                    if ui.add_enabled(self.active.is_some(), egui::Button::new(logout)).clicked() {
+                        if let Some(id) = self.active.clone() {
+                            self.disconnect_account(&id);
+                        }
                         ui.close();
                     }
                 });
                 if ui.button("New Message").clicked() {
-                    self.compose = Some(compose::ComposeState::default());
+                    self.compose = Some(compose::ComposeState {
+                        account_id: self.active_account_id(),
+                        ..Default::default()
+                    });
                     self.compose_status.clear();
                 }
             });
@@ -1919,7 +1937,7 @@ impl eframe::App for EsMailApp {
                 ui.heading("esMail");
                 ui.separator();
                 
-                if self.is_connected {
+                if main_view && self.active.is_some() {
                     ui.label("Search:");
                     // A fixed id (rather than the auto-generated one) so
                     // Ctrl+F (B8) can `request_focus` it from outside this
@@ -1927,28 +1945,43 @@ impl eframe::App for EsMailApp {
                     // available to re-add the same widget.
                     let search_resp = ui.add(egui::TextEdit::singleline(&mut self.search_query).id_salt("search_box").hint_text("Enter keywords..."));
                     self.search_box_id = Some(search_resp.id);
-                    if search_resp.changed() || (search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                    // Only worth offering once there is more than one account
+                    // to choose between.
+                    let scope_changed = self.accounts.len() > 1
+                        && ui.checkbox(&mut self.search_all_accounts, "All accounts").changed();
+                    if search_resp.changed() || scope_changed || (search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                         // `from:`/`to:`/`subject:`/`body:` and bare text all
                         // become an FTS5 MATCH expression; `since:`/`before:`/
                         // `is:unread`/`has:attachment` parse but aren't
                         // applied yet (see search_query.rs) — a query made
                         // only of those is treated the same as an empty one.
                         match ParsedQuery::parse(&self.search_query).to_fts_match() {
+                            // Scoped to the active account's selected mailbox, or
+                            // -- with "All accounts" -- every mailbox of every
+                            // account (the FTS index is keyed per account, so this
+                            // is one query).
                             Some(fts_query) => {
-                                let _ = self.db_tx.try_send(DbCommand::Search {
-                                    account_id: self.account_id(),
-                                    query: fts_query,
-                                    mailbox: Some(self.selected_mailbox.clone()),
-                                });
+                                let (account_id, mailbox) = if self.search_all_accounts {
+                                    (None, None)
+                                } else {
+                                    (self.active_account_id(), Some(self.selected_mailbox.clone()))
+                                };
+                                if self.search_all_accounts || account_id.is_some() {
+                                    let _ = self.db_tx.try_send(DbCommand::Search {
+                                        account_id,
+                                        query: fts_query,
+                                        mailbox,
+                                    });
+                                }
                             }
                             None => {
-                                self.search_results = None;
+                                self.clear_search();
                             }
                         }
                     }
                     if ui.button("Clear").clicked() {
                         self.search_query.clear();
-                        self.search_results = None;
+                        self.clear_search();
                     }
                     ui.separator();
                 }
@@ -1964,7 +1997,7 @@ impl eframe::App for EsMailApp {
                         self.apply_theme(ui.ctx(), next);
                     }
                     if ui.button("Settings").clicked() {
-                        self.open_settings();
+                        self.open_settings(settings::Tab::General);
                     }
                 });
             });
@@ -1991,25 +2024,31 @@ impl eframe::App for EsMailApp {
             });
         }
 
-        if self.is_connected {
+        if main_view && self.active.is_some() {
             self.handle_mark_seen_delay();
             self.handle_keyboard_shortcuts(ui);
         }
 
-        if !self.is_connected {
+        if !main_view {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.group(|ui| {
                         ui.set_width(300.0);
-                        ui.heading("Login");
+                        ui.heading(if self.accounts.is_empty() { "Login" } else { "Add account" });
 
                         if !self.config.accounts.is_empty() {
                             ui.label("Saved accounts:");
                             let mut to_remove = None;
                             for account in self.config.accounts.clone() {
                                 ui.horizontal(|ui| {
-                                    if ui.button(&account.display_name).clicked() {
-                                        self.select_account(&account);
+                                    let connected = self.view(&account.id).is_some();
+                                    let name = if connected {
+                                        format!("{} (connected)", account.display_name)
+                                    } else {
+                                        account.display_name.clone()
+                                    };
+                                    if ui.button(name).clicked() {
+                                        self.fill_form_from(&account);
                                     }
                                     if ui.small_button("x").on_hover_text("Forget this account").clicked() {
                                         to_remove = Some(account.id.clone());
@@ -2017,12 +2056,7 @@ impl eframe::App for EsMailApp {
                                 });
                             }
                             if let Some(id) = to_remove {
-                                secrets::delete_password(&id, "imap");
-                                secrets::delete_password(&id, "oauth");
-                                self.config.remove_account(&id);
-                                if let Err(e) = self.config.save() {
-                                    log::warn!("could not persist account removal: {e}");
-                                }
+                                self.remove_account(&id);
                             }
                             ui.separator();
                         }
@@ -2069,17 +2103,22 @@ impl eframe::App for EsMailApp {
                         ui.add(egui::TextEdit::singleline(&mut self.smtp_host).hint_text("SMTP Host"));
                         ui.add(egui::TextEdit::singleline(&mut self.smtp_port).hint_text("SMTP Port"));
 
-                        if self.oauth_task.is_some() {
+                        let form_id = self.account_from_form().id;
+                        if self.oauth_tasks.contains_key(&form_id) {
                             ui.label("Finish signing in with Google in your browser...");
-                            if ui.button("Cancel").clicked() {
-                                if let Some(task) = self.oauth_task.take() {
-                                    task.abort();
-                                }
-                                self.status = "Ready".to_string();
+                            if ui.button("Cancel sign-in").clicked() {
+                                self.cancel_google_sign_in(&form_id);
                             }
                         } else {
                             ui.horizontal(|ui| {
                                 if ui.button("Connect").clicked() {
+                                    // Starts a session for this account next
+                                    // to any already open: its own actor, IDLE
+                                    // watch and watermark (see session.rs).
+                                    // Connecting an id that is already open
+                                    // replaces its session, so a retry after a
+                                    // typo'd password cannot leak a second
+                                    // watcher.
                                     self.connect_clicked(ui.ctx());
                                 }
                                 if oauth_active
@@ -2088,7 +2127,13 @@ impl eframe::App for EsMailApp {
                                         .on_hover_text("Go through Google's consent page again, even if this account was approved before")
                                         .clicked()
                                 {
-                                    self.begin_google_sign_in(ui.ctx());
+                                    let account = self.account_from_form();
+                                    self.begin_google_sign_in(ui.ctx(), account);
+                                }
+                                // Only offered once there is a main view to go
+                                // back to.
+                                if !self.accounts.is_empty() && ui.button("Cancel").clicked() {
+                                    self.adding_account = false;
                                 }
                             });
                             if oauth_active {
@@ -2099,117 +2144,193 @@ impl eframe::App for EsMailApp {
                 });
             });
         } else {
-            // Mailbox tree (B8) as its own column, separate from the
-            // message-list column below -- previously both lived stacked in
-            // one narrow `left_panel`, which squeezed the tree into a
-            // `max_height(220.0)` scroll area regardless of how much vertical
-            // room the window actually had. As its own resizable panel, the
-            // tree gets the full column width and full available height.
+            // The folder pane, like Thunderbird's: each account is a
+            // top-level node with its own connection status and mailbox
+            // tree. It is its own column, separate from the message-list
+            // column below -- previously both lived stacked in one narrow
+            // `left_panel`, which squeezed the tree into a `max_height(220.0)`
+            // scroll area regardless of how much vertical room the window
+            // actually had. As its own resizable panel, the tree gets the
+            // full column width and full available height.
             egui::Panel::left("mailbox_panel").resizable(true).default_size(240.0).show(ui, |ui| {
-                ui.heading("Mailboxes");
+                // Deferred past the loop for the same reason as the message
+                // list below: acting on a click needs &mut self, which can't
+                // happen while the rows still borrow `self.accounts`.
+                let mut clicked_mailbox: Option<(AccountId, String)> = None;
+                // Same deferral for a fold toggle: it edits `self.config`, which
+                // the rows (borrowed from `self.accounts`) are alive across.
+                let mut toggled_folder: Option<(AccountId, String, bool)> = None;
+                let mut logout: Option<AccountId> = None;
+                let mut reconnect: Option<AccountId> = None;
+                let mut sign_in: Option<AccountId> = None;
+                ui.horizontal(|ui| {
+                    ui.heading("Accounts");
+                    if ui.small_button("+").on_hover_text("Add account").clicked() {
+                        self.adding_account = true;
+                    }
+                });
                 egui::ScrollArea::vertical().id_salt("mailboxes_scroll").show(ui, |ui| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                        // Deferred past the loop for the same reason as the
-                        // message list below: fetch_headers needs &mut self,
-                        // which can't happen while `row` still borrows
-                        // self.mailbox_rows.
-                        let mut clicked_mailbox = None;
-                        // Same deferral for a fold toggle: it edits
-                        // `self.config`, which `row` (borrowed from
-                        // `self.mailbox_rows`) is still alive across.
-                        let mut toggled_folder: Option<(String, bool)> = None;
-                        let account_id = self.account_id();
-                        let collapsed: std::collections::BTreeSet<String> = self
-                            .config
-                            .collapsed_folders
-                            .iter()
-                            .filter_map(|k| k.strip_prefix(&account_id)?.strip_prefix('\t'))
-                            .map(str::to_string)
-                            .collect();
-                        for index in imap::visible_rows(&self.mailbox_rows, &collapsed) {
-                            let row = &self.mailbox_rows[index];
-                            let is_collapsed = row.has_children && collapsed.contains(&row.key);
-                            // A folded node shows its whole subtree's unread
-                            // count, so mail in a hidden child is not lost.
-                            let subtree_unread = |own: Option<&String>| -> u32 {
-                                let own = own.and_then(|n| self.unread_counts.get(n)).copied().unwrap_or(0);
-                                let below: u32 = if is_collapsed {
-                                    imap::descendants(&self.mailbox_rows, index)
-                                        .iter()
-                                        .filter_map(|r| r.full_name.as_ref().and_then(|n| self.unread_counts.get(n)))
-                                        .sum()
-                                } else {
-                                    0
-                                };
-                                own + below
-                            };
-                            let mut indent = |ui: &mut egui::Ui| {
-                                ui.add_space(row.depth as f32 * 14.0);
-                                // The arrow is drawn, not a "▸"/"▾" character:
-                                // egui's bundled fonts have neither, and they
-                                // came out as a box.
-                                let icon_width = ui.spacing().icon_width;
-                                if row.has_children {
-                                    let (_, response) = ui.allocate_exact_size(egui::vec2(icon_width, icon_width), egui::Sense::click());
-                                    let openness = if is_collapsed { 0.0 } else { 1.0 };
-                                    egui::collapsing_header::paint_default_icon(ui, openness, &response);
-                                    let hint = if is_collapsed { "Expand" } else { "Collapse" };
-                                    if response.on_hover_text(hint).clicked() {
-                                        toggled_folder = Some((row.key.clone(), !is_collapsed));
-                                    }
-                                } else {
-                                    // Keeps leaf labels lined up with the
-                                    // labels of their siblings that have an
-                                    // arrow.
-                                    ui.add_space(icon_width + ui.spacing().item_spacing.x);
+                        for view in &self.accounts {
+                            let (dot, dot_color) = match &view.state {
+                                ConnState::Connected => ("\u{25cf}", egui::Color32::from_rgb(60, 160, 80)),
+                                ConnState::Connecting | ConnState::Disconnected => {
+                                    ("\u{25cf}", egui::Color32::from_rgb(210, 150, 30))
                                 }
+                                ConnState::Failed(_) => ("\u{25cf}", egui::Color32::from_rgb(180, 40, 40)),
                             };
-                            let Some(full_name) = &row.full_name else {
-                                // A hierarchy node with no mailbox of its own
-                                // (see MailboxNode::full_name's doc) -- shown
-                                // as a plain, unclickable label. Also covers
-                                // a real `LIST`ed name the server marked
-                                // `\Noselect` (e.g. Gmail's `[Gmail]`) --
-                                // `mailbox_tree` leaves `full_name` unset for
-                                // those too, since neither can be
-                                // `SELECT`/`EXAMINE`d.
-                                let unread = subtree_unread(None);
-                                ui.horizontal(|ui| {
-                                    indent(ui);
-                                    let label = if unread > 0 { format!("{}  ({unread})", row.label) } else { row.label.clone() };
-                                    ui.label(egui::RichText::new(label).weak());
-                                });
-                                continue;
-                            };
-                            let is_selected = self.selected_mailbox == *full_name;
-                            let unread = subtree_unread(Some(full_name));
-                            let label = if unread > 0 {
-                                format!("{}  ({unread})", row.label)
+                            let unread = view.total_unread();
+                            let title = if unread > 0 {
+                                format!("{}  ({unread})", view.label())
                             } else {
-                                row.label.clone()
+                                view.label().to_string()
                             };
-                            ui.horizontal(|ui| {
-                                indent(ui);
-                                if ui.add(egui::Button::selectable(is_selected, label)).clicked() {
-                                    clicked_mailbox = Some(full_name.clone());
-                                }
-                            });
-                        }
-                        if let Some((key, collapse)) = toggled_folder {
-                            if self.config.set_folder_collapsed(&account_id, &key, collapse) {
-                                self.save_config("folded mailbox folders");
-                            }
-                        }
-                        if let Some(mb) = clicked_mailbox {
-                            self.selected_mailbox = mb.clone();
-                            self.selected_uid = None;
-                            self.selected_uids.clear();
-                            self.select_anchor = None;
-                            self.current_page = 1;
-                            self.fetch_headers(mb, 1);
+                            let header = egui::RichText::new(title).strong();
+                            egui::CollapsingHeader::new(header)
+                                .id_salt(("account_node", view.id()))
+                                .default_open(true)
+                                .icon(move |ui, _openness, response| {
+                                    ui.painter().text(
+                                        response.rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        dot,
+                                        egui::FontId::proportional(12.0),
+                                        dot_color,
+                                    );
+                                })
+                                .show(ui, |ui| {
+                                    match &view.state {
+                                        ConnState::Connecting => {
+                                            ui.label(egui::RichText::new("Connecting…").weak());
+                                        }
+                                        ConnState::Failed(error) => {
+                                            ui.colored_label(egui::Color32::from_rgb(180, 40, 40), error);
+                                            let is_google = self
+                                                .config
+                                                .accounts
+                                                .iter()
+                                                .any(|a| a.id == view.id() && a.auth == config::AuthKind::GoogleOAuth);
+                                            if is_google {
+                                                if ui.button("Sign in again").clicked() {
+                                                    sign_in = Some(view.id().to_string());
+                                                }
+                                            } else if ui.button("Reconnect…").clicked() {
+                                                reconnect = Some(view.id().to_string());
+                                            }
+                                        }
+                                        ConnState::Disconnected => {
+                                            ui.label(egui::RichText::new("Reconnecting…").weak());
+                                        }
+                                        ConnState::Connected => {}
+                                    }
+                                    let account_id = view.id().to_string();
+                                    let collapsed: std::collections::BTreeSet<String> = self
+                                        .config
+                                        .collapsed_folders
+                                        .iter()
+                                        .filter_map(|k| k.strip_prefix(&account_id)?.strip_prefix('\t'))
+                                        .map(str::to_string)
+                                        .collect();
+                                    for index in imap::visible_rows(&view.mailbox_rows, &collapsed) {
+                                        let row = &view.mailbox_rows[index];
+                                        let is_collapsed = row.has_children && collapsed.contains(&row.key);
+                                        // A folded node shows its whole subtree's unread
+                                        // count, so mail in a hidden child is not lost.
+                                        let subtree_unread = |own: Option<&String>| -> u32 {
+                                            let own = own.and_then(|n| view.unread_counts.get(n)).copied().unwrap_or(0);
+                                            let below: u32 = if is_collapsed {
+                                                imap::descendants(&view.mailbox_rows, index)
+                                                    .iter()
+                                                    .filter_map(|r| r.full_name.as_ref().and_then(|n| view.unread_counts.get(n)))
+                                                    .sum()
+                                            } else {
+                                                0
+                                            };
+                                            own + below
+                                        };
+                                        let mut indent = |ui: &mut egui::Ui| {
+                                            ui.add_space(row.depth as f32 * 14.0);
+                                            // The arrow is drawn, not a "▸"/"▾" character:
+                                            // egui's bundled fonts have neither, and they
+                                            // came out as a box.
+                                            let icon_width = ui.spacing().icon_width;
+                                            if row.has_children {
+                                                let (_, response) = ui.allocate_exact_size(egui::vec2(icon_width, icon_width), egui::Sense::click());
+                                                let openness = if is_collapsed { 0.0 } else { 1.0 };
+                                                egui::collapsing_header::paint_default_icon(ui, openness, &response);
+                                                let hint = if is_collapsed { "Expand" } else { "Collapse" };
+                                                if response.on_hover_text(hint).clicked() {
+                                                    toggled_folder = Some((account_id.clone(), row.key.clone(), !is_collapsed));
+                                                }
+                                            } else {
+                                                // Keeps leaf labels lined up with the
+                                                // labels of their siblings that have an
+                                                // arrow.
+                                                ui.add_space(icon_width + ui.spacing().item_spacing.x);
+                                            }
+                                        };
+                                        let Some(full_name) = &row.full_name else {
+                                            // A hierarchy node with no mailbox of its own
+                                            // (see MailboxNode::full_name's doc) -- shown
+                                            // as a plain, unclickable label. Also covers
+                                            // a real `LIST`ed name the server marked
+                                            // `\Noselect` (e.g. Gmail's `[Gmail]`) --
+                                            // `mailbox_tree` leaves `full_name` unset for
+                                            // those too, since neither can be
+                                            // `SELECT`/`EXAMINE`d.
+                                            let unread = subtree_unread(None);
+                                            ui.horizontal(|ui| {
+                                                indent(ui);
+                                                let label = if unread > 0 { format!("{}  ({unread})", row.label) } else { row.label.clone() };
+                                                ui.label(egui::RichText::new(label).weak());
+                                            });
+                                            continue;
+                                        };
+                                        let is_selected = self.active.as_deref() == Some(view.id()) && self.selected_mailbox == *full_name;
+                                        let unread = subtree_unread(Some(full_name));
+                                        let label = if unread > 0 {
+                                            format!("{}  ({unread})", row.label)
+                                        } else {
+                                            row.label.clone()
+                                        };
+                                        ui.horizontal(|ui| {
+                                            indent(ui);
+                                            if ui.add(egui::Button::selectable(is_selected, label)).clicked() {
+                                                clicked_mailbox = Some((account_id.clone(), full_name.clone()));
+                                            }
+                                        });
+                                    }
+                                    if ui
+                                        .small_button("Log out")
+                                        .on_hover_text("Disconnect this account and stop watching it")
+                                        .clicked()
+                                    {
+                                        logout = Some(view.id().to_string());
+                                    }
+                                });
                         }
                     });
                 });
+                if let Some((account, key, collapse)) = toggled_folder {
+                    if self.config.set_folder_collapsed(&account, &key, collapse) {
+                        self.save_config("folded mailbox folders");
+                    }
+                }
+                if let Some((account, mb)) = clicked_mailbox {
+                    self.activate(&account, mb);
+                }
+                if let Some(id) = logout {
+                    self.disconnect_account(&id);
+                }
+                if let Some(id) = sign_in {
+                    self.sign_in_again(ui.ctx(), &id);
+                }
+                if let Some(id) = reconnect {
+                    if let Some(account) = self.config.accounts.iter().find(|a| a.id == id).cloned() {
+                        self.fill_form_from(&account);
+                    }
+                    self.adding_account = true;
+                }
             });
 
             // Message list, as its own column next to the mailbox tree.
@@ -2281,15 +2402,39 @@ impl eframe::App for EsMailApp {
                         // still alive across the loop.
                         let list = self.search_results.as_ref().unwrap_or(&self.headers);
                         let is_search = self.search_results.is_some();
-                        let mut clicked: Option<(u32, egui::Modifiers)> = None;
-                        for header in list {
-                            let is_selected = self.selected_uids.contains(&header.uid) || self.selected_uid == Some(header.uid);
+                        // Clicks are by index: across accounts a UID alone
+                        // does not identify a message.
+                        let mut clicked: Option<(usize, egui::Modifiers)> = None;
+                        // Hits from several accounts/mailboxes say where
+                        // each one lives.
+                        let show_origin = is_search && self.search_all_accounts;
+                        for (i, header) in list.iter().enumerate() {
+                            let in_open_context = !is_search || self.in_open_context(i);
+                            let is_selected = in_open_context
+                                && (self.selected_uids.contains(&header.uid) || self.selected_uid == Some(header.uid));
                             let resp = message_row(ui, header, is_selected);
+                            if show_origin {
+                                if let Some((account, mailbox)) = self.search_origins.get(i) {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("{} \u{b7} {mailbox}", self.account_label(account)))
+                                                .small()
+                                                .weak(),
+                                        )
+                                        .truncate(),
+                                    );
+                                }
+                            }
                             if resp.clicked() {
-                                clicked = Some((header.uid, ui.input(|i| i.modifiers)));
+                                clicked = Some((i, ui.input(|i| i.modifiers)));
                             }
                         }
-                        if let Some((uid, modifiers)) = clicked {
+                        if let Some((idx, modifiers)) = clicked {
+                            let uid = list[idx].uid;
+                            // A selection range only makes sense within one
+                            // mailbox; hits from several are opened one at
+                            // a time.
+                            let modifiers = if show_origin { egui::Modifiers::NONE } else { modifiers };
                             if modifiers.shift && self.select_anchor.is_some() {
                                 let anchor = self.select_anchor.expect("just checked is_some");
                                 self.selected_uids = select_range(list, anchor, uid);
@@ -2307,7 +2452,11 @@ impl eframe::App for EsMailApp {
                                 self.selected_uids.clear();
                                 self.select_anchor = Some(uid);
                             }
-                            self.open_message(uid, is_search);
+                            if is_search {
+                                self.open_search_hit(idx);
+                            } else {
+                                self.open_message(uid, false);
+                            }
                         }
                     });
                 });
@@ -2324,13 +2473,13 @@ impl eframe::App for EsMailApp {
             }
 
             egui::CentralPanel::default().show(ui, |ui| {
-                if let Some(uid) = self.selected_uid {
+                if self.selected_uid.is_some() {
                     // Cloned rather than borrowed: the Reply/Reply All/
                     // Forward buttons below need `&mut self.compose` while
                     // this is in scope, which can't coexist with a borrow of
                     // `self.headers` (the same reason the mailbox/message
                     // list loops elsewhere in this file defer their sends).
-                    if let Some(header) = self.headers.iter().find(|h| h.uid == uid).cloned() {
+                    if let Some(header) = self.selected_header() {
                         egui::Panel::top("mail_info").show(ui, |ui| {
                             egui::Grid::new("mail_info_grid").num_columns(2).show(ui, |ui| {
                                 ui.label(egui::RichText::new("From:").strong());
@@ -2351,19 +2500,25 @@ impl eframe::App for EsMailApp {
                             });
                             ui.horizontal(|ui| {
                                 if ui.button("Reply").clicked() {
-                                    self.compose = Some(compose::ComposeState::reply(&header, &self.current_message_html));
+                                    self.compose = Some(compose::ComposeState::reply(&header, &self.current_message_html).with_account(self.active_account_id()));
                                     self.compose_status.clear();
                                 }
                                 if ui.button("Reply All").clicked() {
-                                    self.compose = Some(compose::ComposeState::reply_all(
-                                        &header,
-                                        &self.current_message_html,
-                                        &self.username,
-                                    ));
+                                    // "Me" is the account that received the
+                                    // message, so Reply All drops that
+                                    // address from Cc.
+                                    self.compose = Some(
+                                        compose::ComposeState::reply_all(
+                                            &header,
+                                            &self.current_message_html,
+                                            &self.active_username(),
+                                        )
+                                        .with_account(self.active_account_id()),
+                                    );
                                     self.compose_status.clear();
                                 }
                                 if ui.button("Forward").clicked() {
-                                    self.compose = Some(compose::ComposeState::forward(&header, &self.current_message_html));
+                                    self.compose = Some(compose::ComposeState::forward(&header, &self.current_message_html).with_account(self.active_account_id()));
                                     self.compose_status.clear();
                                 }
                                 ui.separator();
@@ -2490,18 +2645,6 @@ impl eframe::App for EsMailApp {
     }
 }
 
-/// Mailbox `spawn_new_mail_watch` polls (B10). Hardcoded rather than
-/// following `selected_mailbox`: watching whatever mailbox happens to be
-/// selected would mean a background task's behavior silently changes based
-/// on what the user last clicked in the UI, and would poll nothing at all
-/// for a user who is reading a different folder. INBOX is the one mailbox
-/// every account has and the one "new mail" conventionally means; see
-/// PLAN.md §B10 for the fuller reasoning and what a per-mailbox version
-/// would need.
-const NEW_MAIL_POLL_MAILBOX: &str = "INBOX";
-/// How often `spawn_new_mail_watch` asks `ImapActor` to check
-/// [`NEW_MAIL_POLL_MAILBOX`] for new mail.
-const NEW_MAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Fallback for where a sent message is `APPEND`ed after sending (B7), used
 /// only when [`EsMailApp::special_use_mailbox`] finds no `\Sent`-classified
 /// mailbox (via real `LIST` attributes or the name-based fallback in
@@ -2522,130 +2665,53 @@ const ARCHIVE_MAILBOX: &str = "Archive";
 /// all read, short enough that actually reading one still marks it promptly.
 const MARK_SEEN_DELAY: std::time::Duration = std::time::Duration::from_millis(1200);
 
-/// Background watcher for B10 (new-mail notifications). Forwards every
-/// `ImapEvent` from `ImapActor` to the UI channel (bumping a repaint) --
-/// exactly what the bridging task this replaced did -- while additionally:
+/// Start a session for `account` and wrap it in the per-account UI state.
+/// `pending_persist` is `Some` for an account added through the form, which
+/// is only saved once its connection succeeds.
 ///
-/// - tracking whether the account is currently connected (from `Connected`/
-///   `Disconnected`, which pass through this same stream already),
-/// - asking for a [`ImapCommand::PollMailbox`] on [`NEW_MAIL_POLL_INTERVAL`]
-///   whenever connected, **and** immediately on every `idle_wake` push (IMAP
-///   `IDLE`, via `idle_watch` -- see its module doc) rather than waiting for
-///   the timer, so new mail shows up within about as long as the round trip
-///   takes instead of up to [`NEW_MAIL_POLL_INTERVAL`] later. The interval
-///   timer still runs unconditionally: it is what keeps working if `IDLE`
-///   isn't supported by the server, or `idle_watch`'s connection is
-///   mid-reconnect, so nothing regresses versus B10's original poll-only
-///   behavior -- `IDLE` only ever makes new mail show up *sooner*,
-/// - folding each [`ImapEvent::MailboxPolled`] into `notify::update_watermark`
-///   and, on a `NewMail` verdict, requesting the envelopes that describe it,
-/// - turning the resulting [`ImapEvent::NewHeaders`] into a toast via
-///   `notify::build_notification` + [`notify_new_mail`].
-///
-/// This is a plain tokio task, not anything driven by `EsMailApp::logic`/
-/// `ui`, so it keeps running -- and can keep showing toasts -- for as long
-/// as the process is alive, independent of whether the main window is
-/// visible. That's what "notifications work even with the window closed"
-/// means in practice here: the process (and this task) survives a window
-/// close because `tray.rs` turns that close into hide-to-tray instead of
-/// exit; nothing about *this* function knows or cares whether the window is
-/// visible.
-///
-/// The in-memory UID watermark this keeps is deliberately not `db.rs`'s
-/// `sync_decision`/cache -- see `notify.rs`'s module doc for why -- and is
-/// deliberately not a field on `EsMailApp`: keeping it as a local in this
-/// task's own async block means no other code can accidentally read or
-/// reset it, and it needs no `Send`/lock story since it never leaves this
-/// task.
-fn spawn_new_mail_watch(
-    mut actor_events: mpsc::Receiver<ImapEvent>,
-    ui_events: mpsc::Sender<ImapEvent>,
-    imap_tx: mpsc::Sender<ImapCommand>,
-    ctx: egui::Context,
-    mut idle_wake: mpsc::Receiver<idle_watch::MailboxChanged>,
-) {
-    tokio::spawn(async move {
-        let mut connected = false;
-        let mut watermark: Option<notify::MailWatermark> = None;
-        let mut poll_interval = tokio::time::interval(NEW_MAIL_POLL_INTERVAL);
-        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Disabled once `idle_wake` closes (which nothing currently does --
-        // `idle_watch::spawn`'s task loops forever -- but a channel that
-        // keeps returning `None` would otherwise busy-loop this `select!`)
-        // so the timer-only path keeps working even in that case.
-        let mut idle_wake_open = true;
-
-        loop {
-            tokio::select! {
-                evt = actor_events.recv() => {
-                    let Some(evt) = evt else { break };
-                    match &evt {
-                        ImapEvent::Connected => {
-                            connected = true;
-                            // A fresh connection (or reconnection) starts a
-                            // new baseline -- see `notify::update_watermark`'s
-                            // doc for why the first observation after one
-                            // must never itself be reported as "new mail".
-                            watermark = None;
-                        }
-                        ImapEvent::Disconnected => connected = false,
-                        ImapEvent::MailboxPolled { mailbox, state } if mailbox == NEW_MAIL_POLL_MAILBOX => {
-                            let (next, update) = notify::update_watermark(
-                                watermark,
-                                notify::MailWatermark {
-                                    uid_validity: state.uid_validity,
-                                    uid_next: state.uid_next,
-                                },
-                            );
-                            watermark = Some(next);
-                            if let notify::WatermarkUpdate::NewMail { first_new_uid, .. } = update {
-                                let _ = imap_tx.try_send(ImapCommand::FetchNewHeaders {
-                                    mailbox: NEW_MAIL_POLL_MAILBOX.to_string(),
-                                    first_uid: first_new_uid,
-                                });
-                            }
-                        }
-                        ImapEvent::NewHeaders { mailbox, headers } if mailbox == NEW_MAIL_POLL_MAILBOX => {
-                            if let Some((title, body)) = notify::build_notification(headers) {
-                                notify_new_mail(&title, &body);
-                            }
-                        }
-                        _ => {}
-                    }
-                    if ui_events.send(evt).await.is_err() {
-                        break; // EsMailApp is gone; nothing left to forward to.
-                    }
-                    ctx.request_repaint();
-                }
-                _ = poll_interval.tick(), if connected => {
-                    let _ = imap_tx.try_send(ImapCommand::PollMailbox {
-                        mailbox: NEW_MAIL_POLL_MAILBOX.to_string(),
-                    });
-                }
-                woke = idle_wake.recv(), if idle_wake_open => {
-                    match woke {
-                        Some(idle_watch::MailboxChanged) if connected => {
-                            let _ = imap_tx.try_send(ImapCommand::PollMailbox {
-                                mailbox: NEW_MAIL_POLL_MAILBOX.to_string(),
-                            });
-                        }
-                        Some(idle_watch::MailboxChanged) => {
-                            // A push arrived while `ImapActor`'s own session
-                            // is disconnected/reconnecting -- nothing to poll
-                            // with right now; the timer (once `connected`
-                            // again) or the next push will catch it.
-                        }
-                        None => idle_wake_open = false,
-                    }
-                }
-            }
-        }
-    });
+/// The session's new-mail watch (B10) runs as a plain tokio task, not
+/// anything driven by `EsMailApp::logic`/`ui`, so it keeps running -- and can
+/// keep showing toasts -- for as long as the process is alive, independent of
+/// whether the main window is visible. That's what "notifications work even
+/// with the window closed" means in practice: the process (and these tasks)
+/// survives a window close because `tray.rs` turns that close into
+/// hide-to-tray instead of exit.
+fn spawn_account_view(
+    account: &AccountConfig,
+    auth: auth::Auth,
+    pending_persist: Option<(AccountConfig, auth::Auth)>,
+    events: &mpsc::Sender<AccountEvent>,
+    hooks: &Hooks,
+) -> AccountView {
+    let session = AccountSession::spawn(
+        SessionParams {
+            id: account.id.clone(),
+            label: account.display_name.clone(),
+            host: account.imap_host.clone(),
+            port: account.imap_port,
+            username: account.username.clone(),
+            auth: auth.clone(),
+            watch_mailbox: account
+                .watch_mailbox
+                .clone()
+                .unwrap_or_else(|| session::DEFAULT_WATCH_MAILBOX.to_string()),
+        },
+        events.clone(),
+        hooks.clone(),
+    );
+    AccountView {
+        session,
+        state: ConnState::Connecting,
+        mailbox_rows: Vec::new(),
+        unread_counts: std::collections::HashMap::new(),
+        auth,
+        pending_persist,
+    }
 }
 
 /// Show a new-mail toast on Windows; elsewhere, just log it. B10 is
 /// Windows-only (see PLAN.md §B10) -- this is the one place that
-/// distinction is made, so `spawn_new_mail_watch` above doesn't need its own
+/// distinction is made, so `session.rs` doesn't need its own
 /// `#[cfg]`.
 fn notify_new_mail(title: &str, body: &str) {
     #[cfg(target_os = "windows")]

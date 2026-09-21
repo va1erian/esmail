@@ -60,6 +60,11 @@ pub struct AccountConfig {
     /// exactly the password case.
     #[serde(default)]
     pub auth: AuthKind,
+    /// Mailbox watched for new mail (IDLE + polling, toasts). `None` means
+    /// the default, `INBOX` -- see `session::DEFAULT_WATCH_MAILBOX`. Only
+    /// settable by editing `config.toml` for now.
+    #[serde(default)]
+    pub watch_mailbox: Option<String>,
 }
 
 impl AccountConfig {
@@ -80,6 +85,7 @@ impl AccountConfig {
             smtp_tls: TlsMode::Ssl,
             username,
             auth: AuthKind::Password,
+            watch_mailbox: None,
         }
     }
 }
@@ -344,8 +350,14 @@ impl Config {
     }
 
     /// Insert `account`, or replace the existing entry with the same `id`.
-    pub fn upsert_account(&mut self, account: AccountConfig) {
+    ///
+    /// A `watch_mailbox` set in `config.toml` by hand survives being
+    /// re-added through the login form, which has no field for it.
+    pub fn upsert_account(&mut self, mut account: AccountConfig) {
         if let Some(existing) = self.accounts.iter_mut().find(|a| a.id == account.id) {
+            if account.watch_mailbox.is_none() {
+                account.watch_mailbox = existing.watch_mailbox.take();
+            }
             *existing = account;
         } else {
             self.accounts.push(account);
@@ -388,6 +400,32 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upsert_keeps_a_hand_edited_watch_mailbox_and_an_old_config_still_parses() {
+        let mut config = Config::default();
+        let mut edited = AccountConfig::new("A".into(), "imap.example.com".into(), 993, "alice".into());
+        edited.watch_mailbox = Some("Work".into());
+        config.upsert_account(edited);
+        config.upsert_account(AccountConfig::new("A".into(), "imap.example.com".into(), 993, "alice".into()));
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].watch_mailbox.as_deref(), Some("Work"));
+
+        // A config.toml written before the field existed has no such key.
+        let old = "[[accounts]]
+id = \"a@h\"
+display_name = \"a\"
+imap_host = \"h\"
+imap_port = 993
+imap_tls = \"Ssl\"
+smtp_host = \"s\"
+smtp_port = 465
+smtp_tls = \"Ssl\"
+username = \"a\"
+";
+        let parsed: Config = toml::from_str(old).expect("old config parses");
+        assert_eq!(parsed.accounts[0].watch_mailbox, None);
+    }
 
     #[test]
     fn account_id_combines_username_and_host_so_two_accounts_on_one_host_differ() {

@@ -35,9 +35,22 @@ pub struct ComposeState {
     /// shorter thread than a client that tracked the whole chain would show.
     pub references: Option<String>,
     pub attachments: Vec<(String, Vec<u8>)>,
+    /// The account this message is sent from, and whose Sent folder gets the
+    /// copy: `AccountConfig::id`. `None` until the UI picks one -- it
+    /// defaults to the account of the message being replied to, else the
+    /// active one (see `main.rs`). Carrying it here rather than in a separate
+    /// app-level field keeps it with the message it belongs to, which is what
+    /// a compose-window-per-message design (#34) will need.
+    pub account_id: Option<String>,
 }
 
 impl ComposeState {
+    /// This message, sent from `account_id`.
+    pub fn with_account(mut self, account_id: Option<String>) -> Self {
+        self.account_id = account_id;
+        self
+    }
+
     /// Reply to just the sender.
     pub fn reply(original: &MailHeader, original_body_html: &str) -> Self {
         Self::from_original(original, original_body_html, String::new())
@@ -64,6 +77,7 @@ impl ComposeState {
             in_reply_to: non_empty(&original.message_id),
             references: non_empty(&original.message_id),
             attachments: Vec::new(),
+            account_id: None,
         }
     }
 
@@ -80,6 +94,7 @@ impl ComposeState {
             in_reply_to: None,
             references: None,
             attachments: Vec::new(),
+            account_id: None,
         }
     }
 }

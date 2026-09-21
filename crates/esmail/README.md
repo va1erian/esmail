@@ -28,6 +28,13 @@ accepting it (you revoked esmail, or it expired), Connect reports that and
 esmail sends the resulting access token with SASL `XOAUTH2` over IMAP, the
 IDLE connection and SMTP, and refreshes it automatically when it expires.
 
+**Several Google accounts** work side by side, and next to password accounts:
+the OAuth client below identifies esmail to Google and is shared, but every
+account signs in on its own and has its own refresh token in the keyring. All
+saved accounts connect at startup; one whose Google sign-in has lapsed shows
+**Sign in again** in the folder pane and under Settings > Accounts, without
+affecting the others.
+
 **You have to register your own OAuth client.** Google only issues tokens to
 registered applications, so esmail can't ship a working client id:
 
@@ -38,7 +45,7 @@ registered applications, so esmail can't ship a working client id:
    Note the client ID and client secret. (A desktop client's secret is not
    confidential; Google's token endpoint just requires it.)
 3. Give them to esmail by any one of:
-   - the **Settings** button in the top bar: paste the client ID and secret and
+   - **Settings > Google**: paste the client ID and secret and
      click Save (this writes the `config.toml` entry below);
    - environment variables `ESMAIL_GOOGLE_CLIENT_ID` and
      `ESMAIL_GOOGLE_CLIENT_SECRET` (these take precedence over saved settings;
@@ -81,3 +88,19 @@ Outlook, or Gmail without one, you still need an app password.
 Any IMAP/SMTP server that accepts a plain username+password login (most
 self-hosted and IMAP-friendly providers) works with your normal password, no
 app password needed.
+
+## Settings
+
+The **Settings** button in the top bar opens a window with three tabs:
+
+- **General**: the theme, a summary of connected accounts, and the keyboard
+  shortcuts.
+- **Accounts**: every saved account with its connection state, and Connect /
+  Disconnect / Sign in again. **Edit…** opens that account's own dialog:
+  display name, ports, SMTP host and security, the mailbox watched for new
+  mail, and how it signs in (a new password, or Google). **Remove account…**
+  there disconnects it and deletes its saved passwords and token. Username and
+  IMAP host are the account's identity and are not editable; add the account
+  again to change them.
+- **Google**: the OAuth client ID and secret.
+
