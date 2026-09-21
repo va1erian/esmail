@@ -107,7 +107,11 @@ fn address_of(from: &str) -> Option<String> {
         _ => from,
     };
     let addr = addr.trim();
-    (addr.contains('@')).then(|| addr.to_ascii_lowercase())
+    // Both halves must be there: `parse_envelope_header` writes `Name <@>` for
+    // an envelope address with no mailbox or host (group syntax, a malformed
+    // `From`), and "@" must never become something that can be trusted.
+    let (local, domain) = addr.split_once('@')?;
+    (!local.is_empty() && !domain.is_empty()).then(|| addr.to_ascii_lowercase())
 }
 
 /// The `Name` out of `"Name <user@host>"`, without any surrounding quotes;
@@ -1540,6 +1544,15 @@ mod tests {
     fn sender_address_is_none_without_an_address() {
         assert_eq!(header_from("").sender_address(), None);
         assert_eq!(header_from("Nobody").sender_address(), None);
+    }
+
+    #[test]
+    fn sender_address_is_none_when_the_local_part_or_domain_is_missing() {
+        // What `parse_envelope_header` produces for an envelope address with
+        // no mailbox/host.
+        for from in ["@", "Undisclosed <@>", "<@>", "alice@", "@example.com", "Name <@example.com>"] {
+            assert_eq!(header_from(from).sender_address(), None, "{from}");
+        }
     }
 
     #[test]
