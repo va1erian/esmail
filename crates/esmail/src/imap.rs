@@ -70,6 +70,31 @@ impl MailHeader {
     pub fn sender_name(&self) -> String {
         display_name_of(&self.from)
     }
+
+    /// The message's `Date` as `("YYYY-MM-DD", "HH:MM")` in the local time
+    /// zone, for the message list. `None` when the header is missing or not
+    /// a date `mailparse` can read.
+    ///
+    /// This is the `Date:` header the sender's client wrote (what the
+    /// `ENVELOPE` carries), not the server's `INTERNALDATE` -- the moment it
+    /// was actually received. The two are usually minutes apart.
+    pub fn local_date_time(&self) -> Option<(String, String)> {
+        format_date_time(&self.date, &chrono::Local)
+    }
+}
+
+/// [`MailHeader::local_date_time`] with the zone to render in as a parameter,
+/// so it can be tested without depending on the machine's own zone.
+fn format_date_time<Tz>(raw: &str, zone: &Tz) -> Option<(String, String)>
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    // `dateparse` is lenient: empty or garbage input comes back as `Ok(0)`,
+    // which would print as 1970-01-01 rather than as "no date".
+    let timestamp = mailparse::dateparse(raw).ok().filter(|&t| t > 0)?;
+    let when = chrono::DateTime::from_timestamp(timestamp, 0)?.with_timezone(zone);
+    Some((when.format("%Y-%m-%d").to_string(), when.format("%H:%M").to_string()))
 }
 
 /// The address out of a `parse_envelope_header`-style `"Name <user@host>"` /
@@ -1527,6 +1552,37 @@ mod tests {
     fn sender_name_falls_back_to_the_address() {
         assert_eq!(header_from("a@example.com").sender_name(), "a@example.com");
         assert_eq!(header_from(" <a@example.com>").sender_name(), "a@example.com");
+    }
+
+    // ── local_date_time ───────────────────────────────────────────────────────
+
+    fn utc() -> chrono::FixedOffset {
+        chrono::FixedOffset::east_opt(0).unwrap()
+    }
+
+    fn parts(raw: &str, zone: chrono::FixedOffset) -> Option<(String, String)> {
+        format_date_time(raw, &zone)
+    }
+
+    #[test]
+    fn date_time_is_formatted_as_year_month_day_and_hour_minute() {
+        let got = parts("Mon, 21 Sep 2026 09:05:33 +0000", utc());
+        assert_eq!(got, Some(("2026-09-21".to_string(), "09:05".to_string())));
+    }
+
+    #[test]
+    fn date_time_is_converted_from_the_senders_offset_to_the_target_zone() {
+        // 23:30 in UTC-5 is 04:30 the next day in UTC and 05:30 in UTC+1.
+        let raw = "Mon, 21 Sep 2026 23:30:00 -0500";
+        assert_eq!(parts(raw, utc()), Some(("2026-09-22".to_string(), "04:30".to_string())));
+        let paris = chrono::FixedOffset::east_opt(3600).unwrap();
+        assert_eq!(parts(raw, paris), Some(("2026-09-22".to_string(), "05:30".to_string())));
+    }
+
+    #[test]
+    fn date_time_is_none_for_a_missing_or_unreadable_date() {
+        assert_eq!(parts("", utc()), None);
+        assert_eq!(parts("last tuesday", utc()), None);
     }
 
     // ── flag_to_str ───────────────────────────────────────────────────────────

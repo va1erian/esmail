@@ -44,6 +44,8 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1", "to
 # Mail
 async-imap = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
 mailparse = "0.15"
+# Local-time formatting of message dates in the list (`MailHeader::local_date_time`).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # HTML sanitization for message bodies before they reach the webview (B5).
 ammonia = "4"
 # Parses the CSS of a message's `<style>` blocks so they can be filtered (css.rs).
