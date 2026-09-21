@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::oauth::TokenSource;
+use crate::config::{AccountConfig, AuthKind, Config};
+use crate::oauth::{self, TokenSource};
+use crate::secrets;
 
 /// Cheap to clone -- an OAuth source is shared, so every connection of one
 /// account (the actor's session, the body worker, IDLE, SMTP) reuses one
@@ -38,6 +40,24 @@ impl Auth {
         match self {
             Self::Password(password) => Ok(password.clone()),
             Self::OAuth(source) => source.access_token().await,
+        }
+    }
+}
+
+/// What a saved account signs in with, read from the OS keyring: its password,
+/// or a token source built from its Google refresh token. `Err` says what is
+/// missing, in words fit for a banner.
+pub fn saved_auth(config: &Config, account: &AccountConfig) -> Result<Auth, String> {
+    match account.auth {
+        AuthKind::Password => secrets::get_password(&account.id, "imap")
+            .map(Auth::Password)
+            .ok_or_else(|| "no saved password".to_string()),
+        AuthKind::GoogleOAuth => {
+            let client = oauth::google_client(config.google_oauth.as_ref())
+                .ok_or_else(|| "Google sign-in needs an OAuth client id (Settings > Google)".to_string())?;
+            let refresh_token = secrets::get_password(&account.id, "oauth")
+                .ok_or_else(|| "not signed in with Google yet (Settings > Accounts > Sign in)".to_string())?;
+            Ok(Auth::OAuth(TokenSource::from_refresh_token(client, refresh_token)))
         }
     }
 }
