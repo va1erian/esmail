@@ -104,3 +104,44 @@ The **Settings** button in the top bar opens a window with three tabs:
   again to change them.
 - **Google**: the OAuth client ID and secret.
 
+## Windows: installing, where things live, uninstalling
+
+**Installer.** Releases include `esmail-<version>-setup.exe` (built from
+`installer/esmail.iss` with Inno Setup, see `.github/workflows/build.yml`) as
+well as a portable zip. It installs per user, with no administrator prompt, to
+`%LOCALAPPDATA%\Programs\esMail`, and adds a Start-menu entry (and optionally a
+desktop shortcut) and an "Apps & features" entry. A portable copy behaves the
+same way at run time; it just has no shortcuts or uninstaller.
+
+**Where esmail keeps things.** (`paths.rs`)
+
+| What | Where |
+| --- | --- |
+| Settings and account list (`config.toml`) | `%APPDATA%\esmail\config` |
+| Mail cache (`mails.db`), notification icon | `%LOCALAPPDATA%\esmail\data` |
+| Passwords and OAuth refresh tokens | Windows Credential Manager (entries `<account>:imap`/`smtp`/`oauth.esmail`) |
+| Attachments opened with "Open" | `%TEMP%\esmail-attachments` (emptied at start-up) |
+| Toast notification name and icon | `HKCU\Software\Classes\AppUserModelId\io.github.va1erian.esmail` |
+
+`ESMAIL_CONFIG_DIR` and `ESMAIL_DATA_DIR` relocate the first two, which is
+handy for trying a build without touching your real profile.
+
+**Shell integration.** esmail is a GUI-subsystem program (no console window),
+has a real icon in the executable, window and tray (the tray glyph is drawn in
+white on a dark taskbar and follows the system theme), and shows toasts under
+its own name. Starting it while it is already running (for example from the
+Start menu while it sits in the tray) brings the existing window forward
+instead of starting a second copy.
+
+**Uninstalling.** The uninstaller asks whether to remove esmail's data as well
+(settings, cached mail, saved passwords). It does that by running
+`esmail.exe --purge-data`, which you can also run yourself. A silent uninstall
+keeps the data unless told otherwise:
+
+```
+unins000.exe /VERYSILENT /PURGE
+```
+
+To try the installer locally: `cargo build --release`, then
+`iscc /DAppVersion=0.0.0 installer\esmail.iss` (Inno Setup 6); the result is in
+`dist\`. That folder is git-ignored.

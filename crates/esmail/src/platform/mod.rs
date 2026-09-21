@@ -30,4 +30,4 @@ mod imp;
 #[path = "other.rs"]
 mod imp;
 
-pub use imp::{TrayAction, TrayState, set_toast_click_handler, show_new_mail_toast};
+pub use imp::{TrayAction, TrayState, set_toast_click_handler, show_new_mail_toast, use_own_notification_identity};

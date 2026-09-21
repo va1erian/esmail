@@ -1,4 +1,9 @@
-use esmail::{auth, compose, config, db, emoji, imap, oauth, render, screenshot, search_query, secrets, session, smtp};
+// A release build on Windows is a GUI program: without this, launching it from
+// the Start menu or Explorer opens a console window behind the app. Debug
+// builds keep the console so `cargo run` shows the log.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+use esmail::{auth, compose, config, db, emoji, icons, imap, oauth, paths, render, screenshot, search_query, secrets, session, shell, smtp, uninstall};
 mod accounts;
 mod settings;
 /// Tray icon + new-mail toasts (B10): the OS-specific side lives behind
@@ -378,6 +383,7 @@ impl EsMailApp {
         let (db_evt_tx, db_evt_rx) = mpsc::channel(32);
 
         let egui_ctx = cc.egui_ctx.clone();
+        let _ = UI_CONTEXT.set(egui_ctx.clone());
         // A click on a new-mail toast arrives on a thread of the OS's, so it is
         // only handed over here: the account id goes into a channel (drained in
         // `handle_tray`) and the window is asked to come forward and repaint.
@@ -1806,6 +1812,12 @@ impl EsMailApp {
 /// platform without a tray `self.tray` is `None` and this does nothing.
 impl EsMailApp {
     fn handle_tray(&mut self, ctx: &egui::Context) {
+        // A second launch of esMail asked this copy to come forward.
+        if SHOW_WINDOW_REQUESTED.swap(false, Ordering::Relaxed) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         // A clicked toast: open the account the mail arrived in, at the mailbox
         // being watched, so the new message is right there.
         while let Ok(account) = self.toast_click_rx.try_recv() {
@@ -1825,6 +1837,7 @@ impl EsMailApp {
         let unread: u32 = self.accounts.iter().map(AccountView::total_unread).sum();
         let Some(tray) = &mut self.tray else { return };
         tray.set_unread(unread);
+        tray.refresh_icon();
 
         for action in tray.poll_actions() {
             match action {
@@ -2768,7 +2781,7 @@ fn save_attachment(attachment: &render::Attachment) {
 /// cleaned up immediately, since the opened application may still be reading
 /// it after this call returns.
 fn open_attachment(attachment: &render::Attachment) -> std::io::Result<()> {
-    let dir = std::env::temp_dir().join("esmail-attachments");
+    let dir = paths::attachments_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(safe_attachment_filename(&attachment.filename));
     std::fs::write(&path, &attachment.data)?;
@@ -2991,8 +3004,61 @@ fn format_size(bytes: usize) -> String {
     }
 }
 
+/// Wakes the UI when a second launch asks the running copy to show itself
+/// (see [`shell::acquire_single_instance`]). Set once the app has a context.
+static UI_CONTEXT: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+/// Set by that same request; consumed by `handle_tray`.
+static SHOW_WINDOW_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Development runs that render one page and exit (`ESMAIL_PREVIEW`,
+/// `ESMAIL_SCREENSHOT`) are not "the" running mail client: they must not take
+/// the single-instance lock, register notifications, or start a tray icon.
+fn is_dev_run() -> bool {
+    std::env::var_os("ESMAIL_PREVIEW").is_some() || std::env::var_os("ESMAIL_SCREENSHOT").is_some()
+}
+
 #[tokio::main]
 async fn main() -> eframe::Result {
+    init_logging();
+
+    // `esmail --purge-data`: what the Windows uninstaller runs when the user
+    // chooses to remove their settings too. Deliberately ahead of the
+    // single-instance check -- it must work whatever else is happening.
+    if std::env::args().any(|arg| arg == "--purge-data") {
+        let problems = uninstall::purge_user_data();
+        for problem in &problems {
+            eprintln!("esmail: could not remove {problem}");
+        }
+        std::process::exit(if problems.is_empty() { 0 } else { 1 });
+    }
+
+    if !is_dev_run() {
+        // esMail lives in the tray: a second launch should raise the window
+        // that is already there, not start a competing process.
+        let first = match shell::acquire_single_instance() {
+            shell::Instance::First(first) => first,
+            shell::Instance::AlreadyRunning => return Ok(()),
+        };
+        first.on_show_requested(|| {
+            SHOW_WINDOW_REQUESTED.store(true, Ordering::Relaxed);
+            if let Some(ctx) = UI_CONTEXT.get() {
+                ctx.request_repaint();
+            }
+        });
+
+        shell::set_process_identity();
+        let registered = match shell::register_notification_identity() {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("could not register esMail's notification identity: {e}");
+                false
+            }
+        };
+        platform::use_own_notification_identity(registered);
+
+        paths::clean_attachments_dir();
+    }
+
     // Window-geometry persistence (B9): the saved size/position has to be
     // known before the window is created at all, so this reads config.toml
     // a second time here (`EsMailApp::new` also loads it, for the account
@@ -3001,6 +3067,9 @@ async fn main() -> eframe::Result {
     // startup is a small price for keeping `EsMailApp::new`'s signature
     // (`&eframe::CreationContext`, same as every other eframe app) untouched.
     let mut viewport = egui::ViewportBuilder::default().with_inner_size([1280.0, 720.0]);
+    if let Some(icon) = icons::window_icon() {
+        viewport = viewport.with_icon(egui::IconData { rgba: icon.pixels, width: icon.width, height: icon.height });
+    }
     if let Some(geometry) = config::Config::load().window {
         viewport = viewport
             .with_inner_size([geometry.width, geometry.height])

@@ -106,6 +106,13 @@ ureq = "3"
 sha2 = "0.10"
 getrandom = "0.3"
 serde_json = "1"
+# Windows shell integration (`shell.rs`): single-instance lock, AppUserModelID,
+# the notification registration under HKCU, the taskbar theme. Thin raw
+# bindings, already in the tree several times over via winit and friends.
+# Windows-only, see crates/esmail/Cargo.toml.
+windows-sys = "0.61"
+# Embeds the application icon and version info in `esmail.exe` (`build.rs`).
+winresource = "0.1"
 
 [profile.release]
 opt-level = "z"     # Optimize for size

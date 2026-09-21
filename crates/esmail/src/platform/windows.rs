@@ -10,7 +10,9 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -20,13 +22,19 @@ use windows::UI::Notifications::{ToastActivatedEventArgs, ToastNotification, Toa
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
 use windows::core::{HSTRING, IInspectable, Interface};
 
+use crate::{icons, shell};
+
 /// Owns the tray icon and its menu for the lifetime of the app. Dropping
 /// this removes the icon from the tray, so it's held in `EsMailApp` for as
 /// long as the process runs.
 pub struct TrayState {
     // Never read directly again after construction, but must stay alive:
     // dropping a `TrayIcon` removes it from the shell's notification area.
-    _tray_icon: TrayIcon,
+    tray_icon: TrayIcon,
+    /// Whether the icon shown is the light-glyph variant (for a dark taskbar),
+    /// and when the system theme was last looked at; see `refresh_icon`.
+    light_glyph: bool,
+    theme_checked: Instant,
     show_id: MenuId,
     quit_id: MenuId,
     /// Last unread total put in the tooltip; see `set_unread`.
@@ -53,6 +61,7 @@ impl TrayState {
     /// behaving normally, rather than stranding the user with a hidden
     /// window and no way to bring it back.
     pub fn new() -> anyhow::Result<Self> {
+        let light_glyph = shell::taskbar_is_dark();
         let menu = Menu::new();
         let show_item = MenuItem::new("Show esMail", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
@@ -64,10 +73,33 @@ impl TrayState {
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("esMail")
-            .with_icon(placeholder_icon()?)
+            .with_icon(themed_icon(light_glyph)?)
             .build()?;
 
-        Ok(Self { _tray_icon: tray_icon, show_id, quit_id, unread: None })
+        Ok(Self { tray_icon, light_glyph, theme_checked: Instant::now(), show_id, quit_id, unread: None })
+    }
+
+    /// Swap the icon if the taskbar went from light to dark (or back) since it
+    /// was drawn. Looks at the system setting at most every couple of seconds,
+    /// so it is fine to call every frame.
+    pub fn refresh_icon(&mut self) {
+        const CHECK_EVERY: Duration = Duration::from_secs(2);
+        if self.theme_checked.elapsed() < CHECK_EVERY {
+            return;
+        }
+        self.theme_checked = Instant::now();
+        let light_glyph = shell::taskbar_is_dark();
+        if light_glyph == self.light_glyph {
+            return;
+        }
+        match themed_icon(light_glyph) {
+            Ok(icon) => {
+                if self.tray_icon.set_icon(Some(icon)).is_ok() {
+                    self.light_glyph = light_glyph;
+                }
+            }
+            Err(e) => log::warn!("could not redraw the tray icon: {e}"),
+        }
     }
 
     /// Show the unread total (summed over every account by the caller) in the
@@ -79,7 +111,7 @@ impl TrayState {
         }
         self.unread = Some(total);
         let tooltip = if total == 0 { "esMail".to_string() } else { format!("esMail \u{2014} {total} unread") };
-        if let Err(e) = self._tray_icon.set_tooltip(Some(tooltip)) {
+        if let Err(e) = self.tray_icon.set_tooltip(Some(tooltip)) {
             log::warn!("could not update the tray tooltip: {e}");
         }
     }
@@ -119,31 +151,33 @@ impl TrayState {
     }
 }
 
-/// A plain solid-colour 16x16 icon, generated at run time rather than
-/// shipped as a separate asset file. esMail has no branding yet, and a
-/// baked-in pixel buffer keeps the tray icon self-contained in source
-/// instead of adding a binary asset nothing else in the build would use.
-fn placeholder_icon() -> anyhow::Result<Icon> {
-    const SIZE: u32 = 16;
-    const RGBA: [u8; 4] = [0x2b, 0x6c, 0xb0, 0xff]; // opaque, unremarkable blue
-    let pixels: Vec<u8> = RGBA
-        .iter()
-        .copied()
-        .cycle()
-        .take((SIZE * SIZE * 4) as usize)
-        .collect();
-    Icon::from_rgba(pixels, SIZE, SIZE).map_err(|e| anyhow::anyhow!("tray icon: {e}"))
+/// The tray artwork (see `icons.rs`) at the size this display's tray wants, in
+/// the glyph colour that shows up on the current taskbar.
+fn themed_icon(light_glyph: bool) -> anyhow::Result<Icon> {
+    let art = icons::tray_icon(shell::small_icon_px(), light_glyph)
+        .ok_or_else(|| anyhow::anyhow!("the embedded tray icon does not decode"))?;
+    Icon::from_rgba(art.pixels, art.width, art.height).map_err(|e| anyhow::anyhow!("tray icon: {e}"))
 }
 
-/// The AppUserModelID toast notifications are shown under. esMail has no
-/// installer and therefore no Start-menu shortcut to register a real one
-/// against, so this borrows Windows PowerShell's, the same workaround
-/// `winrt-notification` documented for exactly this case. The toast still
-/// shows; Windows just attributes it to "Windows PowerShell" (wrong icon,
-/// wrong name in Focus Assist settings) until esMail ships an installer that
-/// registers a real AUMID + shortcut. Called out as a known limitation in
-/// PLAN.md §B10, not silently accepted.
-const APP_ID: &str = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe";
+/// Windows PowerShell's AppUserModelID, which Windows always knows. Toasts
+/// shown under it are attributed to "Windows PowerShell"; it is only the
+/// fallback for when esMail's own identity could not be registered.
+const FALLBACK_APP_ID: &str = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe";
+
+/// Set once `shell::register_notification_identity` has succeeded. Windows
+/// shows nothing at all for a toast whose AppUserModelID it has never heard
+/// of, so until then (or if registering failed) toasts use [`FALLBACK_APP_ID`].
+static OWN_IDENTITY_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Record whether registering esMail's own notification identity worked; if it
+/// did, toasts are attributed to "esMail" with its icon.
+pub fn use_own_notification_identity(registered: bool) {
+    OWN_IDENTITY_REGISTERED.store(registered, Ordering::Relaxed);
+}
+
+fn app_id() -> &'static str {
+    if OWN_IDENTITY_REGISTERED.load(Ordering::Relaxed) { shell::APP_USER_MODEL_ID } else { FALLBACK_APP_ID }
+}
 
 /// How many shown toasts to keep referenced. A toast's `Activated` handler is
 /// tied to the `ToastNotification` object; keeping the recent ones alive means
@@ -221,7 +255,7 @@ fn try_show_new_mail_toast(account_id: &str, title: &str, body: &str) -> windows
         Ok(())
     }))?;
 
-    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?.Show(&toast)?;
+    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(app_id()))?.Show(&toast)?;
 
     if let Ok(mut shown) = SHOWN_TOASTS.lock() {
         shown.push_back(toast);

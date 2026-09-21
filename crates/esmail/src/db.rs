@@ -137,10 +137,10 @@ impl DbActor {
         event_tx: mpsc::Sender<DbEvent>,
     ) {
         tokio::task::spawn_blocking(move || {
-            let conn = match Connection::open("mails.db") {
+            let conn = match open_cache() {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    let _ = event_tx.blocking_send(DbEvent::Error(e));
                     return;
                 }
             };
@@ -221,6 +221,19 @@ impl DbActor {
             }
         }
     }
+}
+
+/// Open the cache in the per-user data directory (see [`crate::paths`]),
+/// creating the directory on first run. It used to be `mails.db` in the
+/// working directory, which scattered a cache next to whatever folder the app
+/// happened to be launched from (the Start menu launches it from
+/// `System32`, where it cannot even write).
+fn open_cache() -> Result<Connection, String> {
+    let path = crate::paths::db_file().ok_or("no per-user data directory is available")?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    }
+    Connection::open(&path).map_err(|e| format!("could not open {}: {e}", path.display()))
 }
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
