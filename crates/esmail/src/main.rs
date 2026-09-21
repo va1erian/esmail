@@ -2414,7 +2414,7 @@ impl eframe::App for EsMailApp {
                                 if let Some(sender) = self.current_sender.clone() {
                                     if ui
                                         .button(format!("Always load from {sender}"))
-                                        .on_hover_text("Load remote images automatically for every message from this address")
+                                        .on_hover_text("Load remote images automatically for every message that says it is from this address (the From header is not authenticated)")
                                         .clicked()
                                     {
                                         self.set_image_sender_trusted(&sender, true);
@@ -2788,7 +2788,18 @@ fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::
 
     let height = PAD_Y * 2.0 + sender_galley.size().y + LINE_GAP + subject_galley.size().y;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
-    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, format!("{sender}: {subject}")));
+    // What a screen reader announces. Unread and starred are otherwise only
+    // conveyed by colour and an icon (they used to be a "●"/"★" in the button
+    // text), so they are spelled out here.
+    response.widget_info(|| {
+        let state = match (unread, header.is_flagged()) {
+            (true, true) => "Unread, starred. ",
+            (true, false) => "Unread. ",
+            (false, true) => "Starred. ",
+            (false, false) => "",
+        };
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, format!("{state}{sender}: {subject}. {}", header.date))
+    });
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
