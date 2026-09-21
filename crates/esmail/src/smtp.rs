@@ -19,11 +19,12 @@
 //! fallback). There is still no draft autosave (`APPEND` with `\Draft`).
 
 use lettre::message::{Attachment, Message, MultiPart, SinglePart, header::ContentType};
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use tokio::sync::mpsc;
 
+use crate::auth::Auth;
 use crate::compose::ComposeState;
 use crate::config::TlsMode;
 
@@ -33,7 +34,7 @@ pub struct SmtpAccount {
     pub port: u16,
     pub tls: TlsMode,
     pub username: String,
-    pub password: SecretString,
+    pub auth: Auth,
     /// `"Display Name <address@host>"` (or just the bare address) — this
     /// account's own address, used as the `From`.
     pub from_address: String,
@@ -85,14 +86,18 @@ impl SmtpActor {
     async fn send(account: &SmtpAccount, compose: &ComposeState) -> anyhow::Result<Vec<u8>> {
         let message = build_message(account, compose)?;
         let raw = message.formatted();
-        let transport = build_transport(account)?;
+        let transport = build_transport(account).await?;
         transport.send(message).await?;
         Ok(raw)
     }
 }
 
-fn build_transport(account: &SmtpAccount) -> anyhow::Result<AsyncSmtpTransport<Tokio1Executor>> {
-    let credentials = Credentials::new(account.username.clone(), account.password.expose_secret().to_string());
+/// `async` because an OAuth account may have to refresh its access token
+/// first. The transport is built per send, so the token it carries is never
+/// older than the send that uses it.
+async fn build_transport(account: &SmtpAccount) -> anyhow::Result<AsyncSmtpTransport<Tokio1Executor>> {
+    let secret = account.auth.secret().await?;
+    let credentials = Credentials::new(account.username.clone(), secret.expose_secret().to_string());
     let builder = match account.tls {
         TlsMode::Ssl => AsyncSmtpTransport::<Tokio1Executor>::relay(&account.host)?,
         TlsMode::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&account.host)?,
@@ -100,7 +105,11 @@ fn build_transport(account: &SmtpAccount) -> anyhow::Result<AsyncSmtpTransport<T
         // TlsMode::None case in config.rs's doc comment.
         TlsMode::None => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&account.host),
     };
-    Ok(builder.port(account.port).credentials(credentials).build())
+    let builder = builder.port(account.port).credentials(credentials);
+    // lettre otherwise picks from what the server advertises, in its own
+    // order; an OAuth account must use XOAUTH2 (its "password" is a token).
+    let builder = if account.auth.is_oauth() { builder.authentication(vec![Mechanism::Xoauth2]) } else { builder };
+    Ok(builder.build())
 }
 
 fn build_message(account: &SmtpAccount, compose: &ComposeState) -> anyhow::Result<Message> {
@@ -204,7 +213,7 @@ mod tests {
             port: 465,
             tls: TlsMode::Ssl,
             username: "alice@example.com".to_string(),
-            password: SecretString::from("hunter2"),
+            auth: Auth::password("hunter2"),
             from_address: "Alice <alice@example.com>".to_string(),
         };
         let compose = ComposeState {
@@ -226,7 +235,7 @@ mod tests {
             port: 465,
             tls: TlsMode::Ssl,
             username: "alice@example.com".to_string(),
-            password: SecretString::from("hunter2"),
+            auth: Auth::password("hunter2"),
             from_address: "alice@example.com".to_string(),
         };
         let compose = ComposeState {
@@ -250,7 +259,7 @@ mod tests {
             port: 465,
             tls: TlsMode::Ssl,
             username: "alice@example.com".to_string(),
-            password: SecretString::from("hunter2"),
+            auth: Auth::password("hunter2"),
             from_address: "alice@example.com".to_string(),
         };
         let compose = ComposeState {
@@ -269,7 +278,7 @@ mod tests {
             port: 465,
             tls: TlsMode::Ssl,
             username: "alice@example.com".to_string(),
-            password: SecretString::from("hunter2"),
+            auth: Auth::password("hunter2"),
             from_address: "alice@example.com".to_string(),
         };
         let compose = ComposeState {

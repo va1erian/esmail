@@ -18,7 +18,7 @@ use esmail::compose::ComposeState;
 use esmail::idle_watch;
 use esmail::imap::{ImapActor, ImapCommand, ImapEvent};
 use esmail::smtp::{SmtpAccount, SmtpActor, SmtpCommand, SmtpEvent};
-use secrecy::SecretString;
+use esmail::auth::Auth;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -68,7 +68,7 @@ async fn start_harness(inbox_count: u32) -> Harness {
             host: "localhost".to_string(),
             port: server.imap_addr.port(),
             username: TEST_USER.to_string(),
-            password: SecretString::from(TEST_PASSWORD),
+            auth: Auth::password(TEST_PASSWORD),
         })
         .await
         .unwrap();
@@ -514,7 +514,7 @@ async fn send_via_smtp_then_see_it_over_imap() {
         port: h.server.smtp_addr.port(),
         tls: esmail::config::TlsMode::None,
         username: TEST_USER.to_string(),
-        password: SecretString::from(TEST_PASSWORD),
+        auth: Auth::password(TEST_PASSWORD),
         from_address: TEST_USER.to_string(),
     };
     let compose = ComposeState {
@@ -560,7 +560,7 @@ async fn append_saves_a_sent_copy_that_fetch_headers_can_then_see() {
         port: h.server.smtp_addr.port(),
         tls: esmail::config::TlsMode::None,
         username: TEST_USER.to_string(),
-        password: SecretString::from(TEST_PASSWORD),
+        auth: Auth::password(TEST_PASSWORD),
         from_address: TEST_USER.to_string(),
     };
     let compose = ComposeState {
@@ -645,7 +645,7 @@ async fn idle_push_notifies_of_new_mail_without_polling() {
         "localhost".to_string(),
         h.server.imap_addr.port(),
         TEST_USER.to_string(),
-        SecretString::from(TEST_PASSWORD),
+        Auth::password(TEST_PASSWORD),
         "INBOX".to_string(),
         wake_tx,
     );
@@ -766,7 +766,7 @@ mod stress {
                     port: smtp_addr.port(),
                     tls: esmail::config::TlsMode::None,
                     username: TEST_USER.to_string(),
-                    password: SecretString::from(TEST_PASSWORD),
+                    auth: Auth::password(TEST_PASSWORD),
                     from_address: TEST_USER.to_string(),
                 };
                 let compose = ComposeState {
@@ -803,7 +803,7 @@ mod stress {
                 host: "localhost".to_string(),
                 port: h.server.imap_addr.port(),
                 username: TEST_USER.to_string(),
-                password: SecretString::from(TEST_PASSWORD),
+                auth: Auth::password(TEST_PASSWORD),
             })
             .await
             .unwrap();

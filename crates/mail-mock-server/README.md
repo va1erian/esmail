@@ -19,7 +19,8 @@ reliably across CI images. Rolling a small server here means:
   `certs/regen.sh`), so trusting it is one well-understood step: install
   `ca.crt` as an extra trusted root.
 - We only need to implement the exact slice of IMAP4rev1 esmail's client
-  actually sends (`LOGIN`, `LIST`, `EXAMINE`, `FETCH (UID ENVELOPE)`,
+  actually sends (`LOGIN`, `AUTHENTICATE XOAUTH2` and SMTP `AUTH XOAUTH2`
+  against per-user tokens from `Store::add_oauth_token`, `LIST`, `EXAMINE`, `FETCH (UID ENVELOPE)`,
   `UID FETCH ... RFC822`, `LOGOUT`) and verified, response-by-response,
   against the vendored `imap-proto`/`async-imap` grammar rather than hoping
   a full third-party server's edge cases line up.

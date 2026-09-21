@@ -17,6 +17,27 @@ pub enum TlsMode {
     None,
 }
 
+/// How an account signs in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthKind {
+    /// Username + password (or an app password), sent with `LOGIN`/`AUTH PLAIN`.
+    #[default]
+    Password,
+    /// "Sign in with Google": OAuth2 through the system browser, presented as
+    /// SASL `XOAUTH2`. No password of any kind; the keyring holds a refresh
+    /// token instead (see [`crate::oauth`]).
+    GoogleOAuth,
+}
+
+/// A Google OAuth client to sign in with — see [`crate::oauth::google_client`]
+/// for what it is and the other places it can come from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OAuthClientConfig {
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+}
+
 /// One configured mail account. Passwords are looked up separately, from the
 /// OS keyring, keyed by `(id, "imap" | "smtp")` — see [`crate::secrets`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -34,6 +55,10 @@ pub struct AccountConfig {
     pub smtp_tls: TlsMode,
     /// Used for both IMAP and SMTP auth.
     pub username: String,
+    /// Absent in a `config.toml` written before OAuth2 existed, which is
+    /// exactly the password case.
+    #[serde(default)]
+    pub auth: AuthKind,
 }
 
 impl AccountConfig {
@@ -53,6 +78,7 @@ impl AccountConfig {
             smtp_port: 465,
             smtp_tls: TlsMode::Ssl,
             username,
+            auth: AuthKind::Password,
         }
     }
 }
@@ -79,9 +105,10 @@ pub struct ProviderSettings {
 /// is a convenience for the common case, not an attempt at the exhaustive
 /// provider databases Thunderbird/Outlook ship; anything not listed here
 /// falls back to [`derive_smtp_host`]'s mechanical guess once the user types
-/// an IMAP host directly. OAuth2 is out of scope for v1 (see README), so
-/// Gmail and Outlook accounts still need an app password even though their
-/// connection settings are guessed correctly here.
+/// an IMAP host directly. Signing in is a separate matter: Gmail can use
+/// OAuth2 ([`AuthKind::GoogleOAuth`], see [`crate::oauth`]), but Outlook
+/// accounts still need an app password even though their connection settings
+/// are guessed correctly here.
 const PROVIDERS: &[(&str, ProviderSettings)] = &[
     (
         "gmail.com",
@@ -216,6 +243,10 @@ pub struct Config {
     /// run uses eframe's own built-in default size instead of forcing one.
     #[serde(default)]
     pub window: Option<WindowGeometry>,
+    /// The Google OAuth client to use for "Sign in with Google" (an
+    /// environment variable, or a build-time one, can supply it instead).
+    #[serde(default)]
+    pub google_oauth: Option<OAuthClientConfig>,
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -440,6 +471,7 @@ mod tests {
             accounts: vec![],
             theme: ThemeMode::Dark,
             window: Some(WindowGeometry { x: 10.0, y: 20.0, width: 800.0, height: 600.0 }),
+            google_oauth: None,
         };
         let toml = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml).unwrap();
@@ -456,6 +488,50 @@ mod tests {
         let parsed: Config = toml::from_str(toml).unwrap();
         assert_eq!(parsed.theme, ThemeMode::System);
         assert_eq!(parsed.window, None);
+    }
+
+    // ── auth kind / OAuth client ─────────────────────────────────────────────
+
+    /// An account saved before OAuth2 existed has no `auth` key; it must load
+    /// as a password account, not fail the whole file (which `Config::load`
+    /// would turn into "no accounts").
+    #[test]
+    fn account_without_an_auth_key_is_a_password_account() {
+        let toml = r#"
+            [[accounts]]
+            id = "alice@imap.example.com"
+            display_name = "alice"
+            imap_host = "imap.example.com"
+            imap_port = 993
+            imap_tls = "Ssl"
+            smtp_host = "smtp.example.com"
+            smtp_port = 465
+            smtp_tls = "Ssl"
+            username = "alice"
+        "#;
+        let parsed: Config = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.accounts[0].auth, AuthKind::Password);
+        assert_eq!(parsed.google_oauth, None);
+    }
+
+    #[test]
+    fn oauth_account_and_client_round_trip_through_toml() {
+        let mut account = AccountConfig::new("Me".into(), "imap.gmail.com".into(), 993, "me@gmail.com".into());
+        account.auth = AuthKind::GoogleOAuth;
+        let config = Config {
+            accounts: vec![account],
+            google_oauth: Some(OAuthClientConfig { client_id: "id".into(), client_secret: Some("secret".into()) }),
+            ..Config::default()
+        };
+        let toml = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn oauth_client_secret_is_optional() {
+        let parsed: Config = toml::from_str("[google_oauth]\nclient_id = \"id\"\n").unwrap();
+        assert_eq!(parsed.google_oauth, Some(OAuthClientConfig { client_id: "id".into(), client_secret: None }));
     }
 
     // ── provider_for_email ──────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 //! A minimal IMAP4rev1 server -- just enough of the protocol for esmail's
-//! `imap.rs` to drive: `LOGIN`, `LIST`, `EXAMINE`, `FETCH (UID ENVELOPE)`,
+//! `imap.rs` to drive: `LOGIN`, `AUTHENTICATE XOAUTH2`, `LIST`, `EXAMINE`, `FETCH (UID ENVELOPE)`,
 //! `UID FETCH <n|n:m|n:*> (RFC822 | (UID ENVELOPE))`, `APPEND`, `IDLE`,
 //! `LOGOUT`. Nothing else esmail sends is implemented.
 //!
@@ -30,6 +30,7 @@
 //! verified against the vendored `imap-proto-0.16.7` grammar
 //! (`parser/core.rs::literal`).
 
+use base64::Engine as _;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_native_tls::TlsAcceptor;
@@ -174,6 +175,47 @@ where
                     write_half.write_all(format!("{tag} OK LOGIN completed\r\n").as_bytes()).await?;
                 } else {
                     write_half.write_all(format!("{tag} NO LOGIN failed\r\n").as_bytes()).await?;
+                }
+            }
+            "AUTHENTICATE" => {
+                // Only XOAUTH2, the one mechanism esmail's OAuth sign-in uses.
+                if !tokens.get(2).is_some_and(|m| m.eq_ignore_ascii_case("XOAUTH2")) {
+                    write_half.write_all(format!("{tag} NO unsupported authentication mechanism\r\n").as_bytes()).await?;
+                    continue;
+                }
+                // The initial response may ride on the command line, or
+                // follow an empty `+` continuation (what `async_imap` does).
+                let initial = match tokens.get(3) {
+                    Some(inline) => inline.clone(),
+                    None => {
+                        write_half.write_all(b"+ \r\n").await?;
+                        let mut response = String::new();
+                        if reader.read_line(&mut response).await? == 0 {
+                            return Ok(());
+                        }
+                        response.trim_end_matches(['\r', '\n']).to_string()
+                    }
+                };
+                let user = base64::engine::general_purpose::STANDARD
+                    .decode(initial.as_bytes())
+                    .ok()
+                    .and_then(|payload| store.lock().unwrap().check_xoauth2(&payload));
+                match user {
+                    Some(user) => {
+                        authenticated_user = Some(user);
+                        write_half.write_all(format!("{tag} OK AUTHENTICATE completed\r\n").as_bytes()).await?;
+                    }
+                    None => {
+                        // Like Gmail: a rejected token gets a base64 JSON error
+                        // in a second continuation, which the client must
+                        // acknowledge with an empty line before the tagged NO.
+                        let error = base64::engine::general_purpose::STANDARD
+                            .encode(br#"{"status":"401","schemes":"Bearer","scope":"https://mail.google.com/"}"#);
+                        write_half.write_all(format!("+ {error}\r\n").as_bytes()).await?;
+                        let mut ack = String::new();
+                        reader.read_line(&mut ack).await?;
+                        write_half.write_all(format!("{tag} NO AUTHENTICATE failed\r\n").as_bytes()).await?;
+                    }
                 }
             }
             "LIST" => {

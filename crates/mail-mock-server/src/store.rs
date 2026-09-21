@@ -101,6 +101,8 @@ impl Mailbox {
 
 pub struct Store {
     pub users: HashMap<String, String>,
+    /// `XOAUTH2` access tokens by user -- see [`Store::add_oauth_token`].
+    pub oauth_tokens: HashMap<String, String>,
     pub mailboxes: HashMap<String, Mailbox>,
     /// Broadcasts the name of any mailbox a delivery just landed in, so an
     /// `IDLE` connection selected on that mailbox can push an untagged
@@ -115,7 +117,7 @@ pub struct Store {
 impl Store {
     pub fn new() -> Self {
         let (notify, _) = broadcast::channel(32);
-        Store { users: HashMap::new(), mailboxes: HashMap::new(), notify }
+        Store { users: HashMap::new(), oauth_tokens: HashMap::new(), mailboxes: HashMap::new(), notify }
     }
 
     pub fn add_user(&mut self, username: &str, password: &str) {
@@ -130,6 +132,31 @@ impl Store {
 
     pub fn check_login(&self, username: &str, password: &str) -> bool {
         self.users.get(username).is_some_and(|p| p == password)
+    }
+
+    /// Accept `token` as `username`'s OAuth access token, for `XOAUTH2`.
+    /// The tokens are independent of the password: a client that authenticated
+    /// with one of these provably did not use `LOGIN`/`AUTH PLAIN`.
+    pub fn add_oauth_token(&mut self, username: &str, token: &str) {
+        self.oauth_tokens.insert(username.to_string(), token.to_string());
+    }
+
+    /// Check a decoded `XOAUTH2` initial client response
+    /// (`user=<user>^Aauth=Bearer <token>^A^A`), returning the user it
+    /// authenticated as.
+    pub fn check_xoauth2(&self, payload: &[u8]) -> Option<String> {
+        let text = std::str::from_utf8(payload).ok()?;
+        let mut user = None;
+        let mut token = None;
+        for field in text.split('\x01') {
+            if let Some(v) = field.strip_prefix("user=") {
+                user = Some(v);
+            } else if let Some(v) = field.strip_prefix("auth=Bearer ") {
+                token = Some(v);
+            }
+        }
+        let (user, token) = user.zip(token)?;
+        (self.oauth_tokens.get(user).is_some_and(|t| t == token)).then(|| user.to_string())
     }
 
     pub fn mailbox_names(&self) -> Vec<String> {
