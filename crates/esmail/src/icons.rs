@@ -10,13 +10,9 @@
 //! white when asked to -- keeping only the alpha channel, which is all the
 //! artwork's shape lives in.
 
-/// Tray artwork at each size it is provided in, smallest first.
-const TRAY_PNGS: [(u32, &[u8]); 4] = [
-    (16, include_bytes!("../assets/tray-16.png")),
-    (32, include_bytes!("../assets/tray-32.png")),
-    (44, include_bytes!("../assets/tray-44.png")),
-    (64, include_bytes!("../assets/tray-64.png")),
-];
+/// Tray artwork. 32 px: the shell scales it to the 16 or 24 px a 100% or 150%
+/// display wants and shows it as is at 200%.
+const TRAY_PNG: &[u8] = include_bytes!("../assets/tray-32.png");
 
 /// The window/taskbar icon: the full-colour application icon.
 pub const WINDOW_ICON_PNG: &[u8] = include_bytes!("../assets/icon-128.png");
@@ -39,13 +35,9 @@ pub fn window_icon() -> Option<Rgba> {
     decode(WINDOW_ICON_PNG)
 }
 
-/// The tray icon for a shell that wants roughly `want_px` pixels (the
-/// system's small-icon size): the smallest provided size that is at least
-/// that big, or the largest if none is. `light_glyph` selects a white glyph,
-/// for a dark taskbar.
-pub fn tray_icon(want_px: u32, light_glyph: bool) -> Option<Rgba> {
-    let (_, png) = TRAY_PNGS.iter().find(|(size, _)| *size >= want_px).unwrap_or(&TRAY_PNGS[TRAY_PNGS.len() - 1]);
-    let mut icon = decode(png)?;
+/// The tray icon. `light_glyph` selects a white glyph, for a dark taskbar.
+pub fn tray_icon(light_glyph: bool) -> Option<Rgba> {
+    let mut icon = decode(TRAY_PNG)?;
     if light_glyph {
         for pixel in icon.pixels.chunks_exact_mut(4) {
             pixel[0] = 0xff;
@@ -68,25 +60,9 @@ mod tests {
     }
 
     #[test]
-    fn tray_icon_picks_the_smallest_size_that_is_big_enough() {
-        assert_eq!(tray_icon(16, false).unwrap().width, 16);
-        assert_eq!(tray_icon(24, false).unwrap().width, 32);
-        assert_eq!(tray_icon(40, false).unwrap().width, 44);
-        assert_eq!(tray_icon(1000, false).unwrap().width, 64);
-    }
-
-    #[test]
-    fn every_embedded_tray_png_has_the_size_it_is_filed_under() {
-        for (size, png) in TRAY_PNGS {
-            let icon = decode(png).unwrap();
-            assert_eq!((icon.width, icon.height), (size, size));
-        }
-    }
-
-    #[test]
     fn light_glyph_keeps_the_shape_and_whitens_the_colour() {
-        let dark = tray_icon(32, false).unwrap();
-        let light = tray_icon(32, true).unwrap();
+        let dark = tray_icon(false).unwrap();
+        let light = tray_icon(true).unwrap();
         assert!(dark.pixels.chunks_exact(4).any(|p| p[3] > 0), "glyph is not empty");
         for (d, l) in dark.pixels.chunks_exact(4).zip(light.pixels.chunks_exact(4)) {
             assert_eq!(d[3], l[3], "alpha (the shape) is unchanged");

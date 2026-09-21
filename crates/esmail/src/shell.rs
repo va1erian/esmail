@@ -1,74 +1,112 @@
-//! Integration with the Windows shell. On every other platform each function
-//! here is a harmless no-op, so `main.rs` calls them without `cfg` attributes.
+//! Integration with the Windows shell, plus the single-instance lock. On other
+//! platforms the Windows-only functions are harmless no-ops, so `main.rs` calls
+//! them without `cfg` attributes. Everything here is safe Rust: the Win32 calls
+//! go through the `windows` and `windows-registry` crates' safe wrappers.
 //!
-//! * **Process identity.** The AppUserModelID ties together the taskbar
-//!   button, the Start-menu shortcut the installer creates (which carries the
-//!   same ID) and toast notifications. Without it, notifications are filed
-//!   under "Windows PowerShell" and the taskbar cannot group the window with
-//!   its pinned shortcut.
-//! * **Notification identity.** A per-user registry entry that gives that ID a
-//!   display name and icon, so toasts read "esMail" even for a portable copy
-//!   that was never installed.
+//! * **Notification identity.** A per-user registry entry under
+//!   `HKCUSoftwareClassesAppUserModelId` that gives the toast
+//!   AppUserModelID a display name and icon, so toasts read "esMail" instead of
+//!   "Windows PowerShell", with or without the installer.
 //! * **Single instance.** esMail lives in the tray, so launching it again (from
 //!   the Start menu, say) must bring the existing window back rather than start
-//!   a second process fighting over the same cache. The second launch pokes the
-//!   first through a named event and exits.
-//! * **Theme and DPI queries** for the tray icon.
+//!   a second process fighting over the same cache. The first instance holds an
+//!   exclusive lock on a file in the data directory; a later launch fails to
+//!   take it, drops a request file next to it (`show`, or `quit` for the
+//!   installer) and exits. The running instance polls for that file.
+//! * **Taskbar theme** query, so the tray icon can be light or dark.
 
+#![forbid(unsafe_code)]
+
+use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
-/// Shared with `installer/esmail.iss` (`AppUserModelID`); a unit test checks
-/// the two agree.
+/// The AppUserModelID toasts are shown under.
 pub const APP_USER_MODEL_ID: &str = "io.github.va1erian.esmail";
-/// Shared with `installer/esmail.iss` (`AppMutex`), which uses it to refuse to
-/// install or uninstall over a running copy.
-pub const SINGLE_INSTANCE_MUTEX: &str = "esMail.SingleInstance";
-const SHOW_WINDOW_EVENT: &str = "esMail.ShowWindow";
+#[cfg(windows)]
 const DISPLAY_NAME: &str = "esMail";
 
+const LOCK_FILE: &str = "esmail.lock";
+
+/// What a later launch of esMail can ask the running one to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    /// Come to the front (an ordinary second launch).
+    Show,
+    /// Exit cleanly (`esmail --quit`, which the installer uses before it
+    /// replaces or removes the program files).
+    Quit,
+}
+
+impl Request {
+    const ALL: [Request; 2] = [Request::Quit, Request::Show];
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Request::Show => "show.request",
+            Request::Quit => "quit.request",
+        }
+    }
+}
+
 /// Whether this process is the one that owns the tray icon and the cache.
+#[derive(Debug, PartialEq, Eq)]
 pub enum Instance {
-    First(FirstInstance),
-    /// Another esMail is already running and has been asked to show itself.
+    First,
     AlreadyRunning,
 }
 
-/// Held for the life of the process; see [`FirstInstance::on_show_requested`].
-pub struct FirstInstance {
-    #[cfg(windows)]
-    show_event: Option<imp::Handle>,
+/// The lock, held for the life of the process (the OS releases it on exit,
+/// however that happens).
+static LOCK: OnceLock<File> = OnceLock::new();
+
+fn request_path(request: Request) -> Option<PathBuf> {
+    crate::paths::data_dir().map(|dir| dir.join(request.file_name()))
 }
 
-impl FirstInstance {
-    /// Call `callback` (from a background thread) each time a later launch of
-    /// esMail asks this one to come to the front.
-    pub fn on_show_requested(&self, callback: impl Fn() + Send + 'static) {
-        #[cfg(windows)]
-        if let Some(event) = self.show_event {
-            imp::spawn_show_listener(event, callback);
-        }
-        #[cfg(not(windows))]
-        let _ = callback;
-    }
-}
-
-/// Claim the single-instance lock, or -- if another copy holds it -- ask that
-/// copy to show its window.
+/// Try to become the single running instance. Never blocks startup: if the
+/// lock file cannot be created at all (no data directory, read-only disk),
+/// this process simply counts as the first.
 pub fn acquire_single_instance() -> Instance {
-    #[cfg(windows)]
-    {
-        imp::acquire_single_instance()
+    let Some(dir) = crate::paths::data_dir() else { return Instance::First };
+    acquire_in(&dir)
+}
+
+fn acquire_in(dir: &std::path::Path) -> Instance {
+    if fs::create_dir_all(dir).is_err() {
+        return Instance::First;
     }
-    #[cfg(not(windows))]
-    {
-        Instance::First(FirstInstance {})
+    let Ok(file) = OpenOptions::new().create(true).write(true).truncate(false).open(dir.join(LOCK_FILE)) else {
+        return Instance::First;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            // Requests left behind by an instance that died before reading
+            // them must not be obeyed by this one (a stale `quit` would close
+            // it the moment it starts).
+            for request in Request::ALL {
+                let _ = fs::remove_file(dir.join(request.file_name()));
+            }
+            let _ = LOCK.set(file);
+            Instance::First
+        }
+        Err(fs::TryLockError::WouldBlock) => Instance::AlreadyRunning,
+        Err(fs::TryLockError::Error(_)) => Instance::First,
     }
 }
 
-/// Tell Windows which application this process is (see the module docs).
-pub fn set_process_identity() {
-    #[cfg(windows)]
-    imp::set_process_identity();
+/// Ask the running instance to do `request`. Call after
+/// [`acquire_single_instance`] returned [`Instance::AlreadyRunning`].
+pub fn send_request(request: Request) -> io::Result<()> {
+    let path = request_path(request).ok_or_else(|| io::Error::other("no data directory"))?;
+    fs::write(path, b"")
+}
+
+/// The request a later launch left for this instance, if any, consuming it.
+/// Cheap enough to call from the UI loop.
+pub fn take_request() -> Option<Request> {
+    Request::ALL.into_iter().find(|request| request_path(*request).is_some_and(|path| fs::remove_file(path).is_ok()))
 }
 
 /// Give the AppUserModelID a display name and icon for toast notifications.
@@ -109,112 +147,25 @@ pub fn taskbar_is_dark() -> bool {
     }
 }
 
-/// The size in pixels of a small icon at the current DPI (16 at 100%).
-pub fn small_icon_px() -> u32 {
-    #[cfg(windows)]
-    {
-        imp::small_icon_px()
-    }
-    #[cfg(not(windows))]
-    {
-        16
-    }
-}
-
 #[cfg(windows)]
 mod imp {
     use std::io;
-    use std::ptr::{null, null_mut};
 
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HANDLE, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Registry::{
-        HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_DWORD, RegDeleteTreeW, RegGetValueW, RegSetKeyValueW,
-    };
-    use windows_sys::Win32::System::Threading::{
-        CreateEventW, CreateMutexW, INFINITE, SetEvent, WaitForSingleObject,
-    };
-    use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow, GetSystemMetrics, SM_CXSMICON};
+    use windows_registry::CURRENT_USER;
 
-    use super::{APP_USER_MODEL_ID, DISPLAY_NAME, FirstInstance, Instance, SHOW_WINDOW_EVENT, SINGLE_INSTANCE_MUTEX};
+    use super::{APP_USER_MODEL_ID, DISPLAY_NAME};
 
-    /// A kernel handle that lives until the process exits. `HANDLE` is a raw
-    /// pointer (not `Send`); this wrapper is, because a handle value is just an
-    /// index into the process's handle table.
-    #[derive(Clone, Copy)]
-    pub struct Handle(HANDLE);
-    unsafe impl Send for Handle {}
-
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
+    fn to_io(e: windows::core::Error) -> io::Error {
+        io::Error::other(e)
     }
 
-    pub fn acquire_single_instance() -> Instance {
-        let event_name = wide(SHOW_WINDOW_EVENT);
-        // The event first, then the mutex: whoever finds the mutex taken can
-        // then rely on the event existing.
-        let event = unsafe { CreateEventW(null(), 0, 0, event_name.as_ptr()) };
-
-        let mutex_name = wide(SINGLE_INSTANCE_MUTEX);
-        let mutex = unsafe { CreateMutexW(null(), 0, mutex_name.as_ptr()) };
-        let already_running = !mutex.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-
-        if already_running {
-            // Let the running copy take the foreground: this process was just
-            // started by the user and so may hand that right on.
-            unsafe {
-                AllowSetForegroundWindow(ASFW_ANY);
-                SetEvent(event);
-            }
-            return Instance::AlreadyRunning;
-        }
-        // The mutex handle is deliberately never closed: it is released when
-        // the process exits, which is exactly the lifetime of the lock.
-        Instance::First(FirstInstance { show_event: (!event.is_null()).then_some(Handle(event)) })
-    }
-
-    pub fn spawn_show_listener(event: Handle, callback: impl Fn() + Send + 'static) {
-        std::thread::Builder::new()
-            .name("esmail-show-listener".into())
-            .spawn(move || {
-                let event = event;
-                while unsafe { WaitForSingleObject(event.0, INFINITE) } == WAIT_OBJECT_0 {
-                    callback();
-                }
-            })
-            .ok();
-    }
-
-    pub fn set_process_identity() {
-        let id = wide(APP_USER_MODEL_ID);
-        unsafe {
-            SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
-        }
-    }
-
-    fn registry_key() -> Vec<u16> {
-        wide(&format!("Software\\Classes\\AppUserModelId\\{APP_USER_MODEL_ID}"))
-    }
-
-    fn set_string(subkey: &[u16], name: &str, value: &str) -> io::Result<()> {
-        let name = wide(name);
-        let value = wide(value);
-        let status = unsafe {
-            RegSetKeyValueW(
-                HKEY_CURRENT_USER,
-                subkey.as_ptr(),
-                name.as_ptr(),
-                REG_SZ,
-                value.as_ptr().cast(),
-                (value.len() * 2) as u32,
-            )
-        };
-        if status == ERROR_SUCCESS { Ok(()) } else { Err(io::Error::from_raw_os_error(status as i32)) }
+    fn identity_key() -> String {
+        format!("Software\\Classes\\AppUserModelId\\{APP_USER_MODEL_ID}")
     }
 
     pub fn register_notification_identity() -> io::Result<()> {
-        let key = registry_key();
-        set_string(&key, "DisplayName", DISPLAY_NAME)?;
+        let key = CURRENT_USER.create(identity_key()).map_err(to_io)?;
+        key.set_string("DisplayName", DISPLAY_NAME).map_err(to_io)?;
         // The toast icon must be an image file on disk; the .exe's icon
         // resource does not qualify, so write the artwork out once.
         if let Some(icon) = crate::paths::data_dir().map(|dir| dir.join(crate::paths::TOAST_ICON_FILE_NAME)) {
@@ -225,44 +176,25 @@ mod imp {
                 }
                 std::fs::write(&icon, crate::icons::WINDOW_ICON_PNG)?;
             }
-            set_string(&key, "IconUri", &icon.to_string_lossy())?;
+            key.set_string("IconUri", icon.to_string_lossy().as_ref()).map_err(to_io)?;
         }
         Ok(())
     }
 
     pub fn unregister_notification_identity() -> io::Result<()> {
-        let key = registry_key();
-        let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, key.as_ptr()) };
-        if status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND {
-            Ok(())
-        } else {
-            Err(io::Error::from_raw_os_error(status as i32))
+        // Nothing registered (a fresh profile, or already purged) is success.
+        if CURRENT_USER.open(identity_key()).is_err() {
+            return Ok(());
         }
+        CURRENT_USER.remove_tree(identity_key()).map_err(to_io)
     }
 
     pub fn taskbar_is_dark() -> bool {
-        let key = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
-        let name = wide("SystemUsesLightTheme");
-        let mut value: u32 = 0;
-        let mut size = std::mem::size_of::<u32>() as u32;
-        let status = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                key.as_ptr(),
-                name.as_ptr(),
-                RRF_RT_REG_DWORD,
-                null_mut(),
-                (&mut value as *mut u32).cast(),
-                &mut size,
-            )
-        };
+        let light = CURRENT_USER
+            .open("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
+            .and_then(|key| key.get_u32("SystemUsesLightTheme"));
         // Windows before 1903 has no light taskbar and no such value.
-        status != ERROR_SUCCESS || value == 0
-    }
-
-    pub fn small_icon_px() -> u32 {
-        let px = unsafe { GetSystemMetrics(SM_CXSMICON) };
-        if px > 0 { px as u32 } else { 16 }
+        !matches!(light, Ok(v) if v != 0)
     }
 }
 
@@ -270,16 +202,34 @@ mod imp {
 mod tests {
     use super::*;
 
-    #[test]
-    fn installer_uses_the_same_identifiers() {
-        let script = include_str!("../../../installer/esmail.iss");
-        assert!(script.contains(&format!("AppUserModelID: \"{APP_USER_MODEL_ID}\"")), "AppUserModelID differs");
-        assert!(script.contains(&format!("AppMutex={SINGLE_INSTANCE_MUTEX}")), "AppMutex differs");
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("esmail-shell-test-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
     }
 
-    #[cfg(windows)]
     #[test]
-    fn small_icon_size_is_sane() {
-        assert!((16..=64).contains(&small_icon_px()));
+    fn a_second_lock_on_the_same_directory_is_refused() {
+        let dir = scratch("lock");
+        // `acquire_in` stores its lock in a process-wide static, so hold the
+        // first one by hand to keep this test independent of it.
+        fs::create_dir_all(&dir).unwrap();
+        let first = OpenOptions::new().create(true).write(true).truncate(false).open(dir.join(LOCK_FILE)).unwrap();
+        first.try_lock().unwrap();
+        assert_eq!(acquire_in(&dir), Instance::AlreadyRunning);
+        drop(first);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_free_lock_is_taken_and_stale_requests_are_discarded() {
+        let dir = scratch("stale");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(Request::Quit.file_name()), b"").unwrap();
+        fs::write(dir.join(Request::Show.file_name()), b"").unwrap();
+        assert_eq!(acquire_in(&dir), Instance::First);
+        assert!(!dir.join(Request::Quit.file_name()).exists(), "a stale quit would close the new instance");
+        assert!(!dir.join(Request::Show.file_name()).exists());
+        let _ = fs::remove_dir_all(dir);
     }
 }

@@ -25,7 +25,8 @@ const SECRET_KINDS: [&str; 3] = ["imap", "smtp", "oauth"];
 /// The files esMail creates in a directory it does not exclusively own (one
 /// relocated with `ESMAIL_CONFIG_DIR` / `ESMAIL_DATA_DIR`, which could be any
 /// folder, so it is never deleted wholesale).
-const DB_SIDE_FILES: [&str; 4] = ["mails.db", "mails.db-wal", "mails.db-shm", "mails.db-journal"];
+const DATA_FILES: [&str; 7] =
+    ["mails.db", "mails.db-wal", "mails.db-shm", "mails.db-journal", "esmail.lock", "show.request", "quit.request"];
 
 /// Where things are, decoupled from the environment so the deletion logic
 /// can be tested against a scratch directory.
@@ -82,7 +83,7 @@ fn purge(layout: &Layout, accounts: &[AccountConfig], delete_secret: &mut dyn Fn
         if layout.data_exclusive {
             remove_owned_dir(dir, &mut problems);
         } else {
-            remove_files(dir, &[DB_SIDE_FILES.as_slice(), &[paths::TOAST_ICON_FILE_NAME]].concat(), &mut problems);
+            remove_files(dir, &[DATA_FILES.as_slice(), &[paths::TOAST_ICON_FILE_NAME]].concat(), &mut problems);
         }
     }
     remove_dir_all_if_present(&layout.scratch_dir, &mut problems);

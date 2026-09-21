@@ -11,6 +11,8 @@
 ;  * Per-user install by default (no UAC prompt): esMail keeps everything in the
 ;    user's profile, so it needs nothing outside it. The wizard offers "all
 ;    users" for whoever wants it.
+;  * A running esMail (it sits in the tray) is asked to exit with `esmail.exe --quit`
+;    before files are replaced or removed.
 ;  * Everything is compressed as one solid LZMA2 stream at the highest setting.
 ;  * Uninstalling asks whether to remove the user's data as well. That work is
 ;    done by `esmail.exe --purge-data` (see crates/esmail/src/uninstall.rs), so
@@ -45,11 +47,6 @@ PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-; Refuse to install or uninstall over a running copy (the name is
-; shell::SINGLE_INSTANCE_MUTEX in crates/esmail/src/shell.rs; a unit test keeps
-; the two in step). esMail sits in the tray, so the message tells the user to
-; quit it from there.
-AppMutex=esMail.SingleInstance
 Compression=lzma2/ultra64
 SolidCompression=yes
 InternalCompressLevel=ultra64
@@ -71,10 +68,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-; The AppUserModelID ties these shortcuts, the taskbar button and toast
-; notifications together (shell::APP_USER_MODEL_ID; also unit-tested).
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; AppUserModelID: "io.github.va1erian.esmail"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; AppUserModelID: "io.github.va1erian.esmail"; Tasks: desktopicon
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
@@ -82,6 +77,25 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 [Code]
 var
   PurgeUserData: Boolean;
+
+// Ask a running esMail in Dir to exit cleanly (it hides to the tray rather than
+// closing, so the installer cannot just close its window), and give it a moment.
+procedure QuitRunningApp(const Dir: string);
+var
+  ResultCode: Integer;
+begin
+  if FileExists(Dir + '\{#AppExeName}') then
+  begin
+    Exec(Dir + '\{#AppExeName}', '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(2000);
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  QuitRunningApp(WizardDirValue);
+  Result := '';
+end;
 
 function HasSwitch(const Name: string): Boolean;
 var
@@ -99,6 +113,7 @@ end;
 function InitializeUninstall(): Boolean;
 begin
   Result := True;
+  QuitRunningApp(ExpandConstant('{app}'));
   if UninstallSilent then
     // Nobody to ask: keep the data unless the caller said otherwise.
     PurgeUserData := HasSwitch('/PURGE')
