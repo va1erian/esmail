@@ -60,9 +60,13 @@ The UI thread sends render jobs and paints the finished display lists.
   search behind a small query DSL. `sync_decision` (UIDVALIDITY/UIDNEXT)
   drives incremental header fetch.
 - **Reading:** sanitized HTML, remote content blocked until "Load remote
-  images", attachment chips (save/open), inline `style=` via a property
-  allowlist, Export... to `.eml`, flags, delete/archive, mailbox tree with
-  special-use folders, multi-select, keyboard shortcuts.
+  images" (or "Always load from <sender>", kept in `config.toml`), attachment
+  chips (save/open), inline `style=` via a property allowlist, Export... to
+  `.eml`, flags, delete/archive, collapsible mailbox tree with special-use
+  folders (fold state kept in `config.toml`), multi-select, keyboard
+  shortcuts. The message list draws each row by hand (`message_row` in
+  `main.rs`): unread rows get an accent bar and a strong sender, read rows are
+  dimmed.
 - **Composing:** plain-text compose with Reply/Reply All/Forward, attachments,
   SMTP via `lettre`, `APPEND` to the server's Sent folder.
 - **Polish:** error banners, dark/light/system theme, window geometry
@@ -96,8 +100,7 @@ Not ticketed:
   paging; single-opened messages are not indexed; no server-side `UID SEARCH`;
   `since:`/`before:`/`is:unread`/`has:attachment` parse but are not applied.
 - **Reading:** whole-message `RFC822` fetches (no `BODYSTRUCTURE`/partial
-  fetch); attachments missing for messages opened from the search cache; no
-  per-sender "always load images"; mailbox tree not collapsible; bulk
+  fetch); attachments missing for messages opened from the search cache; bulk
   flag/move use one round trip per message; IDLE is INBOX-only and the header
   list does not update live.
 - **Compose:** no drafts, retry queue, rich text or recipient autocomplete;

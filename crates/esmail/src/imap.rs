@@ -58,6 +58,48 @@ impl MailHeader {
     pub fn is_flagged(&self) -> bool {
         self.flags.iter().any(|f| f.eq_ignore_ascii_case("\\Flagged"))
     }
+
+    /// The sender's bare address, lowercased -- the key "always load images
+    /// from this sender" trusts on. `None` when `from` has no address in it.
+    pub fn sender_address(&self) -> Option<String> {
+        address_of(&self.from)
+    }
+
+    /// What the message list shows as the sender: the display name when the
+    /// message has one, else the bare address.
+    pub fn sender_name(&self) -> String {
+        display_name_of(&self.from)
+    }
+}
+
+/// The address out of a `parse_envelope_header`-style `"Name <user@host>"` /
+/// `"user@host"` string, lowercased. Splits on the last `<...>` rather than
+/// parsing RFC 5322, since the string is one this module formatted itself.
+fn address_of(from: &str) -> Option<String> {
+    let from = from.trim();
+    let addr = match (from.rfind('<'), from.rfind('>')) {
+        (Some(open), Some(close)) if open < close => &from[open + 1..close],
+        _ => from,
+    };
+    let addr = addr.trim();
+    (addr.contains('@')).then(|| addr.to_ascii_lowercase())
+}
+
+/// The `Name` out of `"Name <user@host>"`, without any surrounding quotes;
+/// the whole string when there is no name part (or it is empty).
+fn display_name_of(from: &str) -> String {
+    let from = from.trim();
+    if let Some(open) = from.rfind('<') {
+        let name = from[..open].trim().trim_matches('"').trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+        let inner = from[open + 1..].trim_end_matches('>').trim();
+        if !inner.is_empty() {
+            return inner.to_string();
+        }
+    }
+    from.to_string()
 }
 
 /// Well-known IMAP flag names as `main.rs`/`imap.rs` construct `STORE`
@@ -221,21 +263,64 @@ pub struct MailboxRow {
     /// `MailboxNode::full_name`) -- not selectable/clickable.
     pub full_name: Option<String>,
     pub special_use: Option<SpecialUse>,
+    /// Stable identity of this node in the tree (its labels from the root,
+    /// joined with `/`), which -- unlike `full_name` -- every row has. What
+    /// the collapsed-folders set is keyed on.
+    pub key: String,
+    /// Whether the row's node has children, i.e. can be collapsed.
+    pub has_children: bool,
 }
 
 /// Depth-first flatten of [`mailbox_tree`]'s output, in the same order the
 /// tree is already sorted in.
 pub fn flatten_tree(nodes: &[MailboxNode]) -> Vec<MailboxRow> {
     let mut rows = Vec::new();
-    flatten_into(nodes, 0, &mut rows);
+    flatten_into(nodes, 0, "", &mut rows);
     rows
 }
 
-fn flatten_into(nodes: &[MailboxNode], depth: usize, rows: &mut Vec<MailboxRow>) {
+fn flatten_into(nodes: &[MailboxNode], depth: usize, parent_key: &str, rows: &mut Vec<MailboxRow>) {
     for node in nodes {
-        rows.push(MailboxRow { depth, label: node.label.clone(), full_name: node.full_name.clone(), special_use: node.special_use });
-        flatten_into(&node.children, depth + 1, rows);
+        let key = if parent_key.is_empty() { node.label.clone() } else { format!("{parent_key}/{}", node.label) };
+        rows.push(MailboxRow {
+            depth,
+            label: node.label.clone(),
+            full_name: node.full_name.clone(),
+            special_use: node.special_use,
+            key: key.clone(),
+            has_children: !node.children.is_empty(),
+        });
+        flatten_into(&node.children, depth + 1, &key, rows);
     }
+}
+
+/// Indices into `rows` of the rows to draw once every node whose `key` is in
+/// `collapsed` has hidden its descendants. The collapsed node's own row stays.
+pub fn visible_rows(rows: &[MailboxRow], collapsed: &std::collections::BTreeSet<String>) -> Vec<usize> {
+    let mut visible = Vec::with_capacity(rows.len());
+    // Depth of the collapsed ancestor whose descendants are being skipped.
+    let mut hidden_below: Option<usize> = None;
+    for (index, row) in rows.iter().enumerate() {
+        if let Some(depth) = hidden_below {
+            if row.depth > depth {
+                continue;
+            }
+            hidden_below = None;
+        }
+        visible.push(index);
+        if row.has_children && collapsed.contains(&row.key) {
+            hidden_below = Some(row.depth);
+        }
+    }
+    visible
+}
+
+/// The rows below `rows[index]` in the tree (its descendants, in order).
+pub fn descendants(rows: &[MailboxRow], index: usize) -> &[MailboxRow] {
+    let depth = rows[index].depth;
+    let rest = &rows[index + 1..];
+    let len = rest.iter().position(|r| r.depth <= depth).unwrap_or(rest.len());
+    &rest[..len]
 }
 
 /// `(special-use rank, label)`, so every `SpecialUse` variant sorts ahead of
@@ -1355,6 +1440,93 @@ mod tests {
         assert_eq!((rows[0].depth, rows[0].label.as_str(), rows[0].full_name.as_deref()), (0, "INBOX", Some("INBOX")));
         assert_eq!((rows[1].depth, rows[1].label.as_str(), rows[1].full_name.as_deref()), (0, "Work", None));
         assert_eq!((rows[2].depth, rows[2].label.as_str(), rows[2].full_name.as_deref()), (1, "Invoices", Some("Work/Invoices")));
+    }
+
+    fn keys(rows: &[MailboxRow], indices: &[usize]) -> Vec<String> {
+        indices.iter().map(|&i| rows[i].key.clone()).collect()
+    }
+
+    fn collapsed(keys: &[&str]) -> std::collections::BTreeSet<String> {
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    #[test]
+    fn flatten_tree_gives_every_row_a_path_key_and_a_has_children_flag() {
+        let mailboxes = vec![mb("INBOX", "/", Some(SpecialUse::Inbox)), mb("Work/Invoices", "/", None)];
+        let rows = flatten_tree(&mailbox_tree(&mailboxes));
+        let got: Vec<_> = rows.iter().map(|r| (r.key.as_str(), r.has_children)).collect();
+        assert_eq!(got, vec![("INBOX", false), ("Work", true), ("Work/Invoices", false)]);
+    }
+
+    #[test]
+    fn visible_rows_shows_everything_when_nothing_is_collapsed() {
+        let rows = flatten_tree(&mailbox_tree(&[mb("A/B/C", "/", None), mb("A/D", "/", None)]));
+        assert_eq!(visible_rows(&rows, &collapsed(&[])), (0..rows.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn visible_rows_hides_only_the_descendants_of_a_collapsed_node() {
+        let rows = flatten_tree(&mailbox_tree(&[mb("A/B/C", "/", None), mb("A/D", "/", None), mb("E", "/", None)]));
+        // Rows: A, A/B, A/B/C, A/D, E
+        let shown = visible_rows(&rows, &collapsed(&["A/B"]));
+        assert_eq!(keys(&rows, &shown), vec!["A", "A/B", "A/D", "E"]);
+        let shown = visible_rows(&rows, &collapsed(&["A"]));
+        assert_eq!(keys(&rows, &shown), vec!["A", "E"]);
+    }
+
+    #[test]
+    fn visible_rows_ignores_the_collapsed_flag_on_a_node_without_children() {
+        let rows = flatten_tree(&mailbox_tree(&[mb("A", "/", None), mb("B", "/", None)]));
+        assert_eq!(visible_rows(&rows, &collapsed(&["A"])).len(), 2);
+    }
+
+    #[test]
+    fn descendants_covers_exactly_the_subtree_below_a_row() {
+        let rows = flatten_tree(&mailbox_tree(&[mb("A/B/C", "/", None), mb("A/D", "/", None), mb("E", "/", None)]));
+        let below = |i: usize| descendants(&rows, i).iter().map(|r| r.key.as_str()).collect::<Vec<_>>();
+        assert_eq!(below(0), vec!["A/B", "A/B/C", "A/D"]);
+        assert_eq!(below(1), vec!["A/B/C"]);
+        assert!(below(2).is_empty());
+        assert!(below(4).is_empty()); // last row
+    }
+
+    // ── sender_address / sender_name ──────────────────────────────────────────
+
+    fn header_from(from: &str) -> MailHeader {
+        MailHeader { uid: 1, subject: String::new(), from: from.to_string(), to: String::new(), date: String::new(), message_id: String::new(), flags: vec![] }
+    }
+
+    #[test]
+    fn sender_address_takes_the_angle_bracketed_address_lowercased() {
+        assert_eq!(header_from("Alice Doe <Alice@Example.COM>").sender_address().as_deref(), Some("alice@example.com"));
+    }
+
+    #[test]
+    fn sender_address_accepts_a_bare_address() {
+        assert_eq!(header_from("bob@example.com").sender_address().as_deref(), Some("bob@example.com"));
+    }
+
+    #[test]
+    fn sender_address_is_the_last_bracket_pair_when_the_name_contains_one() {
+        assert_eq!(header_from("Eve <fake@a.com> <real@b.com>").sender_address().as_deref(), Some("real@b.com"));
+    }
+
+    #[test]
+    fn sender_address_is_none_without_an_address() {
+        assert_eq!(header_from("").sender_address(), None);
+        assert_eq!(header_from("Nobody").sender_address(), None);
+    }
+
+    #[test]
+    fn sender_name_prefers_the_display_name_and_strips_quotes() {
+        assert_eq!(header_from("Alice Doe <a@example.com>").sender_name(), "Alice Doe");
+        assert_eq!(header_from("\"Doe, Alice\" <a@example.com>").sender_name(), "Doe, Alice");
+    }
+
+    #[test]
+    fn sender_name_falls_back_to_the_address() {
+        assert_eq!(header_from("a@example.com").sender_name(), "a@example.com");
+        assert_eq!(header_from(" <a@example.com>").sender_name(), "a@example.com");
     }
 
     // ── flag_to_str ───────────────────────────────────────────────────────────
