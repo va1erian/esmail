@@ -13,8 +13,6 @@ use std::io;
 
 use interprocess::local_socket::tokio::{Listener, Stream};
 use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
-use interprocess::local_socket::Name;
-
 use super::{Endpoint, Transport};
 
 pub struct LocalSocket;
@@ -24,7 +22,7 @@ impl Transport for LocalSocket {
     type Stream = Stream;
 
     fn bind(endpoint: &Endpoint) -> io::Result<Self::Listener> {
-        platform::bind(name_for_bind(endpoint)?)
+        platform::bind(endpoint)
     }
 
     async fn accept(listener: &mut Self::Listener) -> io::Result<Self::Stream> {
@@ -32,29 +30,8 @@ impl Transport for LocalSocket {
     }
 
     async fn connect(endpoint: &Endpoint) -> io::Result<Self::Stream> {
-        Stream::connect(name_for_connect(endpoint)?).await
+        Stream::connect(platform::name(endpoint)?).await
     }
-}
-
-#[cfg(windows)]
-fn name_for_bind(endpoint: &Endpoint) -> io::Result<Name<'static>> {
-    platform::name(endpoint)
-}
-
-#[cfg(windows)]
-fn name_for_connect(endpoint: &Endpoint) -> io::Result<Name<'static>> {
-    platform::name(endpoint)
-}
-
-#[cfg(unix)]
-fn name_for_bind(endpoint: &Endpoint) -> io::Result<Name<'static>> {
-    platform::prepare_directory(endpoint)?;
-    platform::name(endpoint)
-}
-
-#[cfg(unix)]
-fn name_for_connect(endpoint: &Endpoint) -> io::Result<Name<'static>> {
-    platform::name(endpoint)
 }
 
 #[cfg(windows)]
@@ -78,9 +55,9 @@ mod platform {
         endpoint.name().to_string().to_ns_name::<GenericNamespaced>()
     }
 
-    pub fn bind(name: Name<'static>) -> io::Result<Listener> {
+    pub fn bind(endpoint: &Endpoint) -> io::Result<Listener> {
         ListenerOptions::new()
-            .name(name)
+            .name(name(endpoint)?)
             .security_descriptor(SecurityDescriptor::deserialize(OWNER_ONLY)?)
             .create_tokio()
     }
@@ -90,6 +67,7 @@ mod platform {
 mod platform {
     use std::io;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
 
     use interprocess::local_socket::tokio::Listener;
@@ -110,13 +88,50 @@ mod platform {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
     }
 
-    pub fn name(endpoint: &Endpoint) -> io::Result<Name<'static>> {
-        directory(endpoint).join("ipc.sock").to_fs_name::<GenericFilePath>()
+    pub fn socket_path(endpoint: &Endpoint) -> PathBuf {
+        directory(endpoint).join("ipc.sock")
     }
 
-    pub fn bind(name: Name<'static>) -> io::Result<Listener> {
-        // A socket file left by a listener that died is replaced: which process
-        // may listen is decided by the single-instance lock, not by this file.
-        ListenerOptions::new().name(name).try_overwrite(true).create_tokio()
+    pub fn name(endpoint: &Endpoint) -> io::Result<Name<'static>> {
+        socket_path(endpoint).to_fs_name::<GenericFilePath>()
+    }
+
+    /// Bind the socket, refusing if a live listener already holds it -- the same
+    /// guarantee the Windows pipe gives -- but replacing a socket file that a
+    /// listener left behind when it died (nothing answers on it).
+    pub fn bind(endpoint: &Endpoint) -> io::Result<Listener> {
+        prepare_directory(endpoint)?;
+        let try_bind = || ListenerOptions::new().name(name(endpoint)?).create_tokio();
+        match try_bind() {
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                let path = socket_path(endpoint);
+                if UnixStream::connect(&path).is_ok() {
+                    return Err(e);
+                }
+                std::fs::remove_file(&path)?;
+                try_bind()
+            }
+            other => other,
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_socket_file_left_by_a_dead_listener_is_replaced() {
+        let endpoint = Endpoint::named(format!("esmail-test-stale-{}", std::process::id()));
+        platform::prepare_directory(&endpoint).unwrap();
+        let path = platform::socket_path(&endpoint);
+        // Bind and drop a plain listener: the socket file stays, nothing answers on it.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+
+        let listener = LocalSocket::bind(&endpoint).expect("a stale socket file must not block the listener");
+        assert!(LocalSocket::bind(&endpoint).is_err(), "but a live listener still holds the name");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
