@@ -8,7 +8,6 @@
 //! the toast XML and click arguments) lives in `notify.rs` and is unit tested
 //! there without needing any of what is in this file.
 
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -19,7 +18,7 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::Foundation::TypedEventHandler;
 use windows::UI::Notifications::{ToastActivatedEventArgs, ToastNotification, ToastNotificationManager};
-use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
+use windows::System::Threading::{ThreadPool, WorkItemHandler};
 use windows::core::{HSTRING, IInspectable, Interface};
 
 use crate::{icons, shell};
@@ -198,25 +197,6 @@ pub fn set_toast_click_handler(handler: impl Fn(String) + Send + Sync + 'static)
     let _ = CLICK_HANDLER.set(Box::new(handler));
 }
 
-thread_local! {
-    /// Whether this thread has joined a COM apartment yet. The threads that
-    /// show toasts are tokio worker threads, which nothing else initializes.
-    static COM_READY: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Join the multithreaded apartment on this thread, once. Failing because the
-/// thread already joined a different apartment is fine: the WinRT calls that
-/// follow work either way.
-fn ensure_com() {
-    COM_READY.with(|ready| {
-        if !ready.get() {
-            // SAFETY: a plain COM initialisation call with no pointers.
-            let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
-            ready.set(true);
-        }
-    });
-}
-
 /// Show a new-mail toast for `account_id`. `title`/`body` are expected to
 /// already be sanitized (see `notify::build_account_notification`); the XML
 /// they go into is escaped by `notify::toast_xml`.
@@ -229,13 +209,24 @@ fn ensure_com() {
 /// crash the UI over it" treatment other best-effort I/O gets elsewhere
 /// (e.g. `save_attachment` in main.rs).
 pub fn show_new_mail_toast(account_id: &str, title: &str, body: &str) {
-    if let Err(e) = try_show_new_mail_toast(account_id, title, body) {
-        log::warn!("could not show new-mail toast: {e}");
+    // Run on the WinRT thread pool, whose threads are already in the COM
+    // multithreaded apartment the toast API needs. The callers are tokio worker
+    // threads that nothing else initializes, and joining an apartment by hand
+    // (`RoInitialize`) is an `unsafe` call; this needs none. The work item is
+    // fire-and-forget: it logs its own failure.
+    let (account_id, title, body) = (account_id.to_owned(), title.to_owned(), body.to_owned());
+    let queued = ThreadPool::RunAsync(&WorkItemHandler::new(move |_| {
+        if let Err(e) = try_show_new_mail_toast(&account_id, &title, &body) {
+            log::warn!("could not show new-mail toast: {e}");
+        }
+        Ok(())
+    }));
+    if let Err(e) = queued {
+        log::warn!("could not queue the new-mail toast: {e}");
     }
 }
 
 fn try_show_new_mail_toast(account_id: &str, title: &str, body: &str) -> windows::core::Result<()> {
-    ensure_com();
     let xml = XmlDocument::new()?;
     xml.LoadXml(&HSTRING::from(crate::notify::toast_xml(title, body, account_id)))?;
     let toast = ToastNotification::CreateToastNotification(&xml)?;

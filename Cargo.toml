@@ -69,9 +69,9 @@ tray-icon = { version = "0.24", default-features = false }
 # which is a thin wrapper that hides the toast's `Activated` event -- the one
 # thing needed to open the right account when a toast is clicked. Only the
 # features used are enabled: the toast classes, the XML document they are built
-# from, `TypedEventHandler`, and `RoInitialize` for the threads that show
-# toasts. Windows-only dependency -- see crates/esmail/Cargo.toml.
-windows = { version = "0.62", features = ["UI_Notifications", "Data_Xml_Dom", "Foundation", "Win32_System_WinRT", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# from, `TypedEventHandler`, and the thread pool the toasts are shown on
+# (its threads are already COM-initialised, so no `unsafe` call is needed). Windows-only dependency -- see crates/esmail/Cargo.toml.
+windows = { version = "0.62", features = ["UI_Notifications", "Data_Xml_Dom", "Foundation", "System_Threading"] }
 
 # Storage / secrets
 # `esmail` is the only crate in the workspace that depends on rusqlite, so a
