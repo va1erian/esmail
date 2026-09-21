@@ -5,13 +5,6 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
-  # Installer changes are otherwise only exercised by a release, so a PR that
-  # touches them builds and smoke-tests the installer too.
-  pull_request:
-    paths:
-      - 'installer/**'
-      - 'crates/esmail/assets/**'
-      - '.github/workflows/build.yml'
 
 # The repository's default GITHUB_TOKEN permission is read-only, so the
 # release job has to ask for `contents: write` explicitly -- without it
@@ -23,7 +16,6 @@ jobs:
   build-linux:
     name: Build Linux
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
       
