@@ -26,11 +26,10 @@
 
 use std::time::{Duration, Instant};
 
-use secrecy::{ExposeSecret, SecretString};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_native_tls::TlsStream;
-use tokio_native_tls::native_tls::TlsConnector;
+use tokio::task::JoinHandle;
+
+use crate::auth::Auth;
 
 /// How long to hold one `IDLE` before re-issuing it. RFC 2177 recommends
 /// terminating and restarting at least every 29 minutes, since a server may
@@ -59,19 +58,23 @@ pub struct MailboxChanged;
 /// one-shot command this has no caller left to report the error to; it just
 /// keeps trying, the same "never leaves the actor stuck" tradeoff
 /// `ImapActor::ensure_connected` documents for its own reconnect loop.
+///
+/// Returns the task's handle so a caller that later has *different*
+/// credentials (a fresh sign-in after the old one was revoked) can `abort()`
+/// this watch and spawn a new one. Aborting drops the connection.
 pub fn spawn(
     host: String,
     port: u16,
     username: String,
-    password: SecretString,
+    auth: Auth,
     mailbox: String,
     wake_tx: mpsc::Sender<MailboxChanged>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut delay = Duration::from_secs(1);
         loop {
             let started = Instant::now();
-            if let Err(e) = run(&host, port, &username, password.expose_secret(), &mailbox, &wake_tx).await {
+            if let Err(e) = run(&host, port, &username, &auth, &mailbox, &wake_tx).await {
                 log::warn!("IMAP IDLE watch on {mailbox} lost: {e}");
             }
             if started.elapsed() >= CONNECTED_LONG_ENOUGH_TO_RESET_BACKOFF {
@@ -80,7 +83,7 @@ pub fn spawn(
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(MAX_RECONNECT_DELAY);
         }
-    });
+    })
 }
 
 /// Connects, logs in, selects `mailbox`, then idles in a loop until an error
@@ -90,18 +93,15 @@ async fn run(
     host: &str,
     port: u16,
     username: &str,
-    password: &str,
+    auth: &Auth,
     mailbox: &str,
     wake_tx: &mpsc::Sender<MailboxChanged>,
 ) -> anyhow::Result<()> {
-    let tls_connector = TlsConnector::builder().build()?;
-    let tokio_tls_connector = tokio_native_tls::TlsConnector::from(tls_connector);
-    let stream = TcpStream::connect((host, port)).await?;
-    let tls_stream = tokio_tls_connector.connect(host, stream).await?;
-    let mut client = async_imap::Client::new(tls_stream);
-    let _ = client.read_response().await;
-    let mut session: async_imap::Session<TlsStream<TcpStream>> =
-        client.login(username, password).await.map_err(|(e, _)| e)?;
+    // The same TLS-connect-and-log-in sequence the main session uses, which
+    // also asks `auth` for a fresh secret on every (re)connect: an OAuth
+    // access token from the last attempt may have expired by the time the
+    // backoff loop comes back.
+    let mut session = crate::imap::connect_session(host, port, username, auth).await?;
     // `EXAMINE`, not `SELECT`: this connection only ever watches, it never
     // needs (or wants) write access to flags/expunge.
     session.examine(mailbox).await?;

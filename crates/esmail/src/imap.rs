@@ -4,9 +4,12 @@ use tokio::sync::mpsc;
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsStream;
 use tokio_native_tls::native_tls::TlsConnector;
-use secrecy::{SecretString, ExposeSecret};
+use secrecy::ExposeSecret;
 use futures::StreamExt;
 use anyhow::anyhow;
+
+use crate::auth::{Auth, XOAuth2};
+use crate::oauth::SignInExpired;
 
 /// How many times [`ImapActor::ensure_connected`] retries a lost connection
 /// before giving up and reporting the error to the UI.
@@ -16,13 +19,15 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(16);
 
 /// Credentials kept around so a dropped connection can be retried without the
 /// user re-entering their password. Held only in memory, never persisted —
-/// see `crate::secrets` for the on-disk (keyring) copy.
+/// see `crate::secrets` for the on-disk (keyring) copy. For an OAuth account
+/// `auth` is a shared token source, so each reconnect gets a currently valid
+/// access token rather than replaying the one from the first login.
 #[derive(Clone)]
 struct Credentials {
     host: String,
     port: u16,
     username: String,
-    password: SecretString,
+    auth: Auth,
 }
 
 #[derive(Debug, Clone)]
@@ -264,7 +269,7 @@ pub enum ImapCommand {
         host: String,
         port: u16,
         username: String,
-        password: SecretString,
+        auth: Auth,
     },
     FetchMailboxes,
     /// `req_id` is echoed on the resulting [`ImapEvent::Headers`] (or
@@ -458,12 +463,12 @@ impl ImapActor {
     async fn run(&mut self) {
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
-                ImapCommand::Connect { host, port, username, password } => {
-                    match self.connect(&host, port, &username, password.expose_secret()).await {
+                ImapCommand::Connect { host, port, username, auth } => {
+                    match self.connect(&host, port, &username, &auth).await {
                         Ok(_) => {
                             // Remembered so `ensure_connected` can reconnect
                             // without the user retyping their password.
-                            let creds = Credentials { host, port, username, password };
+                            let creds = Credentials { host, port, username, auth };
                             self.credentials = Some(creds.clone());
                             // One worker per successful `Connect`, not one
                             // per process: a second `Connect` (e.g. logging
@@ -690,7 +695,7 @@ impl ImapActor {
         let mut last_err = None;
         for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
             match self
-                .connect(&creds.host, creds.port, &creds.username, creds.password.expose_secret())
+                .connect(&creds.host, creds.port, &creds.username, &creds.auth)
                 .await
             {
                 Ok(()) => {
@@ -699,7 +704,12 @@ impl ImapActor {
                 }
                 Err(e) => {
                     log::warn!("reconnect attempt {attempt}/{MAX_RECONNECT_ATTEMPTS} failed: {e}");
+                    // Retrying cannot fix a revoked sign-in; only the user can.
+                    let permanent = e.is::<SignInExpired>();
                     last_err = Some(e);
+                    if permanent {
+                        break;
+                    }
                     if attempt < MAX_RECONNECT_ATTEMPTS {
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(MAX_RECONNECT_DELAY);
@@ -710,8 +720,8 @@ impl ImapActor {
         Err(last_err.unwrap_or_else(|| anyhow!("reconnect failed")))
     }
 
-    async fn connect(&mut self, host: &str, port: u16, username: &str, password: &str) -> anyhow::Result<()> {
-        self.session = Some(connect_session(host, port, username, password).await?);
+    async fn connect(&mut self, host: &str, port: u16, username: &str, auth: &Auth) -> anyhow::Result<()> {
+        self.session = Some(connect_session(host, port, username, auth).await?);
         Ok(())
     }
 
@@ -1041,17 +1051,23 @@ fn flag_to_str(flag: &async_imap::types::Flag<'_>) -> String {
     }
 }
 
-/// The TLS-connect-then-`LOGIN` sequence, shared by [`ImapActor::connect`]
+/// The TLS-connect-then-log-in sequence, shared by [`ImapActor::connect`]
 /// and [`spawn_body_worker`]'s own independent connection -- previously
 /// inlined once in each of `ImapActor`'s two (now three, counting the
 /// worker) call sites before B2's session-pool split gave it a second
-/// caller.
-async fn connect_session(
+/// caller. A password account logs in with `LOGIN`; an OAuth one with
+/// `AUTHENTICATE XOAUTH2` and a freshly obtained access token.
+pub(crate) async fn connect_session(
     host: &str,
     port: u16,
     username: &str,
-    password: &str,
+    auth: &Auth,
 ) -> anyhow::Result<async_imap::Session<TlsStream<TcpStream>>> {
+    // Fetched before the connection is opened so a token-refresh failure
+    // (the sign-in was revoked, say) is reported as itself rather than as a
+    // half-open connection that then errors out.
+    let secret = auth.secret().await?;
+
     let tls_connector = TlsConnector::builder().build()?;
     let tokio_tls_connector = tokio_native_tls::TlsConnector::from(tls_connector);
 
@@ -1060,7 +1076,13 @@ async fn connect_session(
     let mut client = async_imap::Client::new(tls_stream);
     let _ = client.read_response().await;
 
-    let session = client.login(username, password).await.map_err(|(e, _)| e)?;
+    let session = match auth {
+        Auth::Password(_) => client.login(username, secret.expose_secret()).await.map_err(|(e, _)| e)?,
+        Auth::OAuth(_) => client
+            .authenticate("XOAUTH2", XOAuth2::new(username, &secret))
+            .await
+            .map_err(|(e, _)| e)?,
+    };
     Ok(session)
 }
 
@@ -1190,11 +1212,16 @@ async fn ensure_worker_connected(credentials: &Credentials) -> anyhow::Result<as
     let mut delay = Duration::from_secs(1);
     let mut last_err = None;
     for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
-        match connect_session(&credentials.host, credentials.port, &credentials.username, credentials.password.expose_secret()).await {
+        match connect_session(&credentials.host, credentials.port, &credentials.username, &credentials.auth).await {
             Ok(session) => return Ok(session),
             Err(e) => {
                 log::warn!("body worker reconnect attempt {attempt}/{MAX_RECONNECT_ATTEMPTS} failed: {e}");
+                // See `ImapActor::ensure_connected`.
+                let permanent = e.is::<SignInExpired>();
                 last_err = Some(e);
+                if permanent {
+                    break;
+                }
                 if attempt < MAX_RECONNECT_ATTEMPTS {
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(MAX_RECONNECT_DELAY);

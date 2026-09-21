@@ -1,4 +1,4 @@
-use esmail::{compose, config, db, idle_watch, imap, notify, render, screenshot, search_query, secrets, smtp};
+use esmail::{auth, compose, config, db, idle_watch, imap, notify, oauth, render, screenshot, search_query, secrets, smtp};
 /// Tray icon + Windows toast notifications (B10). Windows-only: see
 /// notify.rs's module doc for why the pure detection logic lives separately
 /// and builds everywhere.
@@ -104,6 +104,46 @@ struct Banner {
     message: String,
 }
 
+/// The outcome of a "Sign in with Google" browser round trip, sent from the
+/// task that ran it (see `EsMailApp::begin_google_sign_in`) back to the UI.
+/// Carries the account fields as they were when the button was clicked, so
+/// editing the form while the browser is open can't change which account the
+/// freshly authorized token gets attached to.
+enum OAuthMessage {
+    /// The system browser could not be launched; the sign-in is still
+    /// waiting, so the user can open `url` themselves.
+    BrowserUnavailable { url: String },
+    Authorized { host: String, port: u16, username: String, auth: auth::Auth },
+    Failed(String),
+}
+
+/// The whole browser round trip: consent page, redirect, code exchange.
+async fn run_google_sign_in(
+    client: &oauth::OAuthClient,
+    username: &str,
+    tx: &mpsc::Sender<OAuthMessage>,
+    ctx: &egui::Context,
+) -> anyhow::Result<Arc<oauth::TokenSource>> {
+    let pending = oauth::begin(client, username).await?;
+    if let Err(e) = opener::open_browser(&pending.url) {
+        log::warn!("could not open the browser for Google sign-in: {e}");
+        let _ = tx.send(OAuthMessage::BrowserUnavailable { url: pending.url.clone() }).await;
+        ctx.request_repaint();
+    }
+    let grant = pending.finish(client).await?;
+    oauth::TokenSource::from_grant(client.clone(), grant)
+}
+
+/// The Settings window's editable copy of the Google OAuth client, so typing
+/// changes nothing until Save (Cancel just drops it).
+struct SettingsForm {
+    client_id: String,
+    client_secret: String,
+}
+
+/// The host the "Sign in with Google" option is offered for.
+const GMAIL_IMAP_HOST: &str = "imap.gmail.com";
+
 struct EsMailApp {
     web_view: WebView,
     /// Creates views; see `egui_litehtml_webview::WebViewHost`'s own doc for
@@ -136,18 +176,29 @@ struct EsMailApp {
     /// no way to learn those except from the same login form `ImapCommand::
     /// Connect` already reads them from.
     idle_wake_tx: mpsc::Sender<idle_watch::MailboxChanged>,
-    /// Set once the "Connect" button has spawned an `idle_watch` task, so a
-    /// second click (retrying after a typo'd password, say) doesn't leak
-    /// another one. Unlike `ImapActor`'s single `Option<Session>` — which
-    /// naturally drops (and so closes) the old TLS connection when `connect`
-    /// overwrites it — each `idle_watch::spawn` call starts an independent
-    /// `tokio::spawn` loop with no handle to cancel the previous one, so
-    /// without this guard every retry would leave one more IDLE connection
-    /// running forever. Never reset back to `false`: reconnecting to a
-    /// *different* account without restarting the app is already not
-    /// supported cleanly ("Logout" doesn't tear down `ImapActor`'s session
-    /// either — a pre-existing limitation, not one this field adds).
-    idle_watch_started: bool,
+    /// The running `idle_watch` task, if any. Each Connect replaces it: the
+    /// old one is aborted (which drops its IDLE connection) before a new one
+    /// starts with the new credentials. Both halves matter -- without the
+    /// abort every retry would leave one more IDLE connection running
+    /// forever, and without the replacement a retry after a typo'd password,
+    /// or "Sign in again" after a revoked Google token, would leave the watch
+    /// retrying the old credentials for the rest of the session.
+    idle_watch_task: Option<tokio::task::JoinHandle<()>>,
+
+    /// The login form's "Sign in with Google" choice: OAuth2 through the
+    /// browser instead of a password. Only offered for Gmail.
+    use_oauth: bool,
+    /// What the current (or most recent) connection authenticates with.
+    /// SMTP sends reuse it, so an OAuth account's sends share the IMAP
+    /// connection's cached access token instead of each refreshing their own.
+    current_auth: Option<auth::Auth>,
+    oauth_tx: mpsc::Sender<OAuthMessage>,
+    oauth_rx: mpsc::Receiver<OAuthMessage>,
+    /// The running browser round trip, if any. Aborting it closes its local
+    /// redirect listener, which is how "Cancel" works.
+    oauth_task: Option<tokio::task::JoinHandle<()>>,
+    /// The open Settings window's form, if it is open.
+    settings: Option<SettingsForm>,
 
     /// Saved accounts (host/port/username; no passwords — those are in the OS
     /// keyring, see `secrets`). Persisted to `config.toml`.
@@ -414,6 +465,15 @@ impl EsMailApp {
             };
         let initial_status = "Ready".to_string();
 
+        // The form starts on "Sign in with Google" for a returning OAuth
+        // user, and for a brand-new one whenever a Google client is
+        // configured (the empty form defaults to Gmail's host).
+        let use_oauth = match config.accounts.first() {
+            Some(account) => account.auth == config::AuthKind::GoogleOAuth,
+            None => oauth::google_client(config.google_oauth.as_ref()).is_some(),
+        };
+        let (oauth_tx, oauth_rx) = mpsc::channel(4);
+
         // One host per window; a second view (a compose preview, say) would
         // come from this same host. The webview needs nothing from `cc` (no
         // window handle, no GL context -- see egui-litehtml-webview's
@@ -461,7 +521,13 @@ impl EsMailApp {
             smtp_tx: smtp_cmd_tx,
             smtp_rx: smtp_evt_rx,
             idle_wake_tx,
-            idle_watch_started: false,
+            idle_watch_task: None,
+            use_oauth,
+            current_auth: None,
+            oauth_tx,
+            oauth_rx,
+            oauth_task: None,
+            settings: None,
             config,
             host: host_str,
             port: port_str,
@@ -883,6 +949,17 @@ impl EsMailApp {
         if !untouched {
             return;
         }
+        // Runs on every keystroke in the email field while the host still
+        // looks untouched, so the Sign in with Google choice may only be
+        // *defaulted* here, never re-imposed: a user who unticked it must
+        // not see it ticked again by their next keystroke. The untouched
+        // default host is already Gmail, whose default `new()` set.
+        if settings.imap_host != GMAIL_IMAP_HOST {
+            self.use_oauth = false;
+        } else if self.host.is_empty() {
+            // Gmail can skip the app password when a Google client is set up.
+            self.use_oauth = oauth::google_client(self.config.google_oauth.as_ref()).is_some();
+        }
         self.host = settings.imap_host.to_string();
         self.port = settings.imap_port.to_string();
         self.smtp_host = settings.smtp_host.to_string();
@@ -910,7 +987,10 @@ impl EsMailApp {
     /// is derived from the live login form rather than looked up from
     /// `self.config`.
     fn account_id(&self) -> String {
-        format!("{}@{}", self.username, self.host)
+        // Trimmed, like the values a connection is made with, so a stray
+        // space in the form can't make the keyring/config key differ from
+        // the account that actually signed in.
+        format!("{}@{}", self.username.trim(), self.host.trim())
     }
 
     /// A fresh request id for `FetchHeaders`/`FetchBody`, mechanically
@@ -1117,9 +1197,154 @@ impl EsMailApp {
         self.username = account.username.clone();
         self.smtp_host = account.smtp_host.clone();
         self.smtp_port = account.smtp_port.to_string();
-        self.password = secrets::get_password(&account.id, "imap")
-            .map(|s| secrecy::ExposeSecret::expose_secret(&s).to_string())
-            .unwrap_or_default();
+        self.use_oauth = account.auth == config::AuthKind::GoogleOAuth;
+        // An OAuth account has no password to restore; its refresh token is
+        // looked up when Connect is clicked.
+        self.password = if self.use_oauth {
+            String::new()
+        } else {
+            secrets::get_password(&account.id, "imap")
+                .map(|s| secrecy::ExposeSecret::expose_secret(&s).to_string())
+                .unwrap_or_default()
+        };
+    }
+
+    /// Whether the form is currently set to sign in with Google: the box is
+    /// ticked *and* the host is one Google's OAuth actually applies to (the
+    /// box is only shown for Gmail, but stays ticked if the host is edited
+    /// afterwards).
+    fn oauth_active(&self) -> bool {
+        self.use_oauth && self.host.trim() == GMAIL_IMAP_HOST
+    }
+
+    /// Hand `auth` to the IMAP actor for `host`/`port`/`username`, and start
+    /// the IDLE watch alongside it. The one place a connection begins, for a
+    /// typed password and for an OAuth token alike.
+    fn start_connection(&mut self, host: String, port: u16, username: String, auth: auth::Auth) {
+        self.status = "Connecting...".to_string();
+        self.current_auth = Some(auth.clone());
+        let _ = self.imap_tx.try_send(ImapCommand::Connect {
+            host: host.clone(),
+            port,
+            username: username.clone(),
+            auth: auth.clone(),
+        });
+        // A separate, dedicated IDLE connection (see idle_watch's module doc
+        // for why it can't share ImapActor's session) so new-mail detection
+        // is push-based instead of relying only on spawn_new_mail_watch's
+        // poll timer. Started alongside the normal connect rather than only
+        // after `ImapEvent::Connected` arrives: it does its own independent
+        // login/reconnect and simply has nothing to push until it succeeds,
+        // so there is no ordering requirement between the two. Replaces any
+        // earlier watch -- see `idle_watch_task`'s doc.
+        if let Some(previous) = self.idle_watch_task.take() {
+            previous.abort();
+        }
+        self.idle_watch_task = Some(idle_watch::spawn(
+            host,
+            port,
+            username,
+            auth,
+            NEW_MAIL_POLL_MAILBOX.to_string(),
+            self.idle_wake_tx.clone(),
+        ));
+    }
+
+    /// The Connect button. With a password that is just `start_connection`.
+    /// With Google sign-in it reuses the refresh token saved from an earlier
+    /// approval, and only sends the user to the browser when there is none.
+    fn connect_clicked(&mut self, ctx: &egui::Context) {
+        let port: u16 = self.port.parse().unwrap_or(993);
+        // Trimmed: a trailing space would otherwise go out as part of the
+        // XOAUTH2 user and be rejected, though the same account signed in
+        // fine (`begin_google_sign_in` trims) the first time.
+        let host = self.host.trim().to_string();
+        let username = self.username.trim().to_string();
+        if !self.oauth_active() {
+            let auth = auth::Auth::password(self.password.clone());
+            self.start_connection(host, port, username, auth);
+            return;
+        }
+        let Some(client) = self.google_client_or_explain() else { return };
+        match secrets::get_password(&self.account_id(), "oauth") {
+            Some(refresh_token) => {
+                let source = oauth::TokenSource::from_refresh_token(client, refresh_token);
+                self.start_connection(host, port, username, auth::Auth::OAuth(source));
+            }
+            None => self.begin_google_sign_in(ctx),
+        }
+    }
+
+    /// The configured Google OAuth client, or (with a banner saying how to
+    /// configure one) `None`. Google issues tokens only to registered
+    /// applications, so unlike a password this cannot work out of the box --
+    /// see `oauth`'s module doc.
+    fn google_client_or_explain(&mut self) -> Option<oauth::OAuthClient> {
+        let client = oauth::google_client(self.config.google_oauth.as_ref());
+        if client.is_none() {
+            self.push_banner(
+                "Google sign-in needs an OAuth client id: enter it under Settings (top right), or \
+                 set ESMAIL_GOOGLE_CLIENT_ID and ESMAIL_GOOGLE_CLIENT_SECRET. See the esmail README."
+                    .to_string(),
+            );
+        }
+        client
+    }
+
+    /// Open the system browser on Google's consent page and wait, in a
+    /// background task, for the redirect back; the result arrives as an
+    /// [`OAuthMessage`]. Replaces any sign-in already in progress.
+    fn begin_google_sign_in(&mut self, ctx: &egui::Context) {
+        if self.username.trim().is_empty() {
+            self.push_banner("Enter your Gmail address in the Username field first.".to_string());
+            return;
+        }
+        let Some(client) = self.google_client_or_explain() else { return };
+        if let Some(previous) = self.oauth_task.take() {
+            previous.abort();
+        }
+
+        let host = self.host.trim().to_string();
+        let port: u16 = self.port.parse().unwrap_or(993);
+        let username = self.username.trim().to_string();
+        let tx = self.oauth_tx.clone();
+        let ctx = ctx.clone();
+        self.status = "Waiting for Google sign-in in your browser...".to_string();
+        self.oauth_task = Some(tokio::spawn(async move {
+            let message = match run_google_sign_in(&client, &username, &tx, &ctx).await {
+                Ok(source) => OAuthMessage::Authorized { host, port, username, auth: auth::Auth::OAuth(source) },
+                Err(e) => OAuthMessage::Failed(format!("{e:#}")),
+            };
+            let _ = tx.send(message).await;
+            ctx.request_repaint();
+        }));
+    }
+
+    fn handle_oauth_events(&mut self) {
+        while let Ok(message) = self.oauth_rx.try_recv() {
+            match message {
+                OAuthMessage::BrowserUnavailable { url } => {
+                    self.push_banner(format!("Could not open your browser. Open this address to sign in: {url}"));
+                }
+                OAuthMessage::Authorized { host, port, username, auth } => {
+                    self.oauth_task = None;
+                    // The form was editable while the browser was open. The
+                    // token belongs to the account the sign-in was started
+                    // for, and `persist_current_account`/`smtp_account` read
+                    // the form, so put those values back rather than let the
+                    // token be saved under whatever is there now.
+                    self.host = host.clone();
+                    self.port = port.to_string();
+                    self.username = username.clone();
+                    self.start_connection(host, port, username, auth);
+                }
+                OAuthMessage::Failed(error) => {
+                    self.oauth_task = None;
+                    self.status = "Ready".to_string();
+                    self.push_banner(format!("Google sign-in failed: {error}"));
+                }
+            }
+        }
     }
 
     /// Persist the account currently in the login form: upsert it into
@@ -1128,11 +1353,12 @@ impl EsMailApp {
     /// `AccountConfig::username` is documented as used for both). Called
     /// once a connection actually succeeds, not on every keystroke or click.
     fn persist_current_account(&mut self) {
+        let username = self.username.trim().to_string();
         let mut account = AccountConfig::new(
-            self.username.clone(),
-            self.host.clone(),
+            username.clone(),
+            self.host.trim().to_string(),
             self.port.parse().unwrap_or(993),
-            self.username.clone(),
+            username,
         );
         // AccountConfig::new only guesses smtp_host/smtp_port; the login
         // form's fields (pre-filled from that guess, but editable) win.
@@ -1142,12 +1368,33 @@ impl EsMailApp {
         if let Ok(port) = self.smtp_port.parse() {
             account.smtp_port = port;
         }
-        let password = SecretString::from(self.password.clone());
-        if let Err(e) = secrets::set_password(&account.id, "imap", &password) {
-            log::warn!("could not save IMAP password to the OS keyring: {e}");
-        }
-        if let Err(e) = secrets::set_password(&account.id, "smtp", &password) {
-            log::warn!("could not save SMTP password to the OS keyring: {e}");
+        // What the connection that just succeeded actually used decides what
+        // is saved -- not the form, which may have been touched since.
+        match &self.current_auth {
+            // No password anywhere: the refresh token is the credential, and
+            // IMAP and SMTP both derive their access tokens from it.
+            Some(auth::Auth::OAuth(source)) => {
+                account.auth = config::AuthKind::GoogleOAuth;
+                if let Err(e) = secrets::set_password(&account.id, "oauth", &source.refresh_token()) {
+                    log::warn!("could not save the Google sign-in to the OS keyring: {e}");
+                }
+                // An account that used to sign in with a password must not
+                // leave that password behind, unused, in the keyring.
+                secrets::delete_password(&account.id, "imap");
+                secrets::delete_password(&account.id, "smtp");
+            }
+            _ => {
+                // ...and the reverse: a live refresh token for an account
+                // that now uses a password.
+                secrets::delete_password(&account.id, "oauth");
+                let password = SecretString::from(self.password.clone());
+                if let Err(e) = secrets::set_password(&account.id, "imap", &password) {
+                    log::warn!("could not save IMAP password to the OS keyring: {e}");
+                }
+                if let Err(e) = secrets::set_password(&account.id, "smtp", &password) {
+                    log::warn!("could not save SMTP password to the OS keyring: {e}");
+                }
+            }
         }
         self.config.upsert_account(account);
         if let Err(e) = self.config.save() {
@@ -1161,14 +1408,18 @@ impl EsMailApp {
     /// [`EsMailApp::persist_current_account`] has ever run for this account.
     fn smtp_account(&self) -> Option<smtp::SmtpAccount> {
         let account_id = self.account_id();
-        let password = secrets::get_password(&account_id, "smtp")?;
+        let auth = match &self.current_auth {
+            // The very same token source the IMAP connection uses.
+            Some(auth) if auth.is_oauth() => auth.clone(),
+            _ => auth::Auth::Password(secrets::get_password(&account_id, "smtp")?),
+        };
         Some(smtp::SmtpAccount {
             host: self.smtp_host.clone(),
             port: self.smtp_port.parse().unwrap_or(465),
             tls: config::TlsMode::Ssl,
-            username: self.username.clone(),
-            password,
-            from_address: self.username.clone(),
+            username: self.username.trim().to_string(),
+            auth,
+            from_address: self.username.trim().to_string(),
         })
     }
 
@@ -1286,6 +1537,114 @@ impl EsMailApp {
         }
         if star {
             self.toggle_star_on_selection();
+        }
+    }
+
+    /// Open the Settings window, filled from what is saved.
+    fn open_settings(&mut self) {
+        let saved = self.config.google_oauth.as_ref();
+        self.settings = Some(SettingsForm {
+            client_id: saved.map(|c| c.client_id.clone()).unwrap_or_default(),
+            client_secret: saved.and_then(|c| c.client_secret.clone()).unwrap_or_default(),
+        });
+    }
+
+    /// Draws the Settings window when `self.settings` is `Some`: the Google
+    /// OAuth client id and secret that "Sign in with Google" needs (see
+    /// `oauth`'s module doc for why esmail can't supply its own).
+    fn show_settings_window(&mut self, ctx: &egui::Context) {
+        // Only while the window is open: this reads environment variables,
+        // which is not something to do on every frame of a closed window.
+        if self.settings.is_none() {
+            return;
+        }
+        // Read before the form is borrowed, so the window can say when an
+        // environment variable is overriding what is typed here.
+        let active_source = oauth::google_client_with_source(self.config.google_oauth.as_ref()).map(|(_, source)| source);
+        let Some(form) = &mut self.settings else {
+            return;
+        };
+
+        let mut open = true;
+        let mut save_clicked = false;
+        let mut cancel_clicked = false;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.heading("Sign in with Google");
+                ui.label(
+                    "Lets Gmail accounts sign in through the browser instead of an app password. \
+                     Create a \"Desktop app\" OAuth client in Google Cloud Console and enter its \
+                     credentials here (see the esmail README).",
+                );
+                ui.add_space(6.0);
+                egui::Grid::new("google_oauth_settings").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("Client ID");
+                    ui.add(egui::TextEdit::singleline(&mut form.client_id).desired_width(340.0));
+                    ui.end_row();
+                    ui.label("Client secret");
+                    ui.add(egui::TextEdit::singleline(&mut form.client_secret).password(true).desired_width(340.0));
+                    ui.end_row();
+                });
+                ui.add_space(4.0);
+                match active_source {
+                    Some(oauth::ClientSource::Environment) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(200, 140, 30),
+                            "The ESMAIL_GOOGLE_CLIENT_ID environment variable is set and takes precedence \
+                             over what is saved here.",
+                        );
+                    }
+                    Some(source) => {
+                        ui.weak(format!("Currently using: {}.", source.label()));
+                    }
+                    None => {
+                        ui.weak("No client configured yet.");
+                    }
+                }
+                ui.weak("Saved in config.toml. Leave the client ID empty to remove it.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save_clicked = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if save_clicked {
+            if let Some(form) = self.settings.take() {
+                self.apply_settings(form);
+            }
+        } else if cancel_clicked || !open {
+            self.settings = None;
+        }
+    }
+
+    /// Persist the Settings form into `config.toml`.
+    fn apply_settings(&mut self, form: SettingsForm) {
+        let client_id = form.client_id.trim().to_string();
+        let client_secret = form.client_secret.trim().to_string();
+        self.config.google_oauth = (!client_id.is_empty()).then(|| config::OAuthClientConfig {
+            client_id,
+            client_secret: (!client_secret.is_empty()).then_some(client_secret),
+        });
+        match self.config.save() {
+            Ok(()) => self.status = "Settings saved".to_string(),
+            Err(e) => self.push_banner(format!("Could not save settings: {e}")),
+        }
+        // A first-time user who has just configured a client and is looking
+        // at the Gmail defaults most likely wants Sign in with Google.
+        if self.config.accounts.is_empty()
+            && self.host.trim() == GMAIL_IMAP_HOST
+            && oauth::google_client(self.config.google_oauth.as_ref()).is_some()
+        {
+            self.use_oauth = true;
         }
     }
 
@@ -1485,6 +1844,7 @@ impl eframe::App for EsMailApp {
             return;
         }
 
+        self.handle_oauth_events();
         self.handle_imap_events();
         self.handle_db_events();
         self.handle_smtp_events();
@@ -1567,6 +1927,9 @@ impl eframe::App for EsMailApp {
                         let next = self.theme.next();
                         self.apply_theme(ui.ctx(), next);
                     }
+                    if ui.button("Settings").clicked() {
+                        self.open_settings();
+                    }
                 });
             });
         });
@@ -1619,6 +1982,7 @@ impl eframe::App for EsMailApp {
                             }
                             if let Some(id) = to_remove {
                                 secrets::delete_password(&id, "imap");
+                                secrets::delete_password(&id, "oauth");
                                 self.config.remove_account(&id);
                                 if let Err(e) = self.config.save() {
                                     log::warn!("could not persist account removal: {e}");
@@ -1650,7 +2014,18 @@ impl eframe::App for EsMailApp {
                         ui.add(egui::TextEdit::singleline(&mut self.host).hint_text("IMAP Host"));
                         ui.add(egui::TextEdit::singleline(&mut self.port).hint_text("Port"));
                         ui.add(egui::TextEdit::singleline(&mut self.username).hint_text("Username"));
-                        ui.add(egui::TextEdit::singleline(&mut self.password).password(true).hint_text("Password"));
+
+                        // Gmail can sign in through the browser instead of
+                        // an app password (see `oauth`'s module doc). The
+                        // box only appears for Gmail's host, and replaces the
+                        // password field when ticked.
+                        if self.host.trim() == GMAIL_IMAP_HOST {
+                            ui.checkbox(&mut self.use_oauth, "Sign in with Google (no app password)");
+                        }
+                        let oauth_active = self.oauth_active();
+                        if !oauth_active {
+                            ui.add(egui::TextEdit::singleline(&mut self.password).password(true).hint_text("Password"));
+                        }
 
                         // Guessed by config::derive_smtp_host (imap. -> smtp.)
                         // when this is a brand new account; editable since
@@ -1658,39 +2033,30 @@ impl eframe::App for EsMailApp {
                         ui.add(egui::TextEdit::singleline(&mut self.smtp_host).hint_text("SMTP Host"));
                         ui.add(egui::TextEdit::singleline(&mut self.smtp_port).hint_text("SMTP Port"));
 
-                        if ui.button("Connect").clicked() {
-                            self.status = "Connecting...".to_string();
-                            let port: u16 = self.port.parse().unwrap_or(993);
-                            let cmd = ImapCommand::Connect {
-                                host: self.host.clone(),
-                                port,
-                                username: self.username.clone(),
-                                password: self.password.clone().into(),
-                            };
-                            let _ = self.imap_tx.try_send(cmd);
-                            // A separate, dedicated IDLE connection (see
-                            // idle_watch's module doc for why it can't share
-                            // ImapActor's session) so new-mail detection is
-                            // push-based instead of relying only on
-                            // spawn_new_mail_watch's poll timer. Started
-                            // alongside the normal connect rather than only
-                            // after `ImapEvent::Connected` arrives: it does
-                            // its own independent login/reconnect and simply
-                            // has nothing to push until it succeeds, so there
-                            // is no ordering requirement between the two.
-                            // Guarded by `idle_watch_started` -- see that
-                            // field's doc -- so clicking Connect more than
-                            // once can't spawn more than one.
-                            if !self.idle_watch_started {
-                                self.idle_watch_started = true;
-                                idle_watch::spawn(
-                                    self.host.clone(),
-                                    port,
-                                    self.username.clone(),
-                                    self.password.clone().into(),
-                                    NEW_MAIL_POLL_MAILBOX.to_string(),
-                                    self.idle_wake_tx.clone(),
-                                );
+                        if self.oauth_task.is_some() {
+                            ui.label("Finish signing in with Google in your browser...");
+                            if ui.button("Cancel").clicked() {
+                                if let Some(task) = self.oauth_task.take() {
+                                    task.abort();
+                                }
+                                self.status = "Ready".to_string();
+                            }
+                        } else {
+                            ui.horizontal(|ui| {
+                                if ui.button("Connect").clicked() {
+                                    self.connect_clicked(ui.ctx());
+                                }
+                                if oauth_active
+                                    && ui
+                                        .button("Sign in again")
+                                        .on_hover_text("Go through Google's consent page again, even if this account was approved before")
+                                        .clicked()
+                                {
+                                    self.begin_google_sign_in(ui.ctx());
+                                }
+                            });
+                            if oauth_active {
+                                ui.weak("The first time, your browser opens so you can approve access.");
                             }
                         }
                     });
@@ -2002,6 +2368,7 @@ impl eframe::App for EsMailApp {
         }
 
         self.show_compose_window(ui.ctx());
+        self.show_settings_window(ui.ctx());
     }
 }
 

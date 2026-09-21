@@ -1,4 +1,4 @@
-//! A minimal SMTP server -- `EHLO`, `AUTH PLAIN`, `MAIL FROM`, `RCPT TO`,
+//! A minimal SMTP server -- `EHLO`, `AUTH PLAIN`/`AUTH XOAUTH2`, `MAIL FROM`, `RCPT TO`,
 //! `DATA`, `RSET`, `QUIT` -- just what `smtp.rs`'s `lettre` transport sends.
 //!
 //! Plaintext only, matching `TlsMode::None` in `esmail::config`, which its
@@ -62,7 +62,19 @@ async fn handle_connection(stream: tokio::net::TcpStream, store: SharedStore) ->
         let upper = trimmed.to_ascii_uppercase();
 
         if upper.starts_with("EHLO") || upper.starts_with("HELO") {
-            write_half.write_all(b"250-esmail mock server\r\n250 AUTH PLAIN\r\n").await?;
+            write_half.write_all(b"250-esmail mock server\r\n250 AUTH PLAIN XOAUTH2\r\n").await?;
+        } else if upper.starts_with("AUTH XOAUTH2") {
+            let arg = trimmed["AUTH XOAUTH2".len()..].trim();
+            let ok = base64::engine::general_purpose::STANDARD
+                .decode(arg)
+                .ok()
+                .is_some_and(|payload| store.lock().unwrap().check_xoauth2(&payload).is_some());
+            authenticated = ok;
+            if ok {
+                write_half.write_all(b"235 Authentication successful\r\n").await?;
+            } else {
+                write_half.write_all(b"535 Authentication failed\r\n").await?;
+            }
         } else if upper.starts_with("AUTH PLAIN") {
             let arg = trimmed["AUTH PLAIN".len()..].trim();
             let ok = authenticate_plain(&store, arg);

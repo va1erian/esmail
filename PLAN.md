@@ -69,8 +69,13 @@ The UI thread sends render jobs and paints the finished display lists.
   persistence, provider-table first-run autofill.
 - **Notifications (Windows only):** tray icon, new-mail toasts, polled every
   60 s and woken immediately by IDLE pushes.
-- **Auth:** password / app-password only. OAuth2 is out of scope, so Gmail and
-  Outlook work mainly with app passwords.
+- **Auth:** password / app-password, plus "Sign in with Google" for Gmail:
+  OAuth2 (PKCE, loopback redirect) and SASL `XOAUTH2` over IMAP, IDLE and
+  SMTP, with the refresh token in the OS keyring (`oauth.rs`, `auth.rs`).
+  It needs an OAuth client id the user registers themselves and enters under
+  Settings (or env vars / `config.toml`, see README). Outlook
+  still needs an app password; Google refresh tokens are not revoked on
+  "forget account".
 
 ## Open work
 

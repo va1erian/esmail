@@ -93,6 +93,13 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # MessageViewHandler uses to fetch a remote image once the user has opted
 # in via "Load remote images" (B5 in PLAN.md).
 ureq = "3"
+# OAuth2 sign-in (oauth.rs): PKCE needs a SHA-256 and OS randomness, and the
+# token endpoint answers in JSON. Deliberately small pieces rather than an
+# `oauth2` crate -- the whole flow is two HTTP form posts and a loopback
+# redirect, and that crate would pull in its own HTTP stack next to `ureq`.
+sha2 = "0.10"
+getrandom = "0.3"
+serde_json = "1"
 
 [profile.release]
 opt-level = "z"     # Optimize for size

@@ -4,6 +4,7 @@
 //! `ImapActor`/`SmtpActor` directly against `mail-mock-server` — nothing
 //! about the app's own structure or module boundaries changes.
 
+pub mod auth;
 pub mod compose;
 pub mod config;
 pub mod css;
@@ -11,6 +12,7 @@ pub mod db;
 pub mod idle_watch;
 pub mod imap;
 pub mod notify;
+pub mod oauth;
 pub mod render;
 pub mod screenshot;
 pub mod search_query;
