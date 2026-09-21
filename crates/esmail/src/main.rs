@@ -157,8 +157,9 @@ struct EsMailApp {
     #[allow(dead_code)]
     web_view_host: WebViewHost,
     /// Bound to `web_view` at construction. Toggled per-message by the "Load
-    /// remote images" button; reset to blocked whenever a new message is
-    /// opened. See [`MessageViewHandler`].
+    /// remote images" button; reset whenever a new message is opened to
+    /// blocked, or to allowed if its sender is on
+    /// `Config::image_trusted_senders`. See [`MessageViewHandler`].
     message_view_handler: Arc<MessageViewHandler>,
     screenshotter: screenshot::Screenshotter,
     /// Show only the webview, with no IMAP account. See ESMAIL_PREVIEW.
@@ -290,6 +291,11 @@ struct EsMailApp {
     /// only stores rendered HTML, not the raw bytes attachments come from;
     /// see PLAN.md §B6.
     current_attachments: Vec<render::Attachment>,
+    /// Lowercased address of the open message's sender (`None` when nothing
+    /// is open or the header has no address). What the remote-images bar
+    /// offers to trust, and what `open_message` looked up in
+    /// `Config::image_trusted_senders` when it opened the message.
+    current_sender: Option<String>,
     /// The currently-open message's rendered HTML, kept only so
     /// Reply/Reply All/Forward (B7) can quote it — see `compose.rs`. Empty
     /// when no message is loaded.
@@ -555,6 +561,7 @@ impl EsMailApp {
             current_page: 1,
             total_pages: 1,
             current_attachments: Vec::new(),
+            current_sender: None,
             current_message_html: String::new(),
             compose: None,
             compose_status: String::new(),
@@ -932,6 +939,23 @@ impl EsMailApp {
         }
     }
 
+    /// Persist `self.config` after a small preference change (image trust,
+    /// folded folders), logging rather than surfacing a failure: losing the
+    /// preference on the next launch is not worth a banner.
+    fn save_config(&self, what: &str) {
+        if let Err(e) = self.config.save() {
+            log::warn!("could not persist {what}: {e}");
+        }
+    }
+
+    /// Add (`trusted`) or remove `address` on the always-load-images list
+    /// and save it if that changed anything.
+    fn set_image_sender_trusted(&mut self, address: &str, trusted: bool) {
+        if self.config.set_image_trusted(address, trusted) {
+            self.save_config("remote-image sender list");
+        }
+    }
+
     /// First-run wizard (B9): if `self.wizard_email` names a domain
     /// `config::provider_for_email` recognizes, and the host fields still
     /// look untouched (empty, or still holding the generic `imap.gmail.com`/
@@ -1043,8 +1067,20 @@ impl EsMailApp {
     fn open_message(&mut self, uid: u32, is_search: bool) {
         self.selected_uid = Some(uid);
         // A new message defaults to blocked remote content, same as any
-        // other mail client; "Load remote images" opts back in per view.
-        self.message_view_handler.set_allow_remote(false);
+        // other mail client; "Load remote images" opts back in per view, and
+        // "Always load from ..." opts a sender in for good. The sender comes
+        // from the header list because the body has not arrived yet, and the
+        // handler is set before it does, so a trusted sender's first frame
+        // already has its images.
+        self.current_sender = self
+            .search_results
+            .as_ref()
+            .unwrap_or(&self.headers)
+            .iter()
+            .find(|h| h.uid == uid)
+            .and_then(MailHeader::sender_address);
+        let trusted = self.current_sender.as_deref().is_some_and(|a| self.config.is_image_trusted(a));
+        self.message_view_handler.set_allow_remote(trusted);
         self.current_attachments.clear();
         self.web_view.load(WebViewSource::Html("<i>Loading message...</i>".to_string()));
         if is_search {
@@ -2078,7 +2114,50 @@ impl eframe::App for EsMailApp {
                         // which can't happen while `row` still borrows
                         // self.mailbox_rows.
                         let mut clicked_mailbox = None;
-                        for row in &self.mailbox_rows {
+                        // Same deferral for a fold toggle: it edits
+                        // `self.config`, which `row` (borrowed from
+                        // `self.mailbox_rows`) is still alive across.
+                        let mut toggled_folder: Option<(String, bool)> = None;
+                        let account_id = self.account_id();
+                        let collapsed: std::collections::BTreeSet<String> = self
+                            .config
+                            .collapsed_folders
+                            .iter()
+                            .filter_map(|k| k.strip_prefix(&account_id)?.strip_prefix('\t'))
+                            .map(str::to_string)
+                            .collect();
+                        for index in imap::visible_rows(&self.mailbox_rows, &collapsed) {
+                            let row = &self.mailbox_rows[index];
+                            let is_collapsed = row.has_children && collapsed.contains(&row.key);
+                            // A folded node shows its whole subtree's unread
+                            // count, so mail in a hidden child is not lost.
+                            let subtree_unread = |own: Option<&String>| -> u32 {
+                                let own = own.and_then(|n| self.unread_counts.get(n)).copied().unwrap_or(0);
+                                let below: u32 = if is_collapsed {
+                                    imap::descendants(&self.mailbox_rows, index)
+                                        .iter()
+                                        .filter_map(|r| r.full_name.as_ref().and_then(|n| self.unread_counts.get(n)))
+                                        .sum()
+                                } else {
+                                    0
+                                };
+                                own + below
+                            };
+                            let mut indent = |ui: &mut egui::Ui| {
+                                ui.add_space(row.depth as f32 * 14.0);
+                                if row.has_children {
+                                    let arrow = if is_collapsed { "\u{25b8}" } else { "\u{25be}" };
+                                    let hint = if is_collapsed { "Expand" } else { "Collapse" };
+                                    if ui.add(egui::Button::new(arrow).frame(false).small()).on_hover_text(hint).clicked() {
+                                        toggled_folder = Some((row.key.clone(), !is_collapsed));
+                                    }
+                                } else {
+                                    // Keeps leaf labels lined up with the
+                                    // labels of their siblings that have an
+                                    // arrow.
+                                    ui.add_space(ui.spacing().interact_size.y * 0.75);
+                                }
+                            };
                             let Some(full_name) = &row.full_name else {
                                 // A hierarchy node with no mailbox of its own
                                 // (see MailboxNode::full_name's doc) -- shown
@@ -2088,25 +2167,32 @@ impl eframe::App for EsMailApp {
                                 // `mailbox_tree` leaves `full_name` unset for
                                 // those too, since neither can be
                                 // `SELECT`/`EXAMINE`d.
+                                let unread = subtree_unread(None);
                                 ui.horizontal(|ui| {
-                                    ui.add_space(row.depth as f32 * 14.0);
-                                    ui.label(egui::RichText::new(&row.label).weak());
+                                    indent(ui);
+                                    let label = if unread > 0 { format!("{}  ({unread})", row.label) } else { row.label.clone() };
+                                    ui.label(egui::RichText::new(label).weak());
                                 });
                                 continue;
                             };
                             let is_selected = self.selected_mailbox == *full_name;
-                            let unread = self.unread_counts.get(full_name).copied().unwrap_or(0);
+                            let unread = subtree_unread(Some(full_name));
                             let label = if unread > 0 {
                                 format!("{}  ({unread})", row.label)
                             } else {
                                 row.label.clone()
                             };
                             ui.horizontal(|ui| {
-                                ui.add_space(row.depth as f32 * 14.0);
+                                indent(ui);
                                 if ui.add(egui::Button::selectable(is_selected, label)).clicked() {
                                     clicked_mailbox = Some(full_name.clone());
                                 }
                             });
+                        }
+                        if let Some((key, collapse)) = toggled_folder {
+                            if self.config.set_folder_collapsed(&account_id, &key, collapse) {
+                                self.save_config("folded mailbox folders");
+                            }
                         }
                         if let Some(mb) = clicked_mailbox {
                             self.selected_mailbox = mb.clone();
@@ -2192,10 +2278,7 @@ impl eframe::App for EsMailApp {
                         let mut clicked: Option<(u32, egui::Modifiers)> = None;
                         for header in list {
                             let is_selected = self.selected_uids.contains(&header.uid) || self.selected_uid == Some(header.uid);
-                            let unread_mark = if header.is_seen() { "\u{2003}" } else { "\u{25cf} " };
-                            let star_mark = if header.is_flagged() { "\u{2605} " } else { "" };
-                            let text = format!("{unread_mark}{star_mark}{}\n{}", header.from, header.subject);
-                            let resp = ui.add(egui::Button::selectable(is_selected, text));
+                            let resp = message_row(ui, header, is_selected);
                             if resp.clicked() {
                                 clicked = Some((header.uid, ui.input(|i| i.modifiers)));
                             }
@@ -2314,9 +2397,10 @@ impl eframe::App for EsMailApp {
                     // shown rather than only when the message actually has
                     // remote images — knowing whether it does would mean
                     // parsing the HTML again here just to answer that.
+                    let sender_trusted = self.current_sender.as_deref().is_some_and(|a| self.config.is_image_trusted(a));
                     if !self.message_view_handler.allow_remote() {
                         egui::Panel::top("remote_images_bar").show(ui, |ui| {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Remote images are blocked for this message.");
                                 if ui.button("Load remote images").clicked() {
                                     self.message_view_handler.set_allow_remote(true);
@@ -2325,6 +2409,34 @@ impl eframe::App for EsMailApp {
                                     // reload against the same document is
                                     // enough for the now-unblocked requests
                                     // to actually go out.
+                                    self.web_view.reload();
+                                }
+                                if let Some(sender) = self.current_sender.clone() {
+                                    if ui
+                                        .button(format!("Always load from {sender}"))
+                                        .on_hover_text("Load remote images automatically for every message from this address")
+                                        .clicked()
+                                    {
+                                        self.set_image_sender_trusted(&sender, true);
+                                        self.message_view_handler.set_allow_remote(true);
+                                        self.web_view.reload();
+                                    }
+                                }
+                            });
+                        });
+                    } else if sender_trusted {
+                        // Shown only for a sender on the always-load list,
+                        // so it is clear why nothing was blocked and how to
+                        // undo it. A message loaded once via "Load remote
+                        // images" gets no bar: that choice was this
+                        // message's alone.
+                        egui::Panel::top("remote_images_bar").show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                let sender = self.current_sender.clone().unwrap_or_default();
+                                ui.label(egui::RichText::new(format!("Remote images load automatically for {sender}.")).weak());
+                                if ui.button("Stop").clicked() {
+                                    self.set_image_sender_trusted(&sender, false);
+                                    self.message_view_handler.set_allow_remote(false);
                                     self.web_view.reload();
                                 }
                             });
@@ -2602,6 +2714,95 @@ fn export_file_name(subject: &str, uid: u32) -> String {
     }
 }
 
+/// One row of the message list: the sender on a first line, the subject
+/// beneath it, each cut off with an ellipsis rather than wrapped so every row
+/// has the same height.
+///
+/// Unread and read rows are told apart by more than a bullet: an unread row
+/// gets an accent bar on its left edge, its sender in the strong text colour
+/// (drawn twice, half a pixel apart, as egui ships no bold face) and its
+/// subject in the normal colour; a read row has neither bar nor emphasis, a
+/// normal-colour sender and a dimmed subject. A starred message gets a ★ at
+/// the right end of the sender line. Painted by hand, not with a `Button`,
+/// because a button cannot truncate two differently-styled lines.
+fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::Response {
+    const PAD_X: f32 = 10.0;
+    const PAD_Y: f32 = 6.0;
+    const ACCENT_BAR_WIDTH: f32 = 3.0;
+    const LINE_GAP: f32 = 2.0;
+    const SENDER_SIZE: f32 = 14.5;
+    const SUBJECT_SIZE: f32 = 13.0;
+
+    let unread = !header.is_seen();
+    let visuals = ui.visuals();
+    let (sender_color, subject_color) = if selected {
+        (visuals.selection.stroke.color, visuals.selection.stroke.color)
+    } else if unread {
+        (visuals.strong_text_color(), visuals.text_color())
+    } else {
+        (visuals.text_color(), visuals.weak_text_color())
+    };
+    let accent = visuals.hyperlink_color;
+    let star_color = visuals.warn_fg_color;
+    let selected_fill = visuals.selection.bg_fill;
+    let hovered_fill = visuals.widgets.hovered.weak_bg_fill;
+    let separator = visuals.widgets.noninteractive.bg_stroke;
+
+    // Lays `text` out on one line, truncated with an ellipsis at `width`.
+    let one_line = |ui: &egui::Ui, text: &str, size: f32, color: egui::Color32, width: f32| {
+        let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), egui::FontId::proportional(size), color);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(width);
+        ui.painter().layout_job(job)
+    };
+
+    let width = ui.available_width();
+    let star = header
+        .is_flagged()
+        .then(|| one_line(ui, "\u{2605}", SENDER_SIZE, star_color, f32::INFINITY));
+    let star_width = star.as_ref().map_or(0.0, |g| g.size().x + 4.0);
+    let text_width = (width - ACCENT_BAR_WIDTH - PAD_X * 2.0 - star_width).max(0.0);
+
+    let sender = header.sender_name();
+    let sender = if sender.is_empty() { "(unknown sender)" } else { sender.as_str() };
+    let subject = if header.subject.is_empty() { "(no subject)" } else { header.subject.as_str() };
+    let sender_galley = one_line(ui, sender, SENDER_SIZE, sender_color, text_width);
+    let subject_galley = one_line(ui, subject, SUBJECT_SIZE, subject_color, text_width);
+
+    let height = PAD_Y * 2.0 + sender_galley.size().y + LINE_GAP + subject_galley.size().y;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, format!("{sender}: {subject}")));
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if selected {
+            painter.rect_filled(rect, 0.0, selected_fill);
+        } else if response.hovered() {
+            painter.rect_filled(rect, 0.0, hovered_fill);
+        }
+        if unread {
+            let bar = egui::Rect::from_min_size(rect.min, egui::vec2(ACCENT_BAR_WIDTH, rect.height()));
+            painter.rect_filled(bar, 0.0, if selected { sender_color } else { accent });
+        }
+        let text_left = rect.left() + ACCENT_BAR_WIDTH + PAD_X;
+        let sender_pos = egui::pos2(text_left, rect.top() + PAD_Y);
+        painter.galley(sender_pos, sender_galley.clone(), sender_color);
+        if unread {
+            painter.galley(sender_pos + egui::vec2(0.5, 0.0), sender_galley.clone(), sender_color);
+        }
+        if let Some(star) = star {
+            painter.galley(egui::pos2(rect.right() - PAD_X - star.size().x, sender_pos.y), star, star_color);
+        }
+        let subject_pos = egui::pos2(text_left, sender_pos.y + sender_galley.size().y + LINE_GAP);
+        painter.galley(subject_pos, subject_galley, subject_color);
+        painter.hline(rect.x_range(), rect.bottom(), separator);
+    }
+
+    response.on_hover_ui(|ui| {
+        ui.label(&header.from);
+        ui.label(&header.subject);
+    })
+}
+
 /// The set of UIDs between `anchor` and `uid` (inclusive) in `list`'s
 /// current order, for shift-click range selection (B8). Falls back to just
 /// `{uid}` if either isn't actually in `list` (e.g. the anchor was on a page
@@ -2788,7 +2989,8 @@ mod tests {
     // ── find_special_use_mailbox ─────────────────────────────────────────────
 
     fn row(full_name: Option<&str>, special_use: Option<imap::SpecialUse>) -> imap::MailboxRow {
-        imap::MailboxRow { depth: 0, label: full_name.unwrap_or("").to_string(), full_name: full_name.map(str::to_string), special_use }
+        let label = full_name.unwrap_or("").to_string();
+        imap::MailboxRow { depth: 0, key: label.clone(), label, full_name: full_name.map(str::to_string), special_use, has_children: false }
     }
 
     #[test]

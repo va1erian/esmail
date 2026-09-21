@@ -2,6 +2,7 @@
 //! replacing the old 3-line `esmail_config.txt`. Passwords never live here —
 //! see [`crate::secrets`] for those.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -247,6 +248,21 @@ pub struct Config {
     /// environment variable, or a build-time one, can supply it instead).
     #[serde(default)]
     pub google_oauth: Option<OAuthClientConfig>,
+    /// Sender addresses (lowercased) whose remote images load without asking:
+    /// the "Always load from ..." button on the remote-images bar. A set, so
+    /// trusting the same sender twice is a no-op and the file stays sorted.
+    #[serde(default)]
+    pub image_trusted_senders: BTreeSet<String>,
+    /// Mailbox-tree nodes the user collapsed, as [`collapsed_folder_key`]s.
+    #[serde(default)]
+    pub collapsed_folders: BTreeSet<String>,
+}
+
+/// The `Config::collapsed_folders` entry for the tree node `folder_key`
+/// (`imap::MailboxRow::key`) of account `account_id`. Keyed per account so
+/// two accounts that both have an `INBOX/Work` don't share a fold state.
+pub fn collapsed_folder_key(account_id: &str, folder_key: &str) -> String {
+    format!("{account_id}\t{folder_key}")
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -339,6 +355,33 @@ impl Config {
     /// Remove the account with this `id`, if any.
     pub fn remove_account(&mut self, id: &str) {
         self.accounts.retain(|a| a.id != id);
+    }
+
+    /// Whether remote images load automatically for mail from `address`
+    /// (compared case-insensitively).
+    pub fn is_image_trusted(&self, address: &str) -> bool {
+        self.image_trusted_senders.contains(&address.to_ascii_lowercase())
+    }
+
+    /// Start (`trusted`) or stop trusting `address`'s remote images. Returns
+    /// whether the set changed, i.e. whether the config needs saving.
+    pub fn set_image_trusted(&mut self, address: &str, trusted: bool) -> bool {
+        let address = address.to_ascii_lowercase();
+        if trusted {
+            self.image_trusted_senders.insert(address)
+        } else {
+            self.image_trusted_senders.remove(&address)
+        }
+    }
+
+    /// Fold or unfold a mailbox-tree node. Returns whether anything changed.
+    pub fn set_folder_collapsed(&mut self, account_id: &str, folder_key: &str, collapsed: bool) -> bool {
+        let key = collapsed_folder_key(account_id, folder_key);
+        if collapsed {
+            self.collapsed_folders.insert(key)
+        } else {
+            self.collapsed_folders.remove(&key)
+        }
     }
 }
 
@@ -471,11 +514,51 @@ mod tests {
             accounts: vec![],
             theme: ThemeMode::Dark,
             window: Some(WindowGeometry { x: 10.0, y: 20.0, width: 800.0, height: 600.0 }),
-            google_oauth: None,
+            ..Config::default()
         };
         let toml = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml).unwrap();
         assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn config_with_trusted_senders_and_collapsed_folders_round_trips_through_toml() {
+        let mut config = Config::default();
+        config.upsert_account(AccountConfig::new("A".into(), "imap.example.com".into(), 993, "alice".into()));
+        config.set_image_trusted("news@example.com", true);
+        config.set_folder_collapsed("alice@imap.example.com", "Work", true);
+        let toml = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn config_without_trusted_senders_or_collapsed_folders_still_parses() {
+        let parsed: Config = toml::from_str("accounts = []\n").unwrap();
+        assert!(parsed.image_trusted_senders.is_empty());
+        assert!(parsed.collapsed_folders.is_empty());
+    }
+
+    #[test]
+    fn image_trust_is_case_insensitive_and_reports_whether_it_changed() {
+        let mut config = Config::default();
+        assert!(!config.is_image_trusted("News@Example.com"));
+        assert!(config.set_image_trusted("News@Example.com", true));
+        assert!(config.is_image_trusted("news@example.COM"));
+        assert!(!config.set_image_trusted("news@example.com", true), "already trusted");
+        assert!(config.set_image_trusted("NEWS@example.com", false));
+        assert!(!config.is_image_trusted("news@example.com"));
+        assert!(!config.set_image_trusted("news@example.com", false), "already untrusted");
+    }
+
+    #[test]
+    fn folder_collapse_state_is_kept_per_account() {
+        let mut config = Config::default();
+        assert!(config.set_folder_collapsed("a", "Work", true));
+        assert!(config.collapsed_folders.contains(&collapsed_folder_key("a", "Work")));
+        assert!(!config.collapsed_folders.contains(&collapsed_folder_key("b", "Work")));
+        assert!(config.set_folder_collapsed("a", "Work", false));
+        assert!(config.collapsed_folders.is_empty());
     }
 
     /// An old `config.toml` written before B9 added `theme`/`window` has
