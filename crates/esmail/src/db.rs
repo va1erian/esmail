@@ -85,6 +85,11 @@ pub enum DbCommand {
         mailbox: String,
         uid: u32,
     },
+    /// Forget everything cached for an account -- its messages, bodies, search
+    /// index and sync state -- when the account is removed. Without this its
+    /// mail would stay on disk, keep turning up in search across accounts, and
+    /// a later re-add would trust a stale sync state.
+    RemoveAccount { account_id: String },
 }
 
 pub enum DbEvent {
@@ -205,6 +210,11 @@ impl DbActor {
                 }
                 DbCommand::RemoveMessage { account_id, mailbox, uid } => {
                     if let Err(e) = remove_message(&self.conn, &account_id, &mailbox, uid) {
+                        let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    }
+                }
+                DbCommand::RemoveAccount { account_id } => {
+                    if let Err(e) = remove_account(&self.conn, &account_id) {
                         let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
                     }
                 }
@@ -557,6 +567,14 @@ fn update_flags(conn: &Connection, account_id: &str, mailbox: &str, uid: u32, fl
 }
 
 /// Drop a moved-away message from every table that might hold it (B8).
+/// Delete every row cached for `account_id`, from every table.
+fn remove_account(conn: &Connection, account_id: &str) -> rusqlite::Result<()> {
+    for table in ["messages", "bodies", "messages_fts", "mailboxes"] {
+        conn.execute(&format!("DELETE FROM {table} WHERE account_id = ?1"), params![account_id])?;
+    }
+    Ok(())
+}
+
 fn remove_message(conn: &Connection, account_id: &str, mailbox: &str, uid: u32) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM messages WHERE account_id = ?1 AND mailbox = ?2 AND uid = ?3", params![account_id, mailbox, uid])?;
     conn.execute("DELETE FROM bodies WHERE account_id = ?1 AND mailbox = ?2 AND uid = ?3", params![account_id, mailbox, uid])?;
@@ -807,6 +825,26 @@ mod tests {
         let conn = test_conn();
         // No index_mail/index_headers call for uid 1 -- nothing cached.
         update_flags(&conn, "acc", "INBOX", 1, &["\\Seen".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn remove_account_forgets_that_account_only() {
+        let conn = test_conn();
+        index_mail(&conn, "gone", "INBOX", &test_header(1), "needle").unwrap();
+        index_mail(&conn, "kept", "INBOX", &test_header(1), "needle").unwrap();
+        report_mailbox_state(&conn, "gone", "INBOX", 7, 2).unwrap();
+        report_mailbox_state(&conn, "kept", "INBOX", 7, 2).unwrap();
+
+        remove_account(&conn, "gone").unwrap();
+
+        let hits = search(&conn, None, "needle", None).unwrap();
+        assert_eq!(hits.len(), 1, "only the other account's mail is left to find");
+        assert_eq!(hits[0].account_id, "kept");
+        assert!(fetch_mail(&conn, "gone", "INBOX", 1).is_err(), "its cached body is gone too");
+        // Its sync state is gone as well, so a re-add starts from scratch rather
+        // than trusting an empty cache; the other account's is untouched.
+        assert_ne!(report_mailbox_state(&conn, "gone", "INBOX", 7, 2).unwrap(), SyncPlan::UpToDate);
+        assert_eq!(report_mailbox_state(&conn, "kept", "INBOX", 7, 2).unwrap(), SyncPlan::UpToDate);
     }
 
     #[test]

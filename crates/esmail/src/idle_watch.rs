@@ -85,10 +85,20 @@ pub fn spawn(
             let mut delay = Duration::from_secs(1);
             loop {
                 let started = Instant::now();
+                let mut last_error_was_revoked_sign_in = false;
                 if let Err(e) = run(&host, port, &username, &auth, &mailbox, &wake_tx).await {
                     log::warn!("IMAP IDLE watch on {mailbox} for {username}@{host} lost: {e}");
+                    last_error_was_revoked_sign_in = e.is::<crate::oauth::SignInExpired>();
                 }
                 if wake_tx.is_closed() {
+                    return;
+                }
+                // A revoked sign-in cannot be fixed by retrying (same rule as
+                // `ImapActor::ensure_connected`): stop, rather than ask Google's
+                // token endpoint again every half minute for the rest of the
+                // session. Signing in again replaces the session, and with it
+                // this watch.
+                if last_error_was_revoked_sign_in {
                     return;
                 }
                 if started.elapsed() >= CONNECTED_LONG_ENOUGH_TO_RESET_BACKOFF {

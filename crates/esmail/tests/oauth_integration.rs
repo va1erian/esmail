@@ -559,3 +559,30 @@ async fn several_google_accounts_and_a_password_account_run_side_by_side() {
     }
     drop(sessions);
 }
+
+/// A revoked sign-in cannot be fixed by retrying, so the IDLE watch must give
+/// up instead of asking the token endpoint again every half minute for the rest
+/// of the session (the task ending closes its wake channel).
+#[tokio::test]
+async fn idle_watch_stops_retrying_once_the_sign_in_is_revoked() {
+    skip_unless_ca_trusted!();
+    let (server, _google, _) = oauth_setup(GOOD_TOKEN).await;
+    let dead = fake_token_endpoint(|_| (400, r#"{"error":"invalid_grant"}"#.to_string())).await;
+    let auth = Auth::OAuth(TokenSource::from_refresh_token(dead.client(), SecretString::from("rt-dead")));
+
+    let (wake_tx, mut wake_rx) = mpsc::channel(4);
+    let _idle = idle_watch::spawn(
+        "localhost".to_string(),
+        server.imap_addr.port(),
+        TEST_USER.to_string(),
+        auth,
+        "INBOX".to_string(),
+        wake_tx,
+    );
+
+    // The task ended: its sender is dropped, so the channel reports closed
+    // rather than staying open while the watch retries in the background.
+    let closed = timeout(RECV_TIMEOUT, wake_rx.recv()).await.expect("the watch should have ended");
+    assert!(closed.is_none());
+    assert_eq!(dead.request_count(), 1, "a revoked sign-in should be tried once, not retried");
+}
