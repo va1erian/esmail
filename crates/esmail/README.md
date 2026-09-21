@@ -131,7 +131,12 @@ has a real icon in the executable, window and tray (the tray glyph is drawn in
 white on a dark taskbar and follows the system theme), and shows toasts under
 its own name. Starting it while it is already running (for example from the
 Start menu while it sits in the tray) brings the existing window forward
-instead of starting a second copy.
+instead of starting a second copy. (The running copy holds a lock file in
+the data directory; a later launch leaves a request file beside it, which the
+running copy picks up within a quarter of a second. `esmail.exe --quit` uses the
+same route to make it exit, which is what the installer does before replacing
+or removing the program files.) All of this is safe Rust: `shell.rs` is
+`forbid(unsafe_code)`.
 
 **Uninstalling.** The uninstaller asks whether to remove esmail's data as well
 (settings, cached mail, saved passwords). It does that by running

@@ -151,10 +151,10 @@ impl TrayState {
     }
 }
 
-/// The tray artwork (see `icons.rs`) at the size this display's tray wants, in
-/// the glyph colour that shows up on the current taskbar.
+/// The tray artwork (see `icons.rs`), in the glyph colour that shows up on the
+/// current taskbar.
 fn themed_icon(light_glyph: bool) -> anyhow::Result<Icon> {
-    let art = icons::tray_icon(shell::small_icon_px(), light_glyph)
+    let art = icons::tray_icon(light_glyph)
         .ok_or_else(|| anyhow::anyhow!("the embedded tray icon does not decode"))?;
     Icon::from_rgba(art.pixels, art.width, art.height).map_err(|e| anyhow::anyhow!("tray icon: {e}"))
 }

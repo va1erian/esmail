@@ -383,7 +383,6 @@ impl EsMailApp {
         let (db_evt_tx, db_evt_rx) = mpsc::channel(32);
 
         let egui_ctx = cc.egui_ctx.clone();
-        let _ = UI_CONTEXT.set(egui_ctx.clone());
         // A click on a new-mail toast arrives on a thread of the OS's, so it is
         // only handed over here: the account id goes into a channel (drained in
         // `handle_tray`) and the window is asked to come forward and repaint.
@@ -1812,12 +1811,22 @@ impl EsMailApp {
 /// platform without a tray `self.tray` is `None` and this does nothing.
 impl EsMailApp {
     fn handle_tray(&mut self, ctx: &egui::Context) {
-        // A second launch of esMail asked this copy to come forward.
-        if SHOW_WINDOW_REQUESTED.swap(false, Ordering::Relaxed) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        // A later launch of esMail left a request for this one: come forward
+        // (an ordinary second launch) or exit (`esmail --quit`, used by the
+        // installer). Polled, since nothing wakes a hidden window for it.
+        match shell::take_request() {
+            Some(shell::Request::Show) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            Some(shell::Request::Quit) => {
+                self.exit_requested = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            None => {}
         }
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
         // A clicked toast: open the account the mail arrived in, at the mailbox
         // being watched, so the new message is right there.
         while let Ok(account) = self.toast_click_rx.try_recv() {
@@ -3004,12 +3013,6 @@ fn format_size(bytes: usize) -> String {
     }
 }
 
-/// Wakes the UI when a second launch asks the running copy to show itself
-/// (see [`shell::acquire_single_instance`]). Set once the app has a context.
-static UI_CONTEXT: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
-/// Set by that same request; consumed by `handle_tray`.
-static SHOW_WINDOW_REQUESTED: AtomicBool = AtomicBool::new(false);
-
 /// Development runs that render one page and exit (`ESMAIL_PREVIEW`,
 /// `ESMAIL_SCREENSHOT`) are not "the" running mail client: they must not take
 /// the single-instance lock, register notifications, or start a tray icon.
@@ -3024,6 +3027,15 @@ async fn main() -> eframe::Result {
     // `esmail --purge-data`: what the Windows uninstaller runs when the user
     // chooses to remove their settings too. Deliberately ahead of the
     // single-instance check -- it must work whatever else is happening.
+    // `esmail --quit`: ask the running copy to exit (the installer does this
+    // before replacing or removing the program files) and return.
+    if std::env::args().any(|arg| arg == "--quit") {
+        if shell::acquire_single_instance() == shell::Instance::AlreadyRunning {
+            let _ = shell::send_request(shell::Request::Quit);
+        }
+        return Ok(());
+    }
+
     if std::env::args().any(|arg| arg == "--purge-data") {
         let problems = uninstall::purge_user_data();
         for problem in &problems {
@@ -3035,18 +3047,11 @@ async fn main() -> eframe::Result {
     if !is_dev_run() {
         // esMail lives in the tray: a second launch should raise the window
         // that is already there, not start a competing process.
-        let first = match shell::acquire_single_instance() {
-            shell::Instance::First(first) => first,
-            shell::Instance::AlreadyRunning => return Ok(()),
-        };
-        first.on_show_requested(|| {
-            SHOW_WINDOW_REQUESTED.store(true, Ordering::Relaxed);
-            if let Some(ctx) = UI_CONTEXT.get() {
-                ctx.request_repaint();
-            }
-        });
+        if shell::acquire_single_instance() == shell::Instance::AlreadyRunning {
+            let _ = shell::send_request(shell::Request::Show);
+            return Ok(());
+        }
 
-        shell::set_process_identity();
         let registered = match shell::register_notification_identity() {
             Ok(()) => true,
             Err(e) => {
