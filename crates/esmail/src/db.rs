@@ -13,6 +13,7 @@
 
 use rusqlite::{params, Connection};
 use tokio::sync::mpsc;
+use crate::compose::{ComposeId, ComposeState};
 use crate::imap::MailHeader;
 
 /// Cap on rows in `bodies` across all accounts/mailboxes; the oldest
@@ -90,6 +91,47 @@ pub enum DbCommand {
     /// mail would stay on disk, keep turning up in search across accounts, and
     /// a later re-add would trust a stale sync state.
     RemoveAccount { account_id: String },
+
+    /// Durably record a message that failed to send, for the background
+    /// retry queue: a row here survives an app restart, and stays until
+    /// `MarkOutboxSent` removes it. `id: None` inserts a new row (the first
+    /// failure from a given compose window); `Some(id)` overwrites that same
+    /// row with fresh content and resets its backoff, so a second failed
+    /// Send from the same still-open window updates in place instead of
+    /// piling up a duplicate. `compose_id` is never interpreted here -- it
+    /// rides along so `DbEvent::OutboxEnqueued` can hand it straight back to
+    /// `main.rs`, which is what actually needs it (to know which window's
+    /// `window_outbox_id` entry to update).
+    EnqueueOutbox { id: Option<i64>, compose_id: ComposeId, account_id: String, compose: ComposeState },
+    /// Rows whose `next_attempt_at` has passed -- due for a (re)send.
+    /// Answered with `DbEvent::OutboxDue`.
+    DueOutbox,
+    /// The send for this outbox row succeeded: delete it.
+    MarkOutboxSent { id: i64 },
+    /// The send for this outbox row failed: bump its attempt count and push
+    /// `next_attempt_at` out with exponential backoff (`backoff_seconds`),
+    /// so `DueOutbox` stops returning it until then.
+    MarkOutboxFailed { id: i64, error: String },
+    /// Forget an outbox row without ever sending it (the user deleted it
+    /// from the Outbox window).
+    DeleteOutbox { id: i64 },
+    /// Every outbox row, oldest first. Answered with `DbEvent::OutboxList`.
+    ListOutbox,
+
+    /// Create or update an autosaved draft. `id: None` inserts a new row
+    /// (its freshly assigned id comes back in `DbEvent::DraftSaved`);
+    /// `Some(id)` overwrites that row in place. `compose_id` is passed
+    /// straight back on `DbEvent::DraftSaved`, same reason as
+    /// `EnqueueOutbox`'s.
+    SaveDraft { id: Option<i64>, compose_id: ComposeId, account_id: Option<String>, compose: ComposeState },
+    /// Every saved draft, most-recently-updated first. Answered with
+    /// `DbEvent::DraftList`.
+    ListDrafts,
+    /// Load one draft back into a compose window. Answered with
+    /// `DbEvent::DraftLoaded`.
+    LoadDraft { id: i64 },
+    /// Forget a draft (sent, or deleted from the Drafts window).
+    DeleteDraft { id: i64 },
 }
 
 pub enum DbEvent {
@@ -104,7 +146,40 @@ pub enum DbEvent {
     /// writeup on `main.rs`'s `DbEvent::MailFetchFailed` arm.
     MailFetchFailed { uid: u32, error: String },
     SyncPlan { account_id: String, mailbox: String, plan: SyncPlan },
+    /// `EnqueueOutbox` succeeded: the row's id (freshly assigned, or the one
+    /// that was passed in and got overwritten) and the `compose_id` that was
+    /// passed through, so `main.rs` can record which window this row
+    /// belongs to.
+    OutboxEnqueued { id: i64, compose_id: ComposeId },
+    OutboxDue { items: Vec<OutboxItem> },
+    OutboxList { items: Vec<OutboxItem> },
+    /// `SaveDraft` succeeded: the row's id (freshly assigned, or the one
+    /// that was passed in and got overwritten), and the `compose_id` passed
+    /// through so `main.rs` knows which window to attach it to.
+    DraftSaved { id: i64, compose_id: ComposeId },
+    DraftList { items: Vec<DraftSummary> },
+    DraftLoaded { id: i64, compose: ComposeState },
     Error(String),
+}
+
+/// One row of the retry queue, as `DueOutbox`/`ListOutbox` return it.
+#[derive(Debug, Clone)]
+pub struct OutboxItem {
+    pub id: i64,
+    pub account_id: String,
+    pub compose: ComposeState,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+}
+
+/// A draft's list-view summary -- everything the Drafts window shows without
+/// needing the full `ComposeState` (attachments and all) for every row.
+#[derive(Debug, Clone)]
+pub struct DraftSummary {
+    pub id: i64,
+    pub subject: String,
+    pub to: String,
+    pub updated_at: i64,
 }
 
 /// What should happen to bring a mailbox's local cache up to date, given what
@@ -218,6 +293,78 @@ impl DbActor {
                         let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
                     }
                 }
+                DbCommand::EnqueueOutbox { id, compose_id, account_id, compose } => {
+                    match enqueue_outbox(&self.conn, id, &account_id, &compose) {
+                        Ok(id) => {
+                            let _ = self.event_tx.blocking_send(DbEvent::OutboxEnqueued { id, compose_id });
+                        }
+                        Err(e) => {
+                            let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                        }
+                    }
+                }
+                DbCommand::DueOutbox => match due_outbox(&self.conn, now_unix()) {
+                    Ok(items) => {
+                        let _ = self.event_tx.blocking_send(DbEvent::OutboxDue { items });
+                    }
+                    Err(e) => {
+                        let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    }
+                },
+                DbCommand::ListOutbox => match list_outbox(&self.conn) {
+                    Ok(items) => {
+                        let _ = self.event_tx.blocking_send(DbEvent::OutboxList { items });
+                    }
+                    Err(e) => {
+                        let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    }
+                },
+                DbCommand::MarkOutboxSent { id } => {
+                    if let Err(e) = delete_outbox(&self.conn, id) {
+                        let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    }
+                }
+                DbCommand::MarkOutboxFailed { id, error } => {
+                    if let Err(e) = mark_outbox_failed(&self.conn, id, &error, now_unix()) {
+                        let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    }
+                }
+                DbCommand::DeleteOutbox { id } => {
+                    if let Err(e) = delete_outbox(&self.conn, id) {
+                        let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    }
+                }
+                DbCommand::SaveDraft { id, compose_id, account_id, compose } => {
+                    match save_draft(&self.conn, id, account_id.as_deref(), &compose) {
+                        Ok(id) => {
+                            let _ = self.event_tx.blocking_send(DbEvent::DraftSaved { id, compose_id });
+                        }
+                        Err(e) => {
+                            let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                        }
+                    }
+                }
+                DbCommand::ListDrafts => match list_drafts(&self.conn) {
+                    Ok(items) => {
+                        let _ = self.event_tx.blocking_send(DbEvent::DraftList { items });
+                    }
+                    Err(e) => {
+                        let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    }
+                },
+                DbCommand::LoadDraft { id } => match load_draft(&self.conn, id) {
+                    Ok(compose) => {
+                        let _ = self.event_tx.blocking_send(DbEvent::DraftLoaded { id, compose });
+                    }
+                    Err(e) => {
+                        let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    }
+                },
+                DbCommand::DeleteDraft { id } => {
+                    if let Err(e) = delete_draft(&self.conn, id) {
+                        let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    }
+                }
             }
         }
     }
@@ -280,6 +427,23 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             from_addr,
             to_addr,
             body
+        );
+
+        CREATE TABLE IF NOT EXISTS outbox (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id      TEXT NOT NULL,
+            compose_json    TEXT NOT NULL,
+            created_at      INTEGER NOT NULL,
+            attempts        INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL,
+            last_error      TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS drafts (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id   TEXT,
+            compose_json TEXT NOT NULL,
+            updated_at   INTEGER NOT NULL
         );
         ",
     )?;
@@ -592,6 +756,143 @@ fn remove_message(conn: &Connection, account_id: &str, mailbox: &str, uid: u32) 
     conn.execute("DELETE FROM messages WHERE account_id = ?1 AND mailbox = ?2 AND uid = ?3", params![account_id, mailbox, uid])?;
     conn.execute("DELETE FROM bodies WHERE account_id = ?1 AND mailbox = ?2 AND uid = ?3", params![account_id, mailbox, uid])?;
     conn.execute("DELETE FROM messages_fts WHERE account_id = ?1 AND mailbox = ?2 AND uid = ?3", params![account_id, mailbox, uid])?;
+    Ok(())
+}
+
+// ── outbox (retry queue) ─────────────────────────────────────────────────
+
+/// Turn a rusqlite error into the same `String`-error shape the rest of this
+/// module's helpers use, for the one step here (`serde_json`) that isn't a
+/// `rusqlite::Error` to begin with. Mapped straight to `rusqlite::Error::ToSqlConversionFailure`
+/// so every outbox/draft helper can keep returning a plain `rusqlite::Result`.
+fn to_sql_err(e: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+}
+
+/// Insert a new outbox row (`id: None`) or overwrite an existing one
+/// (`Some`) with fresh content and a reset backoff -- a second failed Send
+/// from the same still-open window updates in place rather than piling up a
+/// duplicate row for the same logical message.
+fn enqueue_outbox(conn: &Connection, id: Option<i64>, account_id: &str, compose: &ComposeState) -> rusqlite::Result<i64> {
+    let compose_json = serde_json::to_string(compose).map_err(to_sql_err)?;
+    let now = now_unix();
+    match id {
+        Some(id) => {
+            conn.execute(
+                "UPDATE outbox SET account_id = ?1, compose_json = ?2, attempts = 0, next_attempt_at = ?3, last_error = NULL WHERE id = ?4",
+                params![account_id, compose_json, now, id],
+            )?;
+            Ok(id)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO outbox (account_id, compose_json, created_at, attempts, next_attempt_at)
+                 VALUES (?1, ?2, ?3, 0, ?3)",
+                params![account_id, compose_json, now],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+}
+
+fn row_to_outbox_item(row: &rusqlite::Row) -> rusqlite::Result<OutboxItem> {
+    let compose_json: String = row.get(1)?;
+    let compose: ComposeState = serde_json::from_str(&compose_json).map_err(to_sql_err)?;
+    Ok(OutboxItem {
+        id: row.get(0)?,
+        account_id: row.get(2)?,
+        attempts: row.get(3)?,
+        last_error: row.get(4)?,
+        compose,
+    })
+}
+
+fn due_outbox(conn: &Connection, now: i64) -> rusqlite::Result<Vec<OutboxItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, compose_json, account_id, attempts, last_error FROM outbox
+         WHERE next_attempt_at <= ?1 ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(params![now], row_to_outbox_item)?;
+    rows.collect()
+}
+
+fn list_outbox(conn: &Connection) -> rusqlite::Result<Vec<OutboxItem>> {
+    let mut stmt = conn.prepare("SELECT id, compose_json, account_id, attempts, last_error FROM outbox ORDER BY id ASC")?;
+    let rows = stmt.query_map([], row_to_outbox_item)?;
+    rows.collect()
+}
+
+fn delete_outbox(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM outbox WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Exponential backoff for the retry queue: 30s, 1m, 2m, 4m, ... capped at
+/// one hour, so a server that's down for a while isn't hammered but a brief
+/// blip is retried reasonably soon. `attempts` is the count *after* this
+/// failure (i.e. always >= 1).
+fn backoff_seconds(attempts: i64) -> i64 {
+    let exponent = (attempts - 1).clamp(0, 7) as u32;
+    (30i64 * 2i64.pow(exponent)).min(3600)
+}
+
+fn mark_outbox_failed(conn: &Connection, id: i64, error: &str, now: i64) -> rusqlite::Result<()> {
+    let attempts_before: i64 = conn.query_row("SELECT attempts FROM outbox WHERE id = ?1", params![id], |r| r.get(0))?;
+    let attempts = attempts_before + 1;
+    conn.execute(
+        "UPDATE outbox SET attempts = ?1, last_error = ?2, next_attempt_at = ?3 WHERE id = ?4",
+        params![attempts, error, now + backoff_seconds(attempts), id],
+    )?;
+    Ok(())
+}
+
+// ── drafts ────────────────────────────────────────────────────────────────
+
+/// Insert a new draft (`id: None`) or overwrite an existing one (`Some`),
+/// returning the row's id either way.
+fn save_draft(conn: &Connection, id: Option<i64>, account_id: Option<&str>, compose: &ComposeState) -> rusqlite::Result<i64> {
+    let compose_json = serde_json::to_string(compose).map_err(to_sql_err)?;
+    let now = now_unix();
+    match id {
+        Some(id) => {
+            conn.execute(
+                "UPDATE drafts SET account_id = ?1, compose_json = ?2, updated_at = ?3 WHERE id = ?4",
+                params![account_id, compose_json, now, id],
+            )?;
+            Ok(id)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO drafts (account_id, compose_json, updated_at) VALUES (?1, ?2, ?3)",
+                params![account_id, compose_json, now],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+}
+
+fn list_drafts(conn: &Connection) -> rusqlite::Result<Vec<DraftSummary>> {
+    let mut stmt = conn.prepare("SELECT id, compose_json, updated_at FROM drafts ORDER BY updated_at DESC")?;
+    let rows = stmt.query_map([], |row| {
+        let compose_json: String = row.get(1)?;
+        let compose: ComposeState = serde_json::from_str(&compose_json).map_err(to_sql_err)?;
+        Ok(DraftSummary {
+            id: row.get(0)?,
+            updated_at: row.get(2)?,
+            subject: compose.subject,
+            to: compose.to,
+        })
+    })?;
+    rows.collect()
+}
+
+fn load_draft(conn: &Connection, id: i64) -> rusqlite::Result<ComposeState> {
+    let compose_json: String = conn.query_row("SELECT compose_json FROM drafts WHERE id = ?1", params![id], |r| r.get(0))?;
+    serde_json::from_str(&compose_json).map_err(to_sql_err)
+}
+
+fn delete_draft(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM drafts WHERE id = ?1", params![id])?;
     Ok(())
 }
 
@@ -1017,5 +1318,131 @@ mod tests {
         report_mailbox_state(&conn, "acc", "INBOX", 100, 50).unwrap();
         let plan = report_mailbox_state(&conn, "acc", "INBOX", 100, 50).unwrap();
         assert_eq!(plan, SyncPlan::UpToDate);
+    }
+
+    // ── outbox ────────────────────────────────────────────────────────────────
+
+    fn test_compose(to: &str) -> ComposeState {
+        ComposeState { to: to.to_string(), subject: "Hi".to_string(), body: "Body".to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn enqueued_mail_is_immediately_due() {
+        let conn = test_conn();
+        enqueue_outbox(&conn, None, "acc", &test_compose("bob@example.com")).unwrap();
+
+        let due = due_outbox(&conn, now_unix()).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].account_id, "acc");
+        assert_eq!(due[0].compose.to, "bob@example.com");
+        assert_eq!(due[0].attempts, 0);
+    }
+
+    #[test]
+    fn marking_sent_removes_the_row() {
+        let conn = test_conn();
+        let id = enqueue_outbox(&conn, None, "acc", &test_compose("bob@example.com")).unwrap();
+
+        delete_outbox(&conn, id).unwrap();
+
+        assert!(due_outbox(&conn, now_unix()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn enqueuing_with_an_existing_id_overwrites_rather_than_duplicating() {
+        let conn = test_conn();
+        let id = enqueue_outbox(&conn, None, "acc", &test_compose("bob@example.com")).unwrap();
+        mark_outbox_failed(&conn, id, "connection refused", now_unix()).unwrap();
+
+        let same_id = enqueue_outbox(&conn, Some(id), "acc", &test_compose("carol@example.com")).unwrap();
+
+        assert_eq!(same_id, id);
+        let items = list_outbox(&conn).unwrap();
+        assert_eq!(items.len(), 1, "must not have created a second row");
+        assert_eq!(items[0].compose.to, "carol@example.com");
+        assert_eq!(items[0].attempts, 0, "a fresh attempt resets the backoff");
+        assert_eq!(items[0].last_error, None);
+    }
+
+    #[test]
+    fn a_failed_send_is_not_due_again_until_its_backoff_elapses() {
+        let conn = test_conn();
+        let id = enqueue_outbox(&conn, None, "acc", &test_compose("bob@example.com")).unwrap();
+        let now = now_unix();
+
+        mark_outbox_failed(&conn, id, "connection refused", now).unwrap();
+
+        assert!(due_outbox(&conn, now).unwrap().is_empty(), "should not retry immediately");
+        let later = now + backoff_seconds(1) + 1;
+        let due = due_outbox(&conn, later).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].attempts, 1);
+        assert_eq!(due[0].last_error.as_deref(), Some("connection refused"));
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        assert_eq!(backoff_seconds(1), 30);
+        assert_eq!(backoff_seconds(2), 60);
+        assert_eq!(backoff_seconds(3), 120);
+        assert_eq!(backoff_seconds(20), 3600);
+    }
+
+    #[test]
+    fn list_outbox_returns_every_row() {
+        let conn = test_conn();
+        enqueue_outbox(&conn, None, "acc1", &test_compose("a@example.com")).unwrap();
+        enqueue_outbox(&conn, None, "acc2", &test_compose("b@example.com")).unwrap();
+
+        let items = list_outbox(&conn).unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    // ── drafts ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn saving_a_new_draft_then_loading_it_round_trips() {
+        let conn = test_conn();
+        let id = save_draft(&conn, None, Some("acc"), &test_compose("bob@example.com")).unwrap();
+
+        let loaded = load_draft(&conn, id).unwrap();
+        assert_eq!(loaded.to, "bob@example.com");
+        assert_eq!(loaded.subject, "Hi");
+    }
+
+    #[test]
+    fn saving_with_an_existing_id_overwrites_rather_than_duplicating() {
+        let conn = test_conn();
+        let id = save_draft(&conn, None, Some("acc"), &test_compose("bob@example.com")).unwrap();
+        save_draft(&conn, Some(id), Some("acc"), &test_compose("carol@example.com")).unwrap();
+
+        let drafts = list_drafts(&conn).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(load_draft(&conn, id).unwrap().to, "carol@example.com");
+    }
+
+    #[test]
+    fn list_drafts_orders_most_recently_updated_first() {
+        let conn = test_conn();
+        let first = save_draft(&conn, None, Some("acc"), &test_compose("a@example.com")).unwrap();
+        let second = save_draft(&conn, None, Some("acc"), &test_compose("b@example.com")).unwrap();
+        // Both saved in the same second would otherwise tie on `updated_at`
+        // -- back-date the first so the ordering assertion below isn't a
+        // race against the clock's own resolution.
+        conn.execute("UPDATE drafts SET updated_at = updated_at - 10 WHERE id = ?1", params![first]).unwrap();
+
+        let drafts = list_drafts(&conn).unwrap();
+        assert_eq!(drafts[0].id, second);
+        assert_eq!(drafts[1].id, first);
+    }
+
+    #[test]
+    fn deleting_a_draft_removes_it() {
+        let conn = test_conn();
+        let id = save_draft(&conn, None, Some("acc"), &test_compose("bob@example.com")).unwrap();
+
+        delete_draft(&conn, id).unwrap();
+
+        assert!(list_drafts(&conn).unwrap().is_empty());
     }
 }

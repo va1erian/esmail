@@ -86,7 +86,7 @@ enum Action {
     CloseAccountDialog,
 }
 
-fn tls_label(tls: config::TlsMode) -> &'static str {
+pub(super) fn tls_label(tls: config::TlsMode) -> &'static str {
     match tls {
         config::TlsMode::Ssl => "SSL/TLS",
         config::TlsMode::StartTls => "STARTTLS",

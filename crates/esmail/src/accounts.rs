@@ -60,6 +60,7 @@ impl EsMailApp {
         self.username = account.username.clone();
         self.smtp_host = account.smtp_host.clone();
         self.smtp_port = account.smtp_port.to_string();
+        self.smtp_tls = account.smtp_tls;
         self.use_oauth = account.auth == config::AuthKind::GoogleOAuth;
         // An OAuth account has no password to restore; its refresh token is
         // looked up when Connect is clicked.
@@ -83,7 +84,7 @@ impl EsMailApp {
     /// The account the Add account form describes. Starts from the saved
     /// entry when this account already exists, so reconnecting through the
     /// form keeps what the form has no field for (a display name chosen in
-    /// Settings, the watch mailbox, the SMTP security mode).
+    /// Settings, the watch mailbox).
     pub(super) fn account_from_form(&self) -> AccountConfig {
         // Trimmed, like the values a connection is made with, so a stray
         // space in the form can't make the keyring/config key differ from
@@ -101,6 +102,7 @@ impl EsMailApp {
         if let Ok(port) = self.smtp_port.trim().parse() {
             account.smtp_port = port;
         }
+        account.smtp_tls = self.smtp_tls;
         account.auth = if self.oauth_active() { config::AuthKind::GoogleOAuth } else { config::AuthKind::Password };
         account
     }

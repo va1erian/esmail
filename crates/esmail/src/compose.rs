@@ -3,14 +3,12 @@
 //! editable state a compose window starts from — pure and unit-tested, no
 //! network or UI.
 //!
-//! **Known limitation inherited from `MailHeader`:** `imap.rs`'s envelope
-//! parsing only ever kept the *first* From/To address
-//! (`addrs.and_then(|f| f.first())`, predating this module), not the full
-//! recipient list. So Reply-All's Cc can only ever be "the original To
-//! address, if it wasn't me" rather than a real multi-recipient list — it
-//! degrades gracefully (an empty Cc is still a correct, just less complete,
-//! answer) rather than fabricating recipients that were never captured.
-//! Fixing this needs `imap.rs` to capture every address, not just the first.
+//! Reply-All's Cc is every address in the original `To` field (comma-joined
+//! by `imap.rs`'s envelope parsing) minus `my_address` — there is no
+//! original Cc to fold in, since `MailHeader` doesn't carry one (the
+//! envelope's `Cc` list is never fetched).
+
+use serde::{Deserialize, Serialize};
 
 use crate::imap::MailHeader;
 
@@ -21,7 +19,11 @@ pub type ComposeId = u64;
 /// Everything a compose window edits. Reply-derived state comes from
 /// [`ComposeState::reply`]/[`ComposeState::reply_all`], forwards from
 /// [`ComposeState::forward`]; a blank one is just `ComposeState::default()`.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// `Serialize`/`Deserialize` so `db.rs` can store one as-is (JSON in a
+/// `TEXT` column) for both the drafts table and the outbox/retry-queue
+/// table, rather than each needing its own bespoke set of columns.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ComposeState {
     pub to: String,
     pub cc: String,
@@ -46,6 +48,15 @@ pub struct ComposeState {
     /// app-level field keeps it with the message it belongs to, which is what
     /// a compose-window-per-message design (#34) will need.
     pub account_id: Option<String>,
+    /// The `drafts` row this compose window autosaves into, once it has been
+    /// saved for the first time -- `None` for a window that hasn't been
+    /// autosaved yet (or a fresh reply/forward/new message). Kept here for
+    /// the same reason as `account_id`: so autosave, "load this draft" and
+    /// "delete the draft once sent" can all just read it off the state
+    /// they're already carrying, instead of a parallel app-level map from
+    /// compose window to draft id.
+    #[serde(default)]
+    pub draft_id: Option<i64>,
 }
 
 impl ComposeState {
@@ -60,14 +71,14 @@ impl ComposeState {
         Self::from_original(original, original_body_html, String::new())
     }
 
-    /// Reply to the sender and (best-effort — see the module docs) the
-    /// other original recipients, minus `my_address`.
+    /// Reply to the sender and the other original recipients, minus
+    /// `my_address`.
     pub fn reply_all(original: &MailHeader, original_body_html: &str, my_address: &str) -> Self {
-        let cc = if addresses_match(&original.to, my_address) {
-            String::new()
-        } else {
-            original.to.clone()
-        };
+        let cc = split_addresses(&original.to)
+            .into_iter()
+            .filter(|addr| !addresses_match(addr, my_address))
+            .collect::<Vec<_>>()
+            .join(", ");
         Self::from_original(original, original_body_html, cc)
     }
 
@@ -82,6 +93,7 @@ impl ComposeState {
             references: non_empty(&original.message_id),
             attachments: Vec::new(),
             account_id: None,
+            draft_id: None,
         }
     }
 
@@ -99,6 +111,7 @@ impl ComposeState {
             references: None,
             attachments: Vec::new(),
             account_id: None,
+            draft_id: None,
         }
     }
 }
@@ -118,16 +131,22 @@ fn add_prefix(subject: &str, prefix: &str) -> String {
     }
 }
 
+/// Split a comma-joined address field (as `imap.rs`'s envelope parsing and
+/// `MailHeader.to` produce it) back into its individual `"Name <user@host>"`
+/// entries.
+fn split_addresses(field: &str) -> Vec<String> {
+    field.split(',').map(str::trim).filter(|a| !a.is_empty()).map(str::to_string).collect()
+}
+
 /// A very loose "is this the same mailbox" check for the module's one use —
-/// deciding whether Reply-All's Cc should include the original To address,
-/// or drop it because it's already the sender ("me"). `original_to` is
-/// typically `"Name <user@host>"` (see the module docs on why it's a single
-/// address, not a list); this treats any exact substring match of
-/// `my_address` in it as "yes, that's me" rather than parsing out the
+/// deciding whether one of Reply-All's original-To addresses should be kept
+/// in the Cc, or dropped because it's already the sender ("me"). `address`
+/// is typically `"Name <user@host>"`; this treats any exact substring match
+/// of `my_address` in it as "yes, that's me" rather than parsing out the
 /// address precisely, since the alternative (silently duplicating a
 /// recipient) is worse than an occasional false negative.
-fn addresses_match(original_to: &str, my_address: &str) -> bool {
-    !my_address.is_empty() && original_to.contains(my_address)
+fn addresses_match(address: &str, my_address: &str) -> bool {
+    !my_address.is_empty() && address.contains(my_address)
 }
 
 fn non_empty(s: &str) -> Option<String> {
@@ -222,6 +241,22 @@ mod tests {
     fn reply_all_drops_myself_from_cc_rather_than_ccing_my_own_address() {
         let state = ComposeState::reply_all(&original(), "body", "bob@example.com");
         assert_eq!(state.cc, "");
+    }
+
+    #[test]
+    fn reply_all_ccs_every_original_recipient_not_just_the_first() {
+        let mut msg = original();
+        msg.to = "Bob <bob@example.com>, Carol <carol@example.com>, Dave <dave@example.com>".to_string();
+        let state = ComposeState::reply_all(&msg, "body", "someone-else@example.com");
+        assert_eq!(state.cc, "Bob <bob@example.com>, Carol <carol@example.com>, Dave <dave@example.com>");
+    }
+
+    #[test]
+    fn reply_all_drops_only_myself_and_keeps_the_other_original_recipients() {
+        let mut msg = original();
+        msg.to = "Bob <bob@example.com>, Carol <carol@example.com>, Dave <dave@example.com>".to_string();
+        let state = ComposeState::reply_all(&msg, "body", "carol@example.com");
+        assert_eq!(state.cc, "Bob <bob@example.com>, Dave <dave@example.com>");
     }
 
     #[test]

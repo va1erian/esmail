@@ -105,8 +105,7 @@ Not ticketed:
   fetch); attachments missing for messages opened from the search cache; bulk
   flag/move use one round trip per message; IDLE is INBOX-only and the header
   list does not update live.
-- **Compose:** no drafts, retry queue, rich text or recipient autocomplete;
-  SMTP StartTls not selectable in the UI; Reply-All Ccs only the first address.
+- **Compose:** no rich text or recipient autocomplete.
 - **Notifications:** no click-to-open, no real AUMID, no settings, never
   verified on a real machine.
 - **Polish:** per-operation progress; real first-run wizard; window saved on an

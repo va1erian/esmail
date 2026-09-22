@@ -2,21 +2,24 @@
 //! `imap.rs`/`db.rs`: a tokio task behind an mpsc channel, so sending never
 //! blocks the UI thread.
 //!
-//! **Not done:** persisted retry queue. A failed send reports
-//! [`SmtpEvent::Error`] and that message's compose window stays open with the typed
-//! text intact so the user can just click Send again; there is no background
-//! retry-with-backoff and nothing survives an app restart. PLAN.md's B7 asks
-//! for "queue sends so a failure retries rather than losing the message" —
-//! the "don't lose the message" half is covered (nothing is cleared on
-//! failure), the automatic-retry half is not.
+//! This module only builds and delivers one message at a time; it does not
+//! know about drafts or the retry queue at all. Those live in `db.rs`'s
+//! `outbox`/`drafts` tables and `main.rs`'s `try_send_outbox_item`/
+//! `poll_outbox`/`autosave_draft_now`: clicking Send in `main.rs` durably
+//! enqueues the message first (keyed by the same `ComposeId` the compose
+//! window itself is named by), then this module attempts it; on
+//! [`SmtpEvent::Error`] the outbox row is backed off and retried
+//! automatically rather than depending on the user noticing and re-sending.
 //!
-//! **`APPEND` to Sent now lands, `APPEND` to Drafts still doesn't.**
-//! `SmtpEvent::Sent` carries the sent message's raw RFC822 bytes so
-//! `main.rs` can hand them to `ImapCommand::Append` and save a copy to the
-//! account's Sent folder -- see that command's doc in `imap.rs` for what's
-//! still a bounded subset of the original ask (a hardcoded "Sent" mailbox
-//! name, not real `\Sent` special-use-flag discovery with a name-based
-//! fallback). There is still no draft autosave (`APPEND` with `\Draft`).
+//! **`APPEND` to Sent now lands, `APPEND` to Drafts still doesn't** -- a
+//! draft is autosaved into the local `drafts` table (`db.rs`), not to the
+//! account's real IMAP `Drafts` mailbox, so it isn't visible from another
+//! mail client the way a real `APPEND ... \Draft` would be. `SmtpEvent::Sent`
+//! carries the sent message's raw RFC822 bytes so `main.rs` can hand them to
+//! `ImapCommand::Append` and save a copy to the account's Sent folder -- see
+//! that command's doc in `imap.rs` for what's still a bounded subset of the
+//! original ask (a hardcoded "Sent" mailbox name, not real `\Sent`
+//! special-use-flag discovery with a name-based fallback).
 
 use lettre::message::{Attachment, Message, MultiPart, SinglePart, header::ContentType};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
