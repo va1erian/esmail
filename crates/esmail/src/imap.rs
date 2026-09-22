@@ -883,16 +883,27 @@ impl ImapActor {
     fn parse_envelope_header(uid: u32, envelope: &async_imap::imap_proto::Envelope<'_>, flags: Vec<String>) -> MailHeader {
         let subject = envelope.subject.as_ref().map(|s| Self::decode_rfc2047(s)).unwrap_or_default();
 
+        // Every address in the field, comma-joined (`compose.rs`'s Reply-All
+        // splits this back apart) — not just the first, which used to be all
+        // that survived here and left Reply-All unable to see any Cc/To
+        // recipient past the first.
         let format_address = |addrs: Option<&[async_imap::imap_proto::Address<'_>]>| -> String {
-            addrs.and_then(|f| f.first()).map(|addr| {
-                let name = addr.name.as_ref().map(|n| Self::decode_rfc2047(n));
-                let mailbox = addr.mailbox.as_ref().map(|m| String::from_utf8_lossy(m).to_string()).unwrap_or_default();
-                let host = addr.host.as_ref().map(|h| String::from_utf8_lossy(h).to_string()).unwrap_or_default();
-                match name {
-                    Some(n) => format!("{} <{}@{}>", n, mailbox, host),
-                    None => format!("{}@{}", mailbox, host),
-                }
-            }).unwrap_or_default()
+            addrs
+                .map(|list| {
+                    list.iter()
+                        .map(|addr| {
+                            let name = addr.name.as_ref().map(|n| Self::decode_rfc2047(n));
+                            let mailbox = addr.mailbox.as_ref().map(|m| String::from_utf8_lossy(m).to_string()).unwrap_or_default();
+                            let host = addr.host.as_ref().map(|h| String::from_utf8_lossy(h).to_string()).unwrap_or_default();
+                            match name {
+                                Some(n) => format!("{} <{}@{}>", n, mailbox, host),
+                                None => format!("{}@{}", mailbox, host),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default()
         };
 
         let from = format_address(envelope.from.as_deref());

@@ -141,6 +141,22 @@ impl ComposeWindow {
         self.lock().state.account_id.clone()
     }
 
+    /// A read-only copy of the form's current contents, for autosave --
+    /// unlike [`Self::take_send_request`], this doesn't consume anything and
+    /// can be called on any frame regardless of whether Send was clicked.
+    pub(super) fn snapshot(&self) -> ComposeState {
+        self.lock().state.clone()
+    }
+
+    /// Records which `drafts` row this window autosaves into from now on.
+    /// Updates `initial` to match, so this bookkeeping-only change doesn't
+    /// itself make [`Self::is_dirty`] true.
+    pub(super) fn set_draft_id(&self, id: i64) {
+        let mut s = self.lock();
+        s.state.draft_id = Some(id);
+        s.initial.draft_id = Some(id);
+    }
+
     /// Locks or unlocks the form for a send in flight; starting one clears the
     /// previous error.
     pub(super) fn set_sending(&self, sending: bool) {

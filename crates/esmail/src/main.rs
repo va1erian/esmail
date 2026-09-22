@@ -215,6 +215,40 @@ struct EsMailApp {
     /// `Sent` can save the copy to *that* account's Sent folder -- even when
     /// the window that sent it has been closed meanwhile.
     sending_from: std::collections::HashMap<ComposeId, AccountId>,
+    /// The outbox row a compose id's message is durably recorded under,
+    /// once a send from it has failed at least once -- absent until then,
+    /// since the common case (send succeeds first try) never needs one. A
+    /// second failed Send from the same still-open window updates this same
+    /// row rather than creating a duplicate (see `handle_smtp_events`'s
+    /// `Error` arm). Cleared for a real window in `close_compose`; a
+    /// synthetic id minted for a background retry (`poll_outbox`) is
+    /// one-shot and simply never reused, so its entry (if the retry also
+    /// failed) is left to age out rather than chased down -- a handful of
+    /// stale 16-byte entries per retried send is not worth extra bookkeeping
+    /// to avoid.
+    outbox_owner: std::collections::HashMap<ComposeId, i64>,
+    /// Outbox row ids with a send currently outstanding -- real (a window's
+    /// own retry) or synthetic (`poll_outbox`'s background retry) -- so a
+    /// poll during that window doesn't dispatch a second, concurrent attempt
+    /// at the same row. Cleared once that attempt's `Sent`/`Error` comes
+    /// back.
+    outbox_in_flight: std::collections::HashSet<i64>,
+    /// When `poll_outbox` last asked the db for due retries -- see
+    /// `OUTBOX_POLL_INTERVAL`.
+    last_outbox_check: std::time::Instant,
+    /// When each open compose window last autosaved itself as a draft -- see
+    /// `DRAFT_AUTOSAVE_INTERVAL`. A window's entry is removed once it closes
+    /// (`close_compose`), so the map only ever holds entries for windows
+    /// that are actually still open.
+    compose_last_autosave: std::collections::HashMap<ComposeId, std::time::Instant>,
+    /// The Outbox window's contents, refreshed by `DbEvent::OutboxList` --
+    /// `None` while the window is closed. `main.rs`'s own module docs on
+    /// `settings.rs`'s pattern apply here too: a snapshot taken when opened,
+    /// not a live view.
+    outbox_window: Option<Vec<db::OutboxItem>>,
+    /// The Drafts window's contents, refreshed by `DbEvent::DraftList` --
+    /// `None` while the window is closed.
+    drafts_window: Option<Vec<db::DraftSummary>>,
     db_tx: mpsc::Sender<DbCommand>,
     db_rx: mpsc::Receiver<DbEvent>,
     smtp_tx: mpsc::Sender<smtp::SmtpCommand>,
@@ -243,10 +277,14 @@ struct EsMailApp {
     password: String,
     /// SMTP host for the login form, prefilled from
     /// [`config::derive_smtp_host`]'s guess but editable — see B7 in
-    /// PLAN.md. TLS mode is fixed to `Ssl`/465 for now; `StartTls`/`None`
-    /// have no UI toggle yet, only the `AccountConfig` fields to hold them.
+    /// PLAN.md.
     smtp_host: String,
     smtp_port: String,
+    /// SMTP security for the login form, prefilled from the guessed account
+    /// (`Ssl`, matching [`AccountConfig::new`]'s default) but editable —
+    /// servers that need `StartTls`/`None` used to require editing the
+    /// account in Settings after adding it.
+    smtp_tls: config::TlsMode,
     status: String,
 
     /// First-run wizard (B9): an email address typed on the login screen, to
@@ -552,7 +590,7 @@ impl EsMailApp {
         // Prefill the login form from the first saved account, if any; its
         // password (if the OS keyring has one) comes along too, so a
         // returning user does not have to retype it.
-        let (host_str, port_str, username_str, password_str, smtp_host_str, smtp_port_str) =
+        let (host_str, port_str, username_str, password_str, smtp_host_str, smtp_port_str, smtp_tls_val) =
             match config.accounts.first() {
                 Some(account) => {
                     let password = secrets::get_password(&account.id, "imap")
@@ -565,6 +603,7 @@ impl EsMailApp {
                         password,
                         account.smtp_host.clone(),
                         account.smtp_port.to_string(),
+                        account.smtp_tls,
                     )
                 }
                 None => (
@@ -574,6 +613,7 @@ impl EsMailApp {
                     String::new(),
                     "smtp.gmail.com".to_string(),
                     "465".to_string(),
+                    config::TlsMode::Ssl,
                 ),
             };
         let initial_status = "Ready".to_string();
@@ -656,6 +696,15 @@ impl EsMailApp {
             session_hooks,
             adding_account: false,
             sending_from: std::collections::HashMap::new(),
+            outbox_owner: std::collections::HashMap::new(),
+            outbox_in_flight: std::collections::HashSet::new(),
+            // Subtracted so the very first `logic()` tick polls right away
+            // (e.g. an outbox row left over from a crash mid-send), rather
+            // than waiting a full `OUTBOX_POLL_INTERVAL` after launch.
+            last_outbox_check: std::time::Instant::now() - OUTBOX_POLL_INTERVAL,
+            compose_last_autosave: std::collections::HashMap::new(),
+            outbox_window: None,
+            drafts_window: None,
             db_tx: db_cmd_tx,
             db_rx: db_evt_rx,
             smtp_tx: smtp_cmd_tx,
@@ -667,6 +716,7 @@ impl EsMailApp {
             password: password_str,
             smtp_host: smtp_host_str,
             smtp_port: smtp_port_str,
+            smtp_tls: smtp_tls_val,
             status: initial_status,
             wizard_email: String::new(),
             banners: Vec::new(),
@@ -1087,6 +1137,62 @@ impl EsMailApp {
                         }
                     }
                 }
+                DbEvent::OutboxEnqueued { id, compose_id } => {
+                    self.outbox_owner.insert(compose_id, id);
+                }
+                DbEvent::OutboxDue { items } => {
+                    for item in items {
+                        // Skip a row a still-open window owns -- the user
+                        // could click Send on it at any moment, and that
+                        // must not race a background attempt at the same
+                        // row. It becomes eligible again once that window
+                        // closes (or, if it isn't owned by any window,
+                        // right away).
+                        let owned_by_open_window = self
+                            .outbox_owner
+                            .iter()
+                            .any(|(cid, rid)| *rid == item.id && self.compose_windows.iter().any(|w| w.id() == *cid));
+                        if owned_by_open_window || self.outbox_in_flight.contains(&item.id) {
+                            continue;
+                        }
+                        self.next_compose_id += 1;
+                        let synthetic_id = self.next_compose_id;
+                        match self.smtp_account_for(&item.account_id) {
+                            Some(account) => {
+                                self.outbox_in_flight.insert(item.id);
+                                self.outbox_owner.insert(synthetic_id, item.id);
+                                self.sending_from.insert(synthetic_id, item.account_id.clone());
+                                let _ = self.smtp_tx.try_send(smtp::SmtpCommand::Send { id: synthetic_id, account, compose: item.compose });
+                            }
+                            None => {
+                                // No SMTP credential on file for this account
+                                // (removed, renamed, or never connected) --
+                                // back it off like any other failure rather
+                                // than retrying every single poll forever.
+                                let _ = self.db_tx.try_send(DbCommand::MarkOutboxFailed {
+                                    id: item.id,
+                                    error: "No SMTP password on file for this account".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                DbEvent::OutboxList { items } => {
+                    self.outbox_window = Some(items);
+                }
+                DbEvent::DraftSaved { id, compose_id } => {
+                    if let Some(window) = self.compose_windows.iter().find(|w| w.id() == compose_id) {
+                        window.set_draft_id(id);
+                    }
+                }
+                DbEvent::DraftList { items } => {
+                    self.drafts_window = Some(items);
+                }
+                DbEvent::DraftLoaded { id, mut compose } => {
+                    compose.draft_id = Some(id);
+                    self.open_compose(compose, compose_window::Focus::Body);
+                    self.drafts_window = None;
+                }
                 DbEvent::Error(e) => {
                     self.push_banner(format!("Database error: {e}"));
                 }
@@ -1094,25 +1200,83 @@ impl EsMailApp {
         }
     }
 
+    /// Autosaves every open compose window that's due and has something
+    /// worth keeping (a blank, just-opened window has nothing to save yet).
+    /// Called from `logic()`, so it keeps working while the main window is
+    /// hidden.
+    fn autosave_drafts(&mut self) {
+        let now = std::time::Instant::now();
+        for window in &self.compose_windows {
+            let id = window.id();
+            let due = self.compose_last_autosave.get(&id).is_none_or(|t| now.duration_since(*t) >= DRAFT_AUTOSAVE_INTERVAL);
+            if !due {
+                continue;
+            }
+            self.compose_last_autosave.insert(id, now);
+            let compose = window.snapshot();
+            let has_content = !compose.to.is_empty()
+                || !compose.cc.is_empty()
+                || !compose.bcc.is_empty()
+                || !compose.subject.is_empty()
+                || !compose.body.is_empty();
+            if !has_content {
+                continue;
+            }
+            let _ = self.db_tx.try_send(DbCommand::SaveDraft {
+                id: compose.draft_id,
+                compose_id: id,
+                account_id: compose.account_id.clone(),
+                compose,
+            });
+        }
+    }
+
+    /// Ask the db for outbox rows due for a (re)send, at most once every
+    /// `OUTBOX_POLL_INTERVAL` -- called from `logic()`, which keeps ticking
+    /// (via `handle_tray`'s repaint request) even while the window is
+    /// hidden, so a queued retry still goes out while minimized to the tray.
+    fn poll_outbox(&mut self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_outbox_check) < OUTBOX_POLL_INTERVAL {
+            return;
+        }
+        self.last_outbox_check = now;
+        let _ = self.db_tx.try_send(DbCommand::DueOutbox);
+    }
+
     fn handle_smtp_events(&mut self, ctx: &egui::Context) {
         while let Ok(evt) = self.smtp_rx.try_recv() {
             match evt {
                 smtp::SmtpEvent::Sent { id, raw } => {
+                    // A message that had failed at least once (and so
+                    // picked up an autosaved draft along the way) is done
+                    // being a draft now that it's actually gone out.
+                    if let Some(window) = self.compose_windows.iter().find(|w| w.id() == id) {
+                        if let Some(draft_id) = window.snapshot().draft_id {
+                            let _ = self.db_tx.try_send(DbCommand::DeleteDraft { id: draft_id });
+                        }
+                    }
                     // Only the window that sent it closes; a failure (the
                     // Error arm below) leaves its window open with the typed
-                    // text intact instead, so nothing is lost -- see smtp.rs's
-                    // module docs on why that's a deliberately smaller
-                    // promise than a real retry queue.
+                    // text intact instead, so nothing is lost.
                     self.close_compose(ctx, id);
+                    // This id had already failed and durably recorded
+                    // itself in the outbox at least once (see the `Error`
+                    // arm) -- that attempt just succeeded, so the row is
+                    // done.
+                    if let Some(outbox_id) = self.outbox_owner.remove(&id) {
+                        let _ = self.db_tx.try_send(DbCommand::MarkOutboxSent { id: outbox_id });
+                        self.outbox_in_flight.remove(&outbox_id);
+                    }
                     self.status = "Message sent".to_string();
                     // B7: save a copy to Sent, the way every other mail
                     // client does (SMTP itself doesn't). Best-effort -- a
                     // failure here only logs (via the generic
-                    // ImapEvent::Error path), it doesn't reopen the compose
-                    // window or otherwise imply the send itself failed,
-                    // since it didn't. The copy goes to the account the
-                    // message was sent *from*, into that account's own Sent
-                    // folder (special-use discovery is per account).
+                    // ImapEvent::Error path), it doesn't imply the send
+                    // itself failed, since it didn't. The copy goes to the
+                    // account the message was sent *from*, into that
+                    // account's own Sent folder (special-use discovery is
+                    // per account).
                     if let Some(account) = self.sending_from.remove(&id) {
                         let mailbox = self.special_use_mailbox_for(&account, imap::SpecialUse::Sent, SENT_MAILBOX);
                         self.send_imap_to(&account, ImapCommand::Append { mailbox, raw });
@@ -1120,6 +1284,35 @@ impl EsMailApp {
                 }
                 smtp::SmtpEvent::Error { id, error } => {
                     self.sending_from.remove(&id);
+                    // Durable retry: an id that already owns an outbox row
+                    // (a retry, background or manual, failing again) just
+                    // gets backed off further -- its content is already
+                    // saved. A first-ever failure creates that row, using
+                    // the still-open window to recover the message's
+                    // content (there is no other copy of it by this point).
+                    // A first failure with no window left (discarded while
+                    // this send was still in flight) has nothing to recover
+                    // it from and is not retried -- a narrow, accepted gap
+                    // alongside the crash-mid-send one; see smtp.rs's module
+                    // docs.
+                    match self.outbox_owner.get(&id).copied() {
+                        Some(outbox_id) => {
+                            let _ = self.db_tx.try_send(DbCommand::MarkOutboxFailed { id: outbox_id, error: error.clone() });
+                            self.outbox_in_flight.remove(&outbox_id);
+                        }
+                        None => {
+                            if let Some(window) = self.compose_windows.iter().find(|w| w.id() == id) {
+                                if let Some(account_id) = window.account_id() {
+                                    let _ = self.db_tx.try_send(DbCommand::EnqueueOutbox {
+                                        id: None,
+                                        compose_id: id,
+                                        account_id,
+                                        compose: window.snapshot(),
+                                    });
+                                }
+                            }
+                        }
+                    }
                     let message = format!("Send failed: {error}");
                     // Normally a no-op: the SMTP forwarder's background
                     // thread already called `set_error_and_wake` on this same
@@ -1896,6 +2089,108 @@ impl EsMailApp {
             self.toggle_star_on_selection();
         }
     }
+    /// The Drafts window: every autosaved/explicitly-saved draft, click to
+    /// reopen it in Compose (which removes it from this list -- the window
+    /// carries the same `draft_id` forward, so autosave from then on
+    /// overwrites the same row rather than creating a second one).
+    fn show_drafts_window(&mut self, ctx: &egui::Context) {
+        let Some(drafts) = &self.drafts_window else { return };
+
+        let mut open = true;
+        let mut load_clicked = None;
+        let mut delete_clicked = None;
+        egui::Window::new("Drafts").open(&mut open).default_size([420.0, 320.0]).show(ctx, |ui| {
+            if drafts.is_empty() {
+                ui.weak("No saved drafts.");
+            }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for draft in drafts {
+                    ui.horizontal(|ui| {
+                        let to = if draft.to.is_empty() { "(no recipient)" } else { &draft.to };
+                        let subject = if draft.subject.is_empty() { "(no subject)" } else { &draft.subject };
+                        if ui.link(format!("{subject} — {to}")).clicked() {
+                            load_clicked = Some(draft.id);
+                        }
+                        if ui.small_button("Delete").clicked() {
+                            delete_clicked = Some(draft.id);
+                        }
+                    });
+                }
+            });
+        });
+
+        if let Some(id) = load_clicked {
+            let _ = self.db_tx.try_send(DbCommand::LoadDraft { id });
+        }
+        if let Some(id) = delete_clicked {
+            let _ = self.db_tx.try_send(DbCommand::DeleteDraft { id });
+            if let Some(drafts) = &mut self.drafts_window {
+                drafts.retain(|d| d.id != id);
+            }
+        }
+        if !open {
+            self.drafts_window = None;
+        }
+    }
+
+    /// The Outbox window: every message still queued to send (pending, or
+    /// retrying after a failure with `last_error`/`attempts` to show why).
+    /// "Edit" pulls it back into Compose to fix and resend -- removing it
+    /// from the outbox first, so re-sending can't double up with the
+    /// background retry still trying the old copy.
+    fn show_outbox_window(&mut self, ctx: &egui::Context) {
+        let Some(items) = &self.outbox_window else { return };
+
+        let mut open = true;
+        let mut edit_clicked = None;
+        let mut delete_clicked = None;
+        egui::Window::new("Outbox").open(&mut open).default_size([460.0, 320.0]).show(ctx, |ui| {
+            if items.is_empty() {
+                ui.weak("Nothing queued to send.");
+            }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for item in items {
+                    ui.horizontal(|ui| {
+                        let to = if item.compose.to.is_empty() { "(no recipient)" } else { &item.compose.to };
+                        let subject = if item.compose.subject.is_empty() { "(no subject)" } else { &item.compose.subject };
+                        ui.label(format!("{subject} — {to}"));
+                        if item.attempts > 0 {
+                            let detail = match &item.last_error {
+                                Some(e) => format!("retried {} time(s): {e}", item.attempts),
+                                None => format!("retried {} time(s)", item.attempts),
+                            };
+                            ui.label(egui::RichText::new(detail).color(egui::Color32::RED).small());
+                        }
+                        if ui.small_button("Edit").clicked() {
+                            edit_clicked = Some(item.id);
+                        }
+                        if ui.small_button("Delete").clicked() {
+                            delete_clicked = Some(item.id);
+                        }
+                    });
+                }
+            });
+        });
+
+        if let Some(id) = edit_clicked {
+            if let Some(items) = &mut self.outbox_window {
+                if let Some(pos) = items.iter().position(|i| i.id == id) {
+                    let item = items.remove(pos);
+                    let _ = self.db_tx.try_send(DbCommand::DeleteOutbox { id });
+                    self.open_compose(item.compose.with_account(Some(item.account_id)), compose_window::Focus::Body);
+                }
+            }
+        }
+        if let Some(id) = delete_clicked {
+            let _ = self.db_tx.try_send(DbCommand::DeleteOutbox { id });
+            if let Some(items) = &mut self.outbox_window {
+                items.retain(|i| i.id != id);
+            }
+        }
+        if !open {
+            self.outbox_window = None;
+        }
+    }
 }
 
 /// Tray icon polling + minimize-to-tray (B10), and clicks on new-mail toasts.
@@ -2004,6 +2299,16 @@ impl eframe::App for EsMailApp {
         self.handle_smtp_events(ctx);
         self.process_compose_windows(ctx);
         self.handle_tray(ctx);
+        self.autosave_drafts();
+        self.poll_outbox();
+        // Draining this here too (`ui()` also does, whenever it runs) is what
+        // makes a queued retry (`DbEvent::OutboxDue`) actually go out while
+        // the window is hidden -- `ui()` is skipped entirely while hidden, so
+        // without this a poll's reply would just sit in `db_rx` until the
+        // window is shown again. Idempotent (`try_recv` on an
+        // already-drained channel is just a no-op), so running it again in
+        // `ui()` on a visible frame costs nothing.
+        self.handle_db_events();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2087,12 +2392,6 @@ impl eframe::App for EsMailApp {
                         ui.close();
                     }
                 });
-                if ui.button("New Message").clicked() {
-                    self.open_compose(
-                        ComposeState { account_id: self.active_account_id(), ..Default::default() },
-                        compose_window::Focus::To,
-                    );
-                }
             });
         }
 
@@ -2266,6 +2565,13 @@ impl eframe::App for EsMailApp {
                         // that guess is often wrong. Used by B7's Send.
                         ui.add(egui::TextEdit::singleline(&mut self.smtp_host).hint_text("SMTP Host"));
                         ui.add(egui::TextEdit::singleline(&mut self.smtp_port).hint_text("SMTP Port"));
+                        egui::ComboBox::from_id_salt("wizard_smtp_tls")
+                            .selected_text(settings::tls_label(self.smtp_tls))
+                            .show_ui(ui, |ui| {
+                                for tls in [config::TlsMode::Ssl, config::TlsMode::StartTls, config::TlsMode::None] {
+                                    ui.selectable_value(&mut self.smtp_tls, tls, settings::tls_label(tls));
+                                }
+                            });
 
                         let form_id = self.account_from_form().id;
                         if self.oauth_tasks.contains_key(&form_id) {
@@ -2317,6 +2623,28 @@ impl eframe::App for EsMailApp {
             // actually had. As its own resizable panel, the tree gets the
             // full column width and full available height.
             egui::Panel::left("mailbox_panel").resizable(true).default_size(240.0).show(ui, |ui| {
+                // Compose/Drafts/Outbox as a stack of full-width buttons atop
+                // the account tree, Thunderbird/Outlook-style, rather than
+                // buried in the File menu -- these are the compose-related
+                // actions used often enough to deserve one click instead of
+                // two.
+                let full_width = ui.available_width();
+                if ui.add_sized([full_width, 32.0], egui::Button::new("Compose")).clicked() {
+                    self.open_compose(
+                        ComposeState { account_id: self.active_account_id(), ..Default::default() },
+                        compose_window::Focus::To,
+                    );
+                }
+                if ui.add_sized([full_width, 28.0], egui::Button::new("Drafts")).clicked() {
+                    self.drafts_window = Some(Vec::new());
+                    let _ = self.db_tx.try_send(DbCommand::ListDrafts);
+                }
+                if ui.add_sized([full_width, 28.0], egui::Button::new("Outbox")).clicked() {
+                    self.outbox_window = Some(Vec::new());
+                    let _ = self.db_tx.try_send(DbCommand::ListOutbox);
+                }
+                ui.separator();
+
                 // Deferred past the loop for the same reason as the message
                 // list below: acting on a click needs &mut self, which can't
                 // happen while the rows still borrow `self.accounts`.
@@ -2810,6 +3138,8 @@ impl eframe::App for EsMailApp {
 
         self.show_compose_windows(ui.ctx());
         self.show_quit_confirmation(ui.ctx());
+        self.show_drafts_window(ui.ctx());
+        self.show_outbox_window(ui.ctx());
         self.show_settings_window(ui.ctx());
     }
 }
@@ -2833,6 +3163,13 @@ const ARCHIVE_MAILBOX: &str = "Archive";
 /// enough that quickly arrowing past messages with `j`/`k` doesn't mark them
 /// all read, short enough that actually reading one still marks it promptly.
 const MARK_SEEN_DELAY: std::time::Duration = std::time::Duration::from_millis(1200);
+/// How often `poll_outbox` asks the db for retries that are due -- an
+/// enqueued send is also always attempted immediately (`DbEvent::OutboxEnqueued`),
+/// so this interval only matters for a *failed* send's automatic retry, or
+/// for a row left over from a previous run that crashed mid-send.
+const OUTBOX_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+/// How often an open compose window autosaves itself as a draft.
+const DRAFT_AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Start a session for `account` and wrap it in the per-account UI state.
 /// `pending_persist` is `Some` for an account added through the form, which
