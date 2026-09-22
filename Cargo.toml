@@ -72,7 +72,7 @@ tray-icon = { version = "0.24", default-features = false }
 # features used are enabled: the toast classes, the XML document they are built
 # from, `TypedEventHandler`, and the thread pool the toasts are shown on
 # (its threads are already COM-initialised, so no `unsafe` call is needed). Windows-only dependency -- see crates/esmail/Cargo.toml.
-windows = { version = "0.62", features = ["UI_Notifications", "Data_Xml_Dom", "Foundation", "System_Threading"] }
+windows = { version = "0.62", features = ["UI_Notifications", "Data_Xml_Dom", "Foundation", "System_Threading", "Win32_System_Threading"] }
 
 # Storage / secrets
 # `esmail` is the only crate in the workspace that depends on rusqlite, so a

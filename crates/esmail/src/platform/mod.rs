@@ -17,6 +17,8 @@
 //! - [`show_new_mail_toast`] -- show a toast for an account's new mail.
 //! - [`set_toast_click_handler`] -- what to do with the account id when a
 //!   toast is clicked. The handler may run on any thread.
+//! - [`disable_background_throttling`] -- opt this process out of Windows'
+//!   power-saving throttle for unfocused windows (see its doc for why).
 //!
 //! The decision logic these are driven by (whether it is new mail, what the
 //! text says, the toast XML) is platform independent and lives in
@@ -30,4 +32,7 @@ mod imp;
 #[path = "other.rs"]
 mod imp;
 
-pub use imp::{TrayAction, TrayState, set_toast_click_handler, show_new_mail_toast, use_own_notification_identity};
+pub use imp::{
+    TrayAction, TrayState, disable_background_throttling, set_toast_click_handler,
+    show_new_mail_toast, use_own_notification_identity,
+};

@@ -14,6 +14,10 @@
 
 use crate::imap::MailHeader;
 
+/// Names one compose window for the lifetime of the app; an SMTP result is
+/// routed back to its window by it (see `smtp::SmtpCommand::Send`).
+pub type ComposeId = u64;
+
 /// Everything a compose window edits. Reply-derived state comes from
 /// [`ComposeState::reply`]/[`ComposeState::reply_all`], forwards from
 /// [`ComposeState::forward`]; a blank one is just `ComposeState::default()`.

@@ -35,7 +35,13 @@ async fn run_google_sign_in(
     if let Err(e) = opener::open_browser(&pending.url) {
         log::warn!("could not open the browser for Google sign-in: {e}");
         let _ = tx.send(OAuthMessage::BrowserUnavailable { url: pending.url.clone() }).await;
-        ctx.request_repaint();
+        // `_of(ROOT)`: this runs on a background task with no viewport pass of
+        // its own, so the ambiguous `request_repaint()` can end up waking
+        // whichever viewport (e.g. a compose window animating its own
+        // spinner) last ran a pass instead of the root viewport that
+        // actually drains `OAuthMessage` -- see `main.rs`'s `session_hooks`
+        // for the fuller version of this note.
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
     let grant = pending.finish(client).await?;
     oauth::TokenSource::from_grant(client.clone(), grant)
@@ -186,7 +192,8 @@ impl EsMailApp {
                 Err(e) => OAuthMessage::Failed { account_id: account.id.clone(), error: format!("{e:#}") },
             };
             let _ = tx.send(message).await;
-            ctx.request_repaint();
+            // See `run_google_sign_in`'s note above on why `_of(ROOT)`.
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
         });
         self.oauth_tasks.insert(id, task);
     }

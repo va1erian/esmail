@@ -39,3 +39,7 @@ pub fn use_own_notification_identity(_registered: bool) {}
 
 /// Toasts are never shown here, so they are never clicked.
 pub fn set_toast_click_handler(_handler: impl Fn(String) + Send + Sync + 'static) {}
+
+/// The background-repaint throttle this works around (see `windows.rs`) is
+/// Windows-specific; nothing to opt out of elsewhere.
+pub fn disable_background_throttling() {}

@@ -394,7 +394,7 @@ async fn smtp_send(server: &mail_mock_server::RunningServer, auth: Auth) -> Smtp
         body: "No app password was involved.".to_string(),
         ..Default::default()
     };
-    cmd_tx.send(SmtpCommand::Send { account, compose }).await.unwrap();
+    cmd_tx.send(SmtpCommand::Send { id: 1, account, compose }).await.unwrap();
     timeout(RECV_TIMEOUT, evt_rx.recv()).await.expect("no reply from the SMTP actor").expect("actor gone")
 }
 
@@ -403,7 +403,7 @@ async fn smtp_sends_with_xoauth2_and_the_message_lands() {
     let (server, _google, auth) = oauth_setup(GOOD_TOKEN).await;
     match smtp_send(&server, auth).await {
         SmtpEvent::Sent { .. } => {}
-        SmtpEvent::Error(e) => panic!("send failed: {e}"),
+        SmtpEvent::Error { error, .. } => panic!("send failed: {error}"),
     }
     let store = server.store.lock().unwrap();
     let inbox = store.mailbox("INBOX").unwrap();
@@ -417,7 +417,7 @@ async fn smtp_sends_with_xoauth2_and_the_message_lands() {
 async fn smtp_rejects_a_bad_access_token() {
     let (server, _google, auth) = oauth_setup("ya29.some-other-token").await;
     match smtp_send(&server, auth).await {
-        SmtpEvent::Error(_) => {}
+        SmtpEvent::Error { .. } => {}
         SmtpEvent::Sent { .. } => panic!("a rejected token must not be able to send"),
     }
 }

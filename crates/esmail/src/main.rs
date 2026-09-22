@@ -5,6 +5,7 @@
 
 use esmail::{auth, compose, config, db, emoji, icons, imap, oauth, paths, render, screenshot, search_query, secrets, session, shell, smtp, uninstall};
 mod accounts;
+mod compose_window;
 mod settings;
 /// Tray icon + new-mail toasts (B10): the OS-specific side lives behind
 /// `platform`, so nothing below names a platform.
@@ -16,6 +17,8 @@ use egui_litehtml_webview::{
 };
 use imap::{ImapCommand, ImapEvent, MailHeader};
 use db::{DbActor, DbCommand, DbEvent};
+use compose::{ComposeId, ComposeState};
+use compose_window::ComposeWindow;
 use config::{AccountConfig, Config};
 use search_query::ParsedQuery;
 use secrecy::SecretString;
@@ -208,12 +211,10 @@ struct EsMailApp {
     /// Show the "Add account" form even though accounts are already
     /// connected. With no accounts the form is shown regardless.
     adding_account: bool,
-    /// The account the in-flight SMTP send was issued for, so `Sent` can
-    /// save the copy to *that* account's Sent folder. There is one compose
-    /// window and one send at a time today, which makes a single slot
-    /// enough; a compose-window-per-message design (#34) should carry the
-    /// account on the SMTP event instead.
-    sending_from: Option<AccountId>,
+    /// The account each in-flight SMTP send was issued for, by compose id, so
+    /// `Sent` can save the copy to *that* account's Sent folder -- even when
+    /// the window that sent it has been closed meanwhile.
+    sending_from: std::collections::HashMap<ComposeId, AccountId>,
     db_tx: mpsc::Sender<DbCommand>,
     db_rx: mpsc::Receiver<DbEvent>,
     smtp_tx: mpsc::Sender<smtp::SmtpCommand>,
@@ -322,10 +323,22 @@ struct EsMailApp {
     /// when no message is loaded.
     current_message_html: String,
 
-    /// The compose window's state, when one is open — `None` means it's
-    /// closed. See `compose.rs`.
-    compose: Option<compose::ComposeState>,
-    compose_status: String,
+    /// The open compose windows, one native window per message (see
+    /// `compose_window.rs`). Sending or discarding one leaves the rest alone.
+    compose_windows: Vec<ComposeWindow>,
+    /// The same windows, keyed by id and behind a `Mutex` so the SMTP
+    /// forwarder task's background thread can reach a specific one directly
+    /// -- see `compose_window.rs`'s module docs and
+    /// `ComposeWindow::mark_sent_and_hide`. Kept in sync with
+    /// `compose_windows` by `open_compose`/`close_compose`; a clone of the
+    /// `Arc` was handed to that task when it was spawned.
+    compose_registry: Arc<std::sync::Mutex<std::collections::HashMap<ComposeId, ComposeWindow>>>,
+    /// Source of [`ComposeId`]s.
+    next_compose_id: ComposeId,
+    /// The window icon, shared with the compose windows.
+    window_icon: Option<Arc<egui::IconData>>,
+    /// Asking whether to quit although compose windows hold unsent text.
+    confirm_quit: bool,
 
     /// Monotonic source for `ImapCommand::FetchHeaders`/`FetchBody` request
     /// ids. Only the reply matching `current_headers_req`/`current_body_req`
@@ -383,6 +396,32 @@ impl EsMailApp {
         let (db_evt_tx, db_evt_rx) = mpsc::channel(32);
 
         let egui_ctx = cc.egui_ctx.clone();
+
+        // A safety-net heartbeat for the root viewport (#34's compose windows
+        // exposed this): on Windows, once no esMail window has focus -- which,
+        // once a compose window is open, means the main window unless the
+        // user deliberately clicks back onto it -- the OS can delay an
+        // already-scheduled repaint of it by a long time (observed: well over
+        // a minute), even one requested via the correctly-targeted, otherwise
+        // instant `request_repaint_of(ROOT)`. `platform::disable_background_throttling`
+        // (called once from `main()`) opts the whole process out of the
+        // specific throttle documented for this, but wasn't enough by itself
+        // in testing, so this thread also just unconditionally re-requests a
+        // root repaint on a short, fixed interval for the app's whole
+        // lifetime -- cheap (an idle egui pass is not expensive), and it
+        // bounds the worst case for whatever isn't handled some other way
+        // (see `compose_window.rs`'s module docs for the part that is: a
+        // compose window's own send result no longer waits on this at all).
+        {
+            let ctx = egui_ctx.clone();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            });
+        }
+
         // A click on a new-mail toast arrives on a thread of the OS's, so it is
         // only handed over here: the account id goes into a channel (drained in
         // `handle_tray`) and the window is asked to come forward and repaint.
@@ -393,14 +432,19 @@ impl EsMailApp {
                 let _ = toast_click_tx.try_send(account);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                ctx.request_repaint();
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
             }
         });
         let session_hooks = Hooks {
             notify: Arc::new(platform::show_new_mail_toast),
             repaint: {
                 let ctx = egui_ctx.clone();
-                Arc::new(move || ctx.request_repaint())
+                // `request_repaint_of(ROOT)`: the events this wakes
+                // (`handle_imap_events` and friends) are only ever drained by
+                // the root viewport's `logic()`/`ui()`, so that's the one
+                // that must wake up -- see the heartbeat thread above for why
+                // that alone isn't always prompt on Windows.
+                Arc::new(move || ctx.request_repaint_of(egui::ViewportId::ROOT))
             },
         };
 
@@ -410,19 +454,46 @@ impl EsMailApp {
         tokio::spawn(async move {
             while let Some(evt) = rx_db.recv().await {
                 let _ = db_evt_tx.send(evt).await;
-                ctx_clone_db.request_repaint();
+                ctx_clone_db.request_repaint_of(egui::ViewportId::ROOT);
             }
         });
         DbActor::spawn(db_cmd_rx, tx_db);
+
+        let compose_registry: Arc<std::sync::Mutex<std::collections::HashMap<ComposeId, ComposeWindow>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
         let (smtp_cmd_tx, smtp_cmd_rx) = mpsc::channel(8);
         let (smtp_evt_tx, smtp_evt_rx) = mpsc::channel(8);
         let (tx_smtp, mut rx_smtp) = mpsc::channel(8);
         let ctx_clone_smtp = egui_ctx.clone();
+        let compose_registry_smtp = compose_registry.clone();
         tokio::spawn(async move {
             while let Some(evt) = rx_smtp.recv().await {
+                // Act on the compose window directly, from this thread, as
+                // well as forwarding below -- see `compose_window.rs`'s
+                // module docs for why a successful send (or a failure) isn't
+                // left to wait on the main window's `logic()` to notice.
+                let window = {
+                    let id = match &evt {
+                        smtp::SmtpEvent::Sent { id, .. } | smtp::SmtpEvent::Error { id, .. } => *id,
+                    };
+                    compose_registry_smtp.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&id).cloned()
+                };
+                if let Some(window) = window {
+                    match &evt {
+                        smtp::SmtpEvent::Sent { .. } => window.mark_sent_and_hide(&ctx_clone_smtp),
+                        smtp::SmtpEvent::Error { error, .. } => {
+                            window.set_error_and_wake(&ctx_clone_smtp, format!("Send failed: {error}"));
+                        }
+                    }
+                }
                 let _ = smtp_evt_tx.send(evt).await;
-                ctx_clone_smtp.request_repaint();
+                // The bookkeeping `handle_smtp_events` still does with this
+                // (dropping the window from `compose_windows`/`compose_registry`,
+                // saving the Sent copy) isn't user-visible, so it can wait for
+                // the root viewport's own pace -- `_of(ROOT)`, same reasoning
+                // as `session_hooks.repaint` above.
+                ctx_clone_smtp.request_repaint_of(egui::ViewportId::ROOT);
             }
         });
         smtp::SmtpActor::spawn(smtp_cmd_rx, tx_smtp);
@@ -584,7 +655,7 @@ impl EsMailApp {
             imap_rx,
             session_hooks,
             adding_account: false,
-            sending_from: None,
+            sending_from: std::collections::HashMap::new(),
             db_tx: db_cmd_tx,
             db_rx: db_evt_rx,
             smtp_tx: smtp_cmd_tx,
@@ -615,8 +686,11 @@ impl EsMailApp {
             current_attachments: Vec::new(),
             current_sender: None,
             current_message_html: String::new(),
-            compose: None,
-            compose_status: String::new(),
+            compose_windows: Vec::new(),
+            compose_registry,
+            next_compose_id: 0,
+            window_icon: icons::window_icon().map(|icon| Arc::new(egui::IconData::from(icon))),
+            confirm_quit: false,
             next_req_id: 0,
             current_headers_req: 0,
             current_body_req: 0,
@@ -1020,17 +1094,16 @@ impl EsMailApp {
         }
     }
 
-    fn handle_smtp_events(&mut self) {
+    fn handle_smtp_events(&mut self, ctx: &egui::Context) {
         while let Ok(evt) = self.smtp_rx.try_recv() {
             match evt {
-                smtp::SmtpEvent::Sent { raw } => {
-                    // The compose window closes on success; a failure (the
-                    // Error arm below) leaves it open with the typed text
-                    // intact instead, so nothing is lost -- see smtp.rs's
+                smtp::SmtpEvent::Sent { id, raw } => {
+                    // Only the window that sent it closes; a failure (the
+                    // Error arm below) leaves its window open with the typed
+                    // text intact instead, so nothing is lost -- see smtp.rs's
                     // module docs on why that's a deliberately smaller
                     // promise than a real retry queue.
-                    self.compose = None;
-                    self.compose_status.clear();
+                    self.close_compose(ctx, id);
                     self.status = "Message sent".to_string();
                     // B7: save a copy to Sent, the way every other mail
                     // client does (SMTP itself doesn't). Best-effort -- a
@@ -1040,16 +1113,159 @@ impl EsMailApp {
                     // since it didn't. The copy goes to the account the
                     // message was sent *from*, into that account's own Sent
                     // folder (special-use discovery is per account).
-                    if let Some(account) = self.sending_from.take().or_else(|| self.active.clone()) {
+                    if let Some(account) = self.sending_from.remove(&id) {
                         let mailbox = self.special_use_mailbox_for(&account, imap::SpecialUse::Sent, SENT_MAILBOX);
                         self.send_imap_to(&account, ImapCommand::Append { mailbox, raw });
                     }
                 }
-                smtp::SmtpEvent::Error(e) => {
-                    self.sending_from = None;
-                    self.compose_status = format!("Send failed: {e}");
+                smtp::SmtpEvent::Error { id, error } => {
+                    self.sending_from.remove(&id);
+                    let message = format!("Send failed: {error}");
+                    // Normally a no-op: the SMTP forwarder's background
+                    // thread already called `set_error_and_wake` on this same
+                    // window the moment the event arrived (see `main()`'s
+                    // `compose_registry_smtp` block) -- this is just the
+                    // fallback for the window having been closed meanwhile,
+                    // which leaves nobody to show it to but the main window.
+                    match self.compose_windows.iter().find(|w| w.id() == id) {
+                        Some(window) => window.set_error_and_wake(ctx, message),
+                        None => self.push_banner(message),
+                    }
                 }
             }
+        }
+    }
+
+    /// Opens a compose window for `state`. Its viewport is created by the
+    /// next [`Self::show_compose_windows`].
+    fn open_compose(&mut self, state: ComposeState, focus: compose_window::Focus) {
+        self.next_compose_id += 1;
+        let window = ComposeWindow::new(self.next_compose_id, state, focus);
+        // Kept in `compose_registry` too -- see `compose_window.rs`'s module
+        // docs -- for as long as this window is open.
+        self.compose_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(window.id(), window.clone());
+        self.compose_windows.push(window);
+    }
+
+    /// Drops the window, which closes its OS window at the next frame of the
+    /// main window. That frame never comes while the main window is hidden,
+    /// so the window is also hidden on the spot -- and, for a send that
+    /// completed, it is normally already hidden by the time this runs at
+    /// all; see `compose_window.rs`'s module docs.
+    fn close_compose(&mut self, ctx: &egui::Context, id: ComposeId) {
+        if let Some(pos) = self.compose_windows.iter().position(|w| w.id() == id) {
+            let window = self.compose_windows.remove(pos);
+            self.compose_registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
+            ctx.send_viewport_cmd_to(window.viewport_id(), egui::ViewportCommand::Visible(false));
+            // `_of(ROOT)`: dropping the window from `compose_windows` only
+            // actually closes it once the root viewport runs another `ui()`
+            // pass (the one that stops calling `show_compose_windows` for
+            // this id) -- see the heartbeat thread's note in `new()` for why
+            // that isn't always prompt on Windows, though this particular
+            // repaint is cosmetic bookkeeping now, not what makes the window
+            // disappear.
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
+    }
+
+    /// What the compose windows ask for, run from `logic()` so it keeps
+    /// working while the main window is hidden in the tray: send the messages
+    /// whose Send was clicked and drop the windows that are finished.
+    fn process_compose_windows(&mut self, ctx: &egui::Context) {
+        let finished: Vec<ComposeId> =
+            self.compose_windows.iter().filter(|w| w.is_finished()).map(ComposeWindow::id).collect();
+        for id in finished {
+            self.close_compose(ctx, id);
+        }
+
+        let mut requests = Vec::new();
+        for window in &self.compose_windows {
+            if let Some(compose) = window.take_send_request() {
+                requests.push((window.id(), window.account_id(), compose));
+            }
+        }
+        for (id, from, compose) in requests {
+            let Some(window) = self.compose_windows.iter().find(|w| w.id() == id) else { continue };
+            let error = match from.as_deref().map(|from| (from, self.smtp_account_for(from))) {
+                Some((from, Some(account))) => {
+                    // Remembered so `Sent` saves the copy to this account's
+                    // Sent folder -- see `sending_from`.
+                    self.sending_from.insert(id, from.to_string());
+                    if self.smtp_tx.try_send(smtp::SmtpCommand::Send { id, account, compose }).is_ok() {
+                        None
+                    } else {
+                        self.sending_from.remove(&id);
+                        Some("Could not queue the message for sending.".to_string())
+                    }
+                }
+                None => Some("Choose an account to send from.".to_string()),
+                Some((_, None)) => Some("No SMTP password on file yet — connect once via IMAP first.".to_string()),
+            };
+            match error {
+                None => window.set_sending(true),
+                Some(error) => window.set_error(error),
+            }
+            ctx.request_repaint_of(window.viewport_id());
+        }
+    }
+
+    /// Declares every compose window to egui; called each frame the main
+    /// window is drawn (see `ComposeWindow::show`).
+    fn show_compose_windows(&self, ctx: &egui::Context) {
+        let accounts: Vec<(String, String)> =
+            self.accounts.iter().map(|v| (v.id().to_string(), v.label().to_string())).collect();
+        for window in &self.compose_windows {
+            window.show(ctx, accounts.clone(), self.window_icon.clone());
+        }
+    }
+
+    /// The "unsent messages" question raised by [`Self::request_quit`].
+    fn show_quit_confirmation(&mut self, ctx: &egui::Context) {
+        if !self.confirm_quit {
+            return;
+        }
+        if !self.has_unsent_compose() {
+            // Sent or discarded while the question was up.
+            self.confirm_quit = false;
+            return;
+        }
+        let mut quit = false;
+        let mut keep = false;
+        egui::Window::new("Quit esMail?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.label("Some messages have not been sent. Quitting discards them.");
+            ui.horizontal(|ui| {
+                quit = ui.button("Quit anyway").clicked();
+                keep = ui.button("Keep them open").clicked();
+            });
+        });
+        if quit {
+            self.confirm_quit = false;
+            self.exit_requested = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if keep {
+            self.confirm_quit = false;
+        }
+    }
+
+    /// Whether any compose window holds text that closing the app would lose.
+    fn has_unsent_compose(&self) -> bool {
+        self.compose_windows.iter().any(ComposeWindow::is_dirty)
+    }
+
+    /// Quit: at once, or -- when a compose window holds unsent text -- after
+    /// asking in the main window.
+    fn request_quit(&mut self, ctx: &egui::Context) {
+        if self.has_unsent_compose() {
+            self.confirm_quit = true;
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+        } else {
+            self.exit_requested = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -1565,11 +1781,6 @@ impl EsMailApp {
         self.move_selection(&dest);
     }
 
-    /// Draws the compose window when `self.compose` is `Some`, and handles
-    /// its Send/Attach/Discard buttons. A separate top-level `egui::Window`
-    /// rather than part of the main layout — B7 says "compose window", and
-    /// this can stay open (or get discarded) independent of what the user
-    /// does with the message list behind it.
     /// B8's mark-as-read delay: fires the actual `StoreFlags` once
     /// `MARK_SEEN_DELAY` has elapsed since `open_message` scheduled it,
     /// provided the same message is still the one open (otherwise the timer
@@ -1602,14 +1813,11 @@ impl EsMailApp {
     /// list's own sake and so a future "highlight without opening" cursor
     /// has something to bind to), `r` (Reply), `a` (Archive), `f`
     /// (star/unstar), `Del`/`Backspace` (delete to Trash), `Ctrl+F` (focus
-    /// search), `Ctrl+N` (compose). Disabled while the compose window is
-    /// open (its own text fields need every keystroke) or the search box
+    /// search), `Ctrl+N` (compose). Disabled while the search box
     /// has focus (so typing "j"/"f"/etc. into a search query doesn't also
-    /// fire a shortcut).
+    /// fire a shortcut). Compose windows are separate native windows with
+    /// their own input, so they need no special-casing here.
     fn handle_keyboard_shortcuts(&mut self, ui: &mut egui::Ui) {
-        if self.compose.is_some() {
-            return;
-        }
         let search_focused = self
             .search_box_id
             .is_some_and(|id| ui.memory(|m| m.has_focus(id)));
@@ -1638,8 +1846,7 @@ impl EsMailApp {
             }
         }
         if ctrl_n {
-            self.compose = Some(compose::ComposeState::default().with_account(self.active_account_id()));
-            self.compose_status.clear();
+            self.open_compose(ComposeState::default().with_account(self.active_account_id()), compose_window::Focus::To);
         }
         if next || prev {
             let is_search = self.search_results.is_some();
@@ -1673,8 +1880,10 @@ impl EsMailApp {
         }
         if reply {
             if let Some(header) = self.selected_header() {
-                self.compose = Some(compose::ComposeState::reply(&header, &self.current_message_html).with_account(self.active_account_id()));
-                self.compose_status.clear();
+                self.open_compose(
+                    ComposeState::reply(&header, &self.current_message_html).with_account(self.active_account_id()),
+                    compose_window::Focus::Body,
+                );
             }
         }
         if archive {
@@ -1685,123 +1894,6 @@ impl EsMailApp {
         }
         if star {
             self.toggle_star_on_selection();
-        }
-    }
-
-    fn show_compose_window(&mut self, ctx: &egui::Context) {
-        let Some(compose) = &mut self.compose else {
-            return;
-        };
-
-        let mut open = true;
-        let mut send_clicked = false;
-        let mut discard_clicked = false;
-        egui::Window::new("Compose")
-            .open(&mut open)
-            .default_size([480.0, 420.0])
-            .show(ctx, |ui| {
-                egui::Grid::new("compose_grid").num_columns(2).show(ui, |ui| {
-                    // Which account this is sent from -- and whose Sent
-                    // folder gets the copy. Defaults to the account of the
-                    // message being replied to (else the active one), set
-                    // when the compose window was opened.
-                    ui.label("From:");
-                    let selected = compose
-                        .account_id
-                        .as_deref()
-                        .and_then(|id| self.accounts.iter().find(|v| v.id() == id))
-                        .map_or("(choose an account)", |v| v.label());
-                    egui::ComboBox::from_id_salt("compose_from").selected_text(selected).show_ui(ui, |ui| {
-                        for view in &self.accounts {
-                            ui.selectable_value(&mut compose.account_id, Some(view.id().to_string()), view.label());
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("To:");
-                    ui.add(egui::TextEdit::singleline(&mut compose.to).desired_width(f32::INFINITY));
-                    ui.end_row();
-
-                    ui.label("Cc:");
-                    ui.add(egui::TextEdit::singleline(&mut compose.cc).desired_width(f32::INFINITY));
-                    ui.end_row();
-
-                    ui.label("Bcc:");
-                    ui.add(egui::TextEdit::singleline(&mut compose.bcc).desired_width(f32::INFINITY));
-                    ui.end_row();
-
-                    ui.label("Subject:");
-                    ui.add(egui::TextEdit::singleline(&mut compose.subject).desired_width(f32::INFINITY));
-                    ui.end_row();
-                });
-
-                ui.separator();
-
-                if !compose.attachments.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        for (filename, data) in &compose.attachments {
-                            ui.label(format!("{filename} ({})", format_size(data.len())));
-                        }
-                    });
-                }
-                if ui.button("Attach file…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        match std::fs::read(&path) {
-                            Ok(data) => {
-                                let filename = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| "attachment".to_string());
-                                compose.attachments.push((filename, data));
-                            }
-                            Err(e) => {
-                                self.compose_status = format!("Could not read {}: {e}", path.display());
-                            }
-                        }
-                    }
-                }
-
-                ui.add_sized(
-                    ui.available_size() - egui::vec2(0.0, 60.0),
-                    egui::TextEdit::multiline(&mut compose.body),
-                );
-
-                ui.horizontal(|ui| {
-                    if ui.button("Send").clicked() {
-                        send_clicked = true;
-                    }
-                    if ui.button("Discard").clicked() {
-                        discard_clicked = true;
-                    }
-                    if !self.compose_status.is_empty() {
-                        ui.label(egui::RichText::new(&self.compose_status).color(egui::Color32::RED));
-                    }
-                });
-            });
-
-        if send_clicked {
-            let from = self.compose.as_ref().and_then(|c| c.account_id.clone());
-            match from.as_deref().and_then(|id| self.smtp_account_for(id)) {
-                Some(account) => {
-                    let compose = self.compose.clone().expect("just matched Some above");
-                    // Remembered so `Sent` saves the copy to this account's
-                    // Sent folder -- see `sending_from`.
-                    self.sending_from = from;
-                    let _ = self.smtp_tx.try_send(smtp::SmtpCommand::Send { account, compose });
-                    self.compose_status = "Sending…".to_string();
-                }
-                None if from.is_none() => {
-                    self.compose_status = "Choose an account to send from.".to_string();
-                }
-                None => {
-                    self.compose_status =
-                        "No SMTP password on file yet — connect once via IMAP first.".to_string();
-                }
-            }
-        }
-        if discard_clicked || !open {
-            self.compose = None;
-            self.compose_status.clear();
         }
     }
 }
@@ -1844,6 +1936,16 @@ impl EsMailApp {
         }
         // The tooltip carries the unread total over all accounts.
         let unread: u32 = self.accounts.iter().map(AccountView::total_unread).sum();
+        // Without a tray a close request really closes -- unless a compose
+        // window holds unsent text, which is asked about first.
+        if self.tray.is_none()
+            && !self.exit_requested
+            && ctx.input(|i| i.viewport().close_requested())
+            && self.has_unsent_compose()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_quit(ctx);
+        }
         let Some(tray) = &mut self.tray else { return };
         tray.set_unread(unread);
         tray.refresh_icon();
@@ -1855,19 +1957,22 @@ impl EsMailApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 platform::TrayAction::Quit => {
-                    self.exit_requested = true;
                     // Hidden windows don't organically generate another
                     // close-request -- nothing is clicking their (invisible)
-                    // close button -- so ask for one explicitly. The check
-                    // below sees `exit_requested` and lets it through rather
-                    // than redirecting it to "hide to tray" again.
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    // close button -- so `request_quit` asks for one
+                    // explicitly. The check below sees `exit_requested` and
+                    // lets it through rather than redirecting it to "hide to
+                    // tray" again. (Unsent compose windows are asked about
+                    // first.)
+                    self.request_quit(ctx);
                 }
             }
         }
 
-        // The redirect: a first close-request (the user clicked the window's
-        // own close button) is canceled and turned into "hide instead",
+        // The redirect: a first close-request (the user clicked the main
+        // window's own close button -- this only ever sees the root viewport's
+        // input, so a compose window's close never lands here) is canceled and
+        // turned into "hide instead",
         // *unless* it was `self.exit_requested` that triggered this request
         // (tray Quit), in which case letting it proceed is the point.
         if ctx.input(|i| i.viewport().close_requested()) && !self.exit_requested {
@@ -1894,6 +1999,10 @@ impl eframe::App for EsMailApp {
     /// need to be here -- see `session::AccountSession`, whose forwarder is a plain tokio task
     /// that runs independent of both `logic()` and `ui()`.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The compose windows' sends and results are handled here rather than
+        // in `ui()`, so they keep working while the main window is hidden.
+        self.handle_smtp_events(ctx);
+        self.process_compose_windows(ctx);
         self.handle_tray(ctx);
     }
 
@@ -1921,7 +2030,7 @@ impl eframe::App for EsMailApp {
         // chosen; without one (no tray on this platform, or it could not be
         // created) a close request really closes.
         let closing = ui.ctx().input(|i| i.viewport().close_requested())
-            && (self.tray.is_none() || self.exit_requested);
+            && (self.exit_requested || (self.tray.is_none() && !self.has_unsent_compose()));
         if closing && !self.geometry_saved_on_close {
             self.geometry_saved_on_close = true;
             self.save_window_geometry();
@@ -1944,7 +2053,6 @@ impl eframe::App for EsMailApp {
         self.handle_oauth_events();
         self.handle_imap_events();
         self.handle_db_events();
-        self.handle_smtp_events();
 
         // The main (folder pane + message list) view is shown as soon as
         // there is any account at all -- the login form is no longer a gate
@@ -1980,11 +2088,10 @@ impl eframe::App for EsMailApp {
                     }
                 });
                 if ui.button("New Message").clicked() {
-                    self.compose = Some(compose::ComposeState {
-                        account_id: self.active_account_id(),
-                        ..Default::default()
-                    });
-                    self.compose_status.clear();
+                    self.open_compose(
+                        ComposeState { account_id: self.active_account_id(), ..Default::default() },
+                        compose_window::Focus::To,
+                    );
                 }
             });
         }
@@ -2536,7 +2643,7 @@ impl eframe::App for EsMailApp {
             egui::CentralPanel::default().show(ui, |ui| {
                 if self.selected_uid.is_some() {
                     // Cloned rather than borrowed: the Reply/Reply All/
-                    // Forward buttons below need `&mut self.compose` while
+                    // Forward buttons below need `&mut self` while
                     // this is in scope, which can't coexist with a borrow of
                     // `self.headers` (the same reason the mailbox/message
                     // list loops elsewhere in this file defer their sends).
@@ -2561,26 +2668,26 @@ impl eframe::App for EsMailApp {
                             });
                             ui.horizontal(|ui| {
                                 if ui.button("Reply").clicked() {
-                                    self.compose = Some(compose::ComposeState::reply(&header, &self.current_message_html).with_account(self.active_account_id()));
-                                    self.compose_status.clear();
+                                    self.open_compose(
+                                        ComposeState::reply(&header, &self.current_message_html).with_account(self.active_account_id()),
+                                        compose_window::Focus::Body,
+                                    );
                                 }
                                 if ui.button("Reply All").clicked() {
                                     // "Me" is the account that received the
                                     // message, so Reply All drops that
                                     // address from Cc.
-                                    self.compose = Some(
-                                        compose::ComposeState::reply_all(
-                                            &header,
-                                            &self.current_message_html,
-                                            &self.active_username(),
-                                        )
-                                        .with_account(self.active_account_id()),
+                                    self.open_compose(
+                                        ComposeState::reply_all(&header, &self.current_message_html, &self.active_username())
+                                            .with_account(self.active_account_id()),
+                                        compose_window::Focus::Body,
                                     );
-                                    self.compose_status.clear();
                                 }
                                 if ui.button("Forward").clicked() {
-                                    self.compose = Some(compose::ComposeState::forward(&header, &self.current_message_html).with_account(self.active_account_id()));
-                                    self.compose_status.clear();
+                                    self.open_compose(
+                                        ComposeState::forward(&header, &self.current_message_html).with_account(self.active_account_id()),
+                                        compose_window::Focus::To,
+                                    );
                                 }
                                 ui.separator();
                                 // Single-message flag/move shortcuts (B8) --
@@ -2701,7 +2808,8 @@ impl eframe::App for EsMailApp {
             });
         }
 
-        self.show_compose_window(ui.ctx());
+        self.show_compose_windows(ui.ctx());
+        self.show_quit_confirmation(ui.ctx());
         self.show_settings_window(ui.ctx());
     }
 }
@@ -3023,6 +3131,10 @@ fn is_dev_run() -> bool {
 #[tokio::main]
 async fn main() -> eframe::Result {
     init_logging();
+    // See `platform::disable_background_throttling`'s doc: without this,
+    // compose windows (#34) and the tray/toast machinery can go unresponsive
+    // for a long time once no esMail window has focus.
+    platform::disable_background_throttling();
 
     // `esmail --purge-data`: what the Windows uninstaller runs when the user
     // chooses to remove their settings too. Deliberately ahead of the
@@ -3073,7 +3185,7 @@ async fn main() -> eframe::Result {
     // (`&eframe::CreationContext`, same as every other eframe app) untouched.
     let mut viewport = egui::ViewportBuilder::default().with_inner_size([1280.0, 720.0]);
     if let Some(icon) = icons::window_icon() {
-        viewport = viewport.with_icon(egui::IconData { rgba: icon.pixels, width: icon.width, height: icon.height });
+        viewport = viewport.with_icon(egui::IconData::from(icon));
     }
     if let Some(geometry) = config::Config::load().window {
         viewport = viewport
