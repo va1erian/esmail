@@ -524,10 +524,10 @@ async fn send_via_smtp_then_see_it_over_imap() {
         ..Default::default()
     };
 
-    smtp_cmd_tx.send(SmtpCommand::Send { account, compose }).await.unwrap();
+    smtp_cmd_tx.send(SmtpCommand::Send { id: 1, account, compose }).await.unwrap();
     match timeout(RECV_TIMEOUT, smtp_evt_rx.recv()).await.unwrap().unwrap() {
         SmtpEvent::Sent { .. } => {}
-        SmtpEvent::Error(e) => panic!("send failed: {e}"),
+        SmtpEvent::Error { error, .. } => panic!("send failed: {error}"),
     }
 
     h.imap_cmd.send(ImapCommand::FetchHeaders { mailbox: "INBOX".to_string(), page: 1, req_id: 1 }).await.unwrap();
@@ -539,6 +539,49 @@ async fn send_via_smtp_then_see_it_over_imap() {
         }
         other => panic!("expected Headers, got {other:?}"),
     }
+}
+
+/// Several compose windows can have a send in flight at once: each result comes
+/// back tagged with the id of the window that sent it (the one that failed
+/// carries the failing id, the others their own).
+#[tokio::test]
+async fn smtp_results_carry_the_id_of_the_compose_window_that_sent() {
+    skip_unless_ca_trusted!();
+    let h = start_harness(0).await;
+
+    let (smtp_cmd_tx, smtp_cmd_rx) = mpsc::channel(8);
+    let (smtp_evt_tx, mut smtp_evt_rx) = mpsc::channel(8);
+    SmtpActor::spawn(smtp_cmd_rx, smtp_evt_tx);
+
+    let account = |password: &str| SmtpAccount {
+        host: "127.0.0.1".to_string(),
+        port: h.server.smtp_addr.port(),
+        tls: esmail::config::TlsMode::None,
+        username: TEST_USER.to_string(),
+        auth: Auth::password(password),
+        from_address: TEST_USER.to_string(),
+    };
+    let compose = |subject: &str| ComposeState {
+        to: TEST_USER.to_string(),
+        subject: subject.to_string(),
+        ..Default::default()
+    };
+
+    smtp_cmd_tx.send(SmtpCommand::Send { id: 11, account: account(TEST_PASSWORD), compose: compose("first") }).await.unwrap();
+    smtp_cmd_tx.send(SmtpCommand::Send { id: 12, account: account("wrong password"), compose: compose("second") }).await.unwrap();
+    smtp_cmd_tx.send(SmtpCommand::Send { id: 13, account: account(TEST_PASSWORD), compose: compose("third") }).await.unwrap();
+
+    let mut sent = Vec::new();
+    let mut failed = Vec::new();
+    for _ in 0..3 {
+        match timeout(RECV_TIMEOUT, smtp_evt_rx.recv()).await.unwrap().unwrap() {
+            SmtpEvent::Sent { id, .. } => sent.push(id),
+            SmtpEvent::Error { id, .. } => failed.push(id),
+        }
+    }
+    sent.sort();
+    assert_eq!(sent, vec![11, 13]);
+    assert_eq!(failed, vec![12]);
 }
 
 /// B7: after a send, `main.rs` also `APPEND`s a copy to Sent -- verify the
@@ -570,10 +613,10 @@ async fn append_saves_a_sent_copy_that_fetch_headers_can_then_see() {
         ..Default::default()
     };
 
-    smtp_cmd_tx.send(SmtpCommand::Send { account, compose }).await.unwrap();
+    smtp_cmd_tx.send(SmtpCommand::Send { id: 1, account, compose }).await.unwrap();
     let raw = match timeout(RECV_TIMEOUT, smtp_evt_rx.recv()).await.unwrap().unwrap() {
-        SmtpEvent::Sent { raw } => raw,
-        SmtpEvent::Error(e) => panic!("send failed: {e}"),
+        SmtpEvent::Sent { raw, .. } => raw,
+        SmtpEvent::Error { error, .. } => panic!("send failed: {error}"),
     };
     assert!(String::from_utf8_lossy(&raw).contains("Copy me to Sent"), "raw bytes should be the actual sent message");
 
@@ -775,7 +818,7 @@ mod stress {
                     body: format!("Body of stress message #{i}"),
                     ..Default::default()
                 };
-                cmd_tx.send(SmtpCommand::Send { account, compose }).await.unwrap();
+                cmd_tx.send(SmtpCommand::Send { id: 1, account, compose }).await.unwrap();
                 match timeout(Duration::from_secs(30), evt_rx.recv()).await {
                     Ok(Some(SmtpEvent::Sent { .. })) => true,
                     other => {

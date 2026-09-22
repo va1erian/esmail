@@ -3,7 +3,7 @@
 //! blocks the UI thread.
 //!
 //! **Not done:** persisted retry queue. A failed send reports
-//! [`SmtpEvent::Error`] and the compose window stays open with the typed
+//! [`SmtpEvent::Error`] and that message's compose window stays open with the typed
 //! text intact so the user can just click Send again; there is no background
 //! retry-with-backoff and nothing survives an app restart. PLAN.md's B7 asks
 //! for "queue sends so a failure retries rather than losing the message" —
@@ -25,7 +25,7 @@ use secrecy::ExposeSecret;
 use tokio::sync::mpsc;
 
 use crate::auth::Auth;
-use crate::compose::ComposeState;
+use crate::compose::{ComposeId, ComposeState};
 use crate::config::TlsMode;
 
 /// Everything sending needs that isn't in the [`ComposeState`] itself.
@@ -41,7 +41,10 @@ pub struct SmtpAccount {
 }
 
 pub enum SmtpCommand {
-    Send { account: SmtpAccount, compose: ComposeState },
+    /// `id` names the compose window the message came from. It comes back on
+    /// the resulting event, so several sends can be in flight at once and
+    /// each result reaches the right window.
+    Send { id: ComposeId, account: SmtpAccount, compose: ComposeState },
 }
 
 #[derive(Debug)]
@@ -51,8 +54,8 @@ pub enum SmtpEvent {
     /// message (which would risk it drifting from what was actually sent —
     /// a fresh `Message-ID`, say, from calling `build_message` a second
     /// time).
-    Sent { raw: Vec<u8> },
-    Error(String),
+    Sent { id: ComposeId, raw: Vec<u8> },
+    Error { id: ComposeId, error: String },
 }
 
 pub struct SmtpActor {
@@ -71,12 +74,12 @@ impl SmtpActor {
     async fn run(&mut self) {
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
-                SmtpCommand::Send { account, compose } => match Self::send(&account, &compose).await {
+                SmtpCommand::Send { id, account, compose } => match Self::send(&account, &compose).await {
                     Ok(raw) => {
-                        let _ = self.event_tx.send(SmtpEvent::Sent { raw }).await;
+                        let _ = self.event_tx.send(SmtpEvent::Sent { id, raw }).await;
                     }
                     Err(e) => {
-                        let _ = self.event_tx.send(SmtpEvent::Error(e.to_string())).await;
+                        let _ = self.event_tx.send(SmtpEvent::Error { id, error: e.to_string() }).await;
                     }
                 },
             }

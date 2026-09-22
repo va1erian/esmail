@@ -19,6 +19,10 @@ use windows::Data::Xml::Dom::XmlDocument;
 use windows::Foundation::TypedEventHandler;
 use windows::UI::Notifications::{ToastActivatedEventArgs, ToastNotification, ToastNotificationManager};
 use windows::System::Threading::{ThreadPool, WorkItemHandler};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+    ProcessPowerThrottling, SetProcessInformation,
+};
 use windows::core::{HSTRING, IInspectable, Interface};
 
 use crate::{icons, shell};
@@ -156,6 +160,43 @@ fn themed_icon(light_glyph: bool) -> anyhow::Result<Icon> {
     let art = icons::tray_icon(light_glyph)
         .ok_or_else(|| anyhow::anyhow!("the embedded tray icon does not decode"))?;
     Icon::from_rgba(art.pixels, art.width, art.height).map_err(|e| anyhow::anyhow!("tray icon: {e}"))
+}
+
+/// Opts this process out of Windows' "EXECUTION_SPEED" power throttling,
+/// which the OS applies to a process none of whose windows currently has
+/// focus -- coalescing its timers and delaying delivery of already-scheduled
+/// window redraws by anywhere from a few seconds to, observed while chasing
+/// #34's stuck "Sending…" spinner, well over a minute. That throttle is what
+/// made a compose window's own repaint requests (and the periodic tray-tick
+/// chain in `main.rs`'s `handle_tray`) go unheard once a second esMail
+/// window took it out of focus, even though every request was correctly
+/// targeted at the root viewport and returned immediately.
+///
+/// Called once at startup (see `main.rs`). Best-effort: if it fails (an
+/// unsupported Windows version, say), esMail is simply subject to the normal
+/// throttle again, same as before this existed -- the periodic heartbeat
+/// thread in `main.rs` still bounds the worst case, just to a a longer one.
+pub fn disable_background_throttling() {
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: 1,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0, // 0 = do not throttle, for every bit named in ControlMask.
+    };
+    // Safety: `state` is a plain, fully-initialized `#[repr(C)]` struct kept
+    // alive for the whole call, and its size matches what `ProcessInformation`
+    // expects for `ProcessPowerThrottling` (see the Win32 docs for
+    // `SetProcessInformation`/`PROCESS_POWER_THROTTLING_STATE`).
+    let result = unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            std::ptr::from_ref(&state).cast(),
+            u32::try_from(size_of::<PROCESS_POWER_THROTTLING_STATE>()).expect("struct size fits u32"),
+        )
+    };
+    if let Err(e) = result {
+        log::warn!("could not opt out of background power throttling: {e}");
+    }
 }
 
 /// Windows PowerShell's AppUserModelID, which Windows always knows. Toasts
