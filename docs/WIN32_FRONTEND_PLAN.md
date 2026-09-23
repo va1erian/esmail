@@ -22,6 +22,28 @@ The route is three tracks that can run partly in parallel:
 - **C.** Grow `win32ui` to cover what a mail client needs, then build
   `esmail-win32` on top of A and B.
 
+## Decisions
+
+- **2026-09-23: keep and grow win32ui, with solid dark mode and theming as
+  its headline feature.** We reviewed the existing Rust Win32 libraries.
+  [winsafe](https://github.com/rodrigocfd/winsafe) is the mature option and
+  has most native controls, but it only exposes the raw owner-draw hooks
+  (`NM_CUSTOMDRAW`, `WM_CTLCOLOR*`, subclassing). It has no theming layer, and
+  it does not wrap Direct2D or DirectWrite. win32ui's model is that controls
+  theme themselves and the app never sees custom-draw plumbing, and that is
+  what esMail needs. winsafe stays a reference for message and struct details.
+  The others were ruled out: native-windows-gui is unmaintained, winio is a
+  cross-platform async framework, and libui and wxDragon are cross-platform
+  toolkits.
+- The theming foundation is
+  [win32ui#30](https://github.com/va1erian/win32ui/issues/30): semantic
+  tokens, a `Themed` trait, `Window::set_theme` with live switching, and
+  central `WM_CTLCOLOR*` routing. It uses documented APIs only, and owner-draws
+  wherever a native part ignores dark mode. Every UI PR attaches light and dark
+  screenshots.
+- `windows` crate (not `windows-sys`): the COM APIs (Direct2D, DirectWrite,
+  task dialog, UI Automation) need it.
+
 ---
 
 ## 1. Where things stand
@@ -88,8 +110,8 @@ esmail-win32 cannot ship without it.
    modules, so it compiles to an empty crate elsewhere, and do the same in
    `esmail-win32`.
 4. **The `windows` crate version.** win32ui pins `windows 0.58` and esMail
-   uses `0.62`, so both would be linked. Align on `0.62`, or on `windows-sys`
-   for the raw calls, which is lighter. `Error::Win32(windows::core::Error)`
+   uses `0.62`, so both would be linked. Align on `0.62` (see Decisions for why not
+   `windows-sys`). `Error::Win32(windows::core::Error)`
    also leaks a `windows` type into the public API. Wrap it as an
    `HRESULT` code plus a message.
 5. **Message coverage.** Keyboard (`WM_KEYDOWN/UP`, `WM_SYSKEYDOWN`,
