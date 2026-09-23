@@ -3,9 +3,9 @@
 //! `va1erian/litehtml-rs`) and paints it with Direct2D/DirectWrite through
 //! [win32ui](https://github.com/va1erian/win32ui).
 //!
-//! This is milestone 1 of the native-Win32 frontend: **render, scroll, resize,
-//! DPI**. Links and text selection are milestone 2. It exists to judge quality
-//! and speed against the current egui painter (`egui-litehtml-webview`) before
+//! This is the native-Win32 frontend prototype: **render, scroll, resize, DPI,
+//! links, text selection, copy, keyboard**. It exists to judge quality and
+//! speed against the current egui painter (`egui-litehtml-webview`) before
 //! committing to the full plan in `docs/WIN32_FRONTEND_PLAN.md` section 4.
 //!
 //! # Design
@@ -22,6 +22,18 @@
 //! to the UI thread as an `Arc`; [`Painter::paint`] replays it into a
 //! `D2dCanvas`, culling to the visible region and applying the scroll offset, so
 //! a tall newsletter costs only what is on screen.
+//!
+//! # Links and selection without a `Document`
+//!
+//! The draw pass also records a [`LinkTable`] and a [`TextRunTable`] (one run
+//! per word: box, text, per-character x offsets, containing block, forced line
+//! breaks) and ships them with the frame. Link clicks, the hover cursor, the
+//! selection highlight, and copy are then point/geometry lookups on the UI
+//! thread, with no second parse + layout. The character boundary under the
+//! pointer and the highlight boxes come from DirectWrite's own hit-testing and
+//! selection rects (a `Layout` rebuilt per run), so right-to-left and complex
+//! text select accurately — the table's left-to-right offsets are only a
+//! fallback and what the pure selection logic is tested against.
 //!
 //! # Units
 //!
@@ -46,15 +58,22 @@
 mod container;
 mod engine;
 mod geom;
+mod links;
 mod list;
 mod paint;
+mod selection;
+mod text_runs;
+mod view;
 mod widget;
 mod worker;
 
 pub use crate::geom::{Point, Radius, Rect, Rgba};
+pub use crate::links::{Link, LinkTable};
 pub use crate::list::{
     BorderKind, BorderPaint, Cmd, Dash, DisplayList, EdgePaint, FontDesc, FontKey, GradientStop,
     Image, ImageKey, LinearGradient, RadialGradient, Stroke, decompose_borders, normalize_stops,
 };
 pub use crate::paint::Painter;
-pub use crate::widget::HtmlView;
+pub use crate::selection::{Selection, TextPos};
+pub use crate::text_runs::{TextRun, TextRunTable};
+pub use crate::view::{HtmlView, HtmlViewEvent};

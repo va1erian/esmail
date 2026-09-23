@@ -4,22 +4,27 @@
 //! ```text
 //! cargo run -p litehtml-view-d2d --example view -- <file.html>
 //! cargo run -p litehtml-view-d2d --example view -- demo --screenshot out.png
+//! cargo run -p litehtml-view-d2d --example view -- --select-demo
 //! ```
 //!
 //! `--screenshot out.png` renders once, captures via `Window::capture` and
 //! exits (the capture path is guarded by a timer so a render always has an
 //! exit path). `--width`/`--height` set the window size in design units.
+//! `--select-demo` renders a page of several blocks (including an RTL and a CJK
+//! phrase), selects everything, and captures a screenshot so the highlight can
+//! be checked. Link clicks print their `href`.
 
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
-use litehtml_view_d2d::HtmlView;
+use litehtml_view_d2d::{HtmlView, HtmlViewEvent};
 use win32ui::column;
 use win32ui::prelude::*;
 
 enum Msg {
     FrameReady,
+    Link(String),
     Tick,
 }
 
@@ -29,6 +34,8 @@ struct App {
     ticks: u64,
     scroll: Option<f32>,
     applied_scroll: bool,
+    select_demo: bool,
+    selected: bool,
 }
 
 const DEMO: &str = r#"<!doctype html>
@@ -47,6 +54,23 @@ const DEMO: &str = r#"<!doctype html>
 <h2 id="bottom">Bottom of the page</h2>
 "#;
 
+/// A page for `--select-demo`: several blocks, an RTL phrase and a CJK phrase,
+/// all on a light background so the selection highlight stands out.
+const SELECT_DEMO: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<style>
+  body { font: 18px/1.6 system-ui, sans-serif; margin: 2rem; color: #111; background: #fff; }
+  p { margin: 1.2rem 0; }
+</style>
+<h1>Selection demo</h1>
+<p>First block: the quick brown fox jumps over the lazy dog.</p>
+<p>Second block: selection should highlight across every one of these blocks.</p>
+<ul><li>List item one</li><li>List item two</li></ul>
+<p>Third block: more prose to select, with some <b>bold</b> and <i>italic</i> text.</p>
+<p dir="rtl" lang="he">שלום עולם, מה שלומך?</p>
+<p lang="ja">日本語のテキストです。中文文本。</p>
+"#;
+
 pub(crate) fn main() {
     env_logger::init();
 
@@ -54,6 +78,7 @@ pub(crate) fn main() {
     let mut path: Option<String> = None;
     let mut screenshot: Option<String> = None;
     let mut scroll: Option<f32> = None;
+    let mut select_demo = false;
     let mut width = 700.0f32;
     let mut height = 900.0f32;
     let mut i = 0;
@@ -62,6 +87,10 @@ pub(crate) fn main() {
             "--screenshot" => {
                 screenshot = args.get(i + 1).cloned();
                 i += 2;
+            }
+            "--select-demo" => {
+                select_demo = true;
+                i += 1;
             }
             "--scroll" => {
                 scroll = args.get(i + 1).and_then(|s| s.parse().ok());
@@ -86,28 +115,41 @@ pub(crate) fn main() {
         }
     }
 
-    let Some(name) = path else {
-        eprintln!("usage: cargo run -p litehtml-view-d2d --example view -- <file.html|file.eml|demo> [--screenshot out.png]");
-        std::process::exit(2);
-    };
-    let html = match load(&name) {
-        Ok(html) => html,
-        Err(e) => {
-            eprintln!("view: {e}");
-            std::process::exit(1);
+    let html = if select_demo {
+        screenshot.get_or_insert_with(|| "select-demo.png".to_string());
+        SELECT_DEMO.to_string()
+    } else {
+        let Some(name) = path else {
+            eprintln!("usage: cargo run -p litehtml-view-d2d --example view -- <file.html|file.eml|demo> [--screenshot out.png] [--select-demo]");
+            std::process::exit(2);
+        };
+        match load(&name) {
+            Ok(html) => html,
+            Err(e) => {
+                eprintln!("view: {e}");
+                std::process::exit(1);
+            }
         }
     };
 
     let result = win32ui::run_app(
         WindowSpec::new("litehtml-view-d2d").size(dip(width), dip(height)),
         |ui| {
-            let view = HtmlView::new(ui, html, || Msg::FrameReady).expect("create the view");
+            let view = HtmlView::new(
+                ui,
+                html,
+                || Msg::FrameReady,
+                |event| match event {
+                    HtmlViewEvent::LinkClicked(href) => Some(Msg::Link(href)),
+                },
+            )
+            .expect("create the view");
             ui.set_layout(column![view.fill(1)]);
             let timer = screenshot.as_ref().map(|_| ui.set_timer(100).ok()).flatten();
             if let Some(timer) = timer {
                 ui.on_timer(move |id| (id == timer).then_some(Msg::Tick));
             }
-            App { view, screenshot, ticks: 0, scroll, applied_scroll: false }
+            App { view, screenshot, ticks: 0, scroll, applied_scroll: false, select_demo, selected: false }
         },
     );
     if let Err(error) = result {
@@ -145,12 +187,27 @@ fn write_screenshot(image: &RgbaImage, path: &Path) -> std::result::Result<(), B
     Ok(())
 }
 
+/// Counts pixels that look like the translucent selection highlight over a
+/// white page (a distinctly blue, non-white colour). A non-zero count is the
+/// programmatic check that the highlight is visible.
+fn count_highlight(image: &RgbaImage) -> usize {
+    let mut n = 0;
+    for px in image.pixels.chunks_exact(4) {
+        let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+        if b >= 200 && b - r >= 40 && b - g >= 20 {
+            n += 1;
+        }
+    }
+    n
+}
+
 impl win32ui::App for App {
     type Msg = Msg;
 
     fn update(&mut self, msg: Msg, ui: &mut Ui<Msg>) {
         match msg {
             Msg::FrameReady => self.view.invalidate(),
+            Msg::Link(href) => eprintln!("view: link clicked: {href}"),
             Msg::Tick => {
                 self.ticks += 1;
                 if !self.applied_scroll && self.view.is_ready() {
@@ -159,16 +216,17 @@ impl win32ui::App for App {
                     }
                     self.applied_scroll = true;
                 }
-                if self.screenshot.is_some() && self.applied_scroll && self.view.is_ready() {
-                    let path = self.screenshot.clone().unwrap();
-                    match ui.capture() {
-                        Ok(image) => match write_screenshot(&image, Path::new(&path)) {
-                            Ok(()) => eprintln!("view: wrote screenshot to {path}"),
-                            Err(e) => eprintln!("view: screenshot failed: {e}"),
-                        },
-                        Err(e) => eprintln!("view: screenshot failed: {e}"),
-                    }
-                    ui.quit();
+                if self.select_demo && self.applied_scroll && self.view.is_ready() && !self.selected {
+                    self.view.select_all();
+                    self.selected = true;
+                    self.ticks = 0;
+                }
+                if self.screenshot.is_some() && self.applied_scroll && self.view.is_ready() && !self.select_demo {
+                    self.finish_screenshot(ui);
+                } else if self.screenshot.is_some() && self.selected && self.ticks > 1 {
+                    // A couple of frames after `select_all` so the highlight is
+                    // painted before we capture.
+                    self.finish_screenshot(ui);
                 } else if self.ticks > 6000 {
                     // A render that never settles must still have an exit path.
                     eprintln!("view: timed out waiting for a frame");
@@ -176,5 +234,23 @@ impl win32ui::App for App {
                 }
             }
         }
+    }
+}
+
+impl App {
+    fn finish_screenshot(&self, ui: &mut Ui<Msg>) {
+        let path = self.screenshot.clone().unwrap();
+        match ui.capture() {
+            Ok(image) => {
+                let highlight = count_highlight(&image);
+                eprintln!("view: highlight pixels: {highlight}");
+                match write_screenshot(&image, Path::new(&path)) {
+                    Ok(()) => eprintln!("view: wrote screenshot to {path}"),
+                    Err(e) => eprintln!("view: screenshot failed: {e}"),
+                }
+            }
+            Err(e) => eprintln!("view: screenshot failed: {e}"),
+        }
+        ui.quit();
     }
 }

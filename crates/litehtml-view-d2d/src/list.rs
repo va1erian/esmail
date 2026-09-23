@@ -5,6 +5,8 @@
 use std::sync::Arc;
 
 use crate::geom::{Point, Radius, Rect, Rgba};
+use crate::links::LinkTable;
+use crate::text_runs::TextRunTable;
 
 /// Identifies one font of a document. Indexes into [`DisplayList::fonts`].
 pub type FontKey = u32;
@@ -231,6 +233,10 @@ pub struct Frame {
     pub id: u64,
     /// The display list.
     pub list: Arc<DisplayList>,
+    /// Where the page's text is, for selection (see [`TextRunTable`]).
+    pub runs: Arc<TextRunTable>,
+    /// Where the page's links are, for clicks and the hover cursor.
+    pub links: Arc<LinkTable>,
 }
 
 // ─── Border decomposition (pure, testable) ──────────────────────────────────

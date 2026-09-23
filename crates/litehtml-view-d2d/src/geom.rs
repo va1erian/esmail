@@ -52,6 +52,27 @@ impl Rect {
         self.bottom - self.top
     }
 
+    /// Whether the point is inside the rectangle (edges on the right/bottom
+    /// do not count).
+    pub fn contains(&self, p: Point) -> bool {
+        p.x >= self.left && p.x < self.right && p.y >= self.top && p.y < self.bottom
+    }
+
+    /// The centre of the rectangle.
+    pub fn center(&self) -> Point {
+        Point::new((self.left + self.right) / 2.0, (self.top + self.bottom) / 2.0)
+    }
+
+    /// The smallest rectangle covering both this rectangle and `other`.
+    pub fn union(&self, other: Rect) -> Rect {
+        Rect {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+
     /// The rectangle moved by `(x, y)`.
     pub fn translate(&self, x: f32, y: f32) -> Rect {
         Rect {

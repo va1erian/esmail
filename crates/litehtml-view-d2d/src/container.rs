@@ -10,6 +10,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use litehtml::email::EMAIL_MASTER_CSS;
@@ -86,6 +87,7 @@ fn border_edge(border: &Border) -> BorderEdge {
 // ─── The container ──────────────────────────────────────────────────────────
 
 /// One resolved font, kept for measuring and for the slot's metrics.
+#[derive(Clone)]
 struct Slot {
     key: FontKey,
     font: Font,
@@ -100,7 +102,10 @@ struct Slot {
 /// The worker-side `DocumentContainer`.
 pub(crate) struct D2dContainer {
     text: TextSystem,
-    slots: HashMap<usize, Slot>,
+    /// `Rc<RefCell>` so [`D2dContainer::text_measure`] can capture the live
+    /// font table without borrowing the container (a `Document` holds its
+    /// mutable borrow while text runs are collected).
+    slots: Rc<std::cell::RefCell<HashMap<usize, Slot>>>,
     next_font: usize,
     fonts: Vec<FontDesc>,
     viewport: Position,
@@ -118,7 +123,7 @@ impl D2dContainer {
     pub(crate) fn new(text: TextSystem) -> Self {
         Self {
             text,
-            slots: HashMap::new(),
+            slots: Rc::new(std::cell::RefCell::new(HashMap::new())),
             next_font: 1,
             fonts: Vec::new(),
             viewport: Position { x: 0.0, y: 0.0, width: 1.0, height: VIEWPORT_HEIGHT },
@@ -157,7 +162,7 @@ impl D2dContainer {
     /// Records a text run whose box is `pos`. Shared by `draw_text` and
     /// numbered list markers.
     fn push_text(&mut self, text: &str, font: FontHandle, color: Color, pos: Position, decorate: bool) {
-        let Some(slot) = self.slots.get(&font.0) else { return };
+        let Some(slot) = self.slots.borrow().get(&font.0).cloned() else { return };
         let (key, ascent, height, font_size) = (slot.key, slot.ascent, slot.height, slot.font_size);
         let (decoration, decoration_color) = (slot.decoration, slot.decoration_color);
         let color32 = c32(color);
@@ -240,6 +245,22 @@ impl D2dContainer {
         )
     }
 
+    /// Closures for [`TextRunTable::collect`](crate::TextRunTable::collect)
+    /// that do not borrow the container: the `Document` holds its mutable
+    /// borrow while collection runs. They share the container's live font
+    /// table (fonts are created during layout, after this is captured), so the
+    /// widths they return match the ones litehtml measured with.
+    pub(crate) fn text_measure(&self) -> (impl Fn(&str, FontHandle) -> f32 + use<>, impl Fn(FontHandle) -> FontKey + use<>) {
+        let widths = Rc::clone(&self.slots);
+        let keys = Rc::clone(&self.slots);
+        (
+            move |text, font| {
+                widths.borrow().get(&font.0).map_or(text.len() as f32 * 8.0, |s| s.font.width(text))
+            },
+            move |font| keys.borrow().get(&font.0).map_or(0, |s| s.key),
+        )
+    }
+
     /// The recorded commands, fonts and images of the finished pass.
     pub(crate) fn take_frame(&mut self) -> (Vec<Cmd>, Vec<FontDesc>, Vec<Arc<Image>>) {
         let cmds = std::mem::take(&mut self.cmds);
@@ -272,7 +293,7 @@ impl DocumentContainer for D2dContainer {
         });
         let handle = self.next_font;
         self.next_font += 1;
-        self.slots.insert(
+        self.slots.borrow_mut().insert(
             handle,
             Slot { key, font, ascent, height, font_size: size, decoration: d.decoration_line(), decoration_color: d.decoration_color() },
         );
@@ -296,7 +317,8 @@ impl DocumentContainer for D2dContainer {
     }
 
     fn text_width(&self, text: &str, font: FontHandle) -> f32 {
-        let Some(slot) = self.slots.get(&font.0) else { return text.len() as f32 * 8.0 };
+        let slots = self.slots.borrow();
+        let Some(slot) = slots.get(&font.0) else { return text.len() as f32 * 8.0 };
         let before = slot.font.cached_widths();
         let width = slot.font.width(text);
         let hit = (slot.font.cached_widths() == before) as u64;
