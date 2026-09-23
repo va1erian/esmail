@@ -3,7 +3,8 @@
 // builds keep the console so `cargo run` shows the log.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use esmail::{auth, compose, config, contacts, db, emoji, icons, imap, oauth, paths, render, screenshot, search_query, secrets, session, shell, smtp, uninstall};
+use esmail::{auth, compose, config, contacts, db, emoji, icons, imap, oauth, paths, progress, render, screenshot, search_query, secrets, session, shell, smtp, uninstall};
+use progress::{Progress, ProgressKind};
 mod accounts;
 mod compose_ui;
 mod compose_window;
@@ -115,6 +116,43 @@ impl WebViewHandler for MessageViewHandler {
 struct Banner {
     id: u64,
     message: String,
+}
+
+/// The one middle-to-long operation shown in the bottom status bar, if any --
+/// issue #79's single progress slot. A report for a new operation replaces
+/// whatever was there, and a terminal event clears it only while it is still
+/// the kind being shown, so a superseded report can't blank the current one.
+struct ProgressView {
+    kind: ProgressKind,
+    progress: Progress,
+}
+
+/// A bulk action over a selection (mark read/unread, star/unstar, archive,
+/// delete) in flight. Only one runs at a time -- the buttons that start one
+/// are disabled while this is `Some` (issue #79's one-at-a-time decision) --
+/// and [`EsMailApp::advance_bulk_action`] turns each per-message reply into an
+/// update of the status bar's `done/total`.
+struct BulkAction {
+    kind: ProgressKind,
+    total: u32,
+    pending: std::collections::BTreeSet<u32>,
+}
+
+/// A finished background attachment write, drained by
+/// [`EsMailApp::handle_attachment_io`]. `error` is `None` on success.
+enum AttachmentIoEvent {
+    Saved { path: std::path::PathBuf, error: Option<String> },
+    Opened { filename: String, error: Option<String> },
+}
+
+/// An attachment disk operation handed to [`spawn_attachment_write`]. The
+/// bytes are owned (cloned on the UI thread when the button is clicked)
+/// because the write itself no longer runs there (issue #79).
+enum AttachmentWrite {
+    /// `Save…`: write `data` to the user-chosen `path`.
+    Save { path: std::path::PathBuf, data: Vec<u8> },
+    /// `Open`: write `data` to a temp file and hand it to the OS handler.
+    Open { filename: String, data: Vec<u8> },
 }
 
 /// The host the "Sign in with Google" option is offered for.
@@ -407,7 +445,19 @@ struct EsMailApp {
     /// `selected_mailbox` there without reloading `headers`; when the search
     /// is cleared the message list has to be fetched again.
     headers_stale: bool,
-    download_progress: Option<(u32, u32)>,
+    /// The one operation the bottom status bar is showing, if any. See
+    /// [`ProgressView`].
+    progress: Option<ProgressView>,
+    /// The bulk flag/move action in flight, if any. See [`BulkAction`].
+    bulk_action: Option<BulkAction>,
+    /// Compose ids whose SMTP send has not come back yet, so the status bar
+    /// can show "Sending…" while any is outstanding -- including a background
+    /// outbox retry that has no compose window of its own.
+    sends_in_flight: std::collections::HashSet<ComposeId>,
+    /// Results of attachment writes run on background threads. See
+    /// [`EsMailApp::handle_attachment_io`].
+    attachment_io_tx: std::sync::mpsc::Sender<AttachmentIoEvent>,
+    attachment_io_rx: std::sync::mpsc::Receiver<AttachmentIoEvent>,
 
     /// The tray icon (B10), or `None` if either it couldn't be created (see
     /// `platform::TrayState::new`'s doc, or this platform has none) or this is a preview/screenshot run,
@@ -700,6 +750,8 @@ impl EsMailApp {
             }
         }
 
+        let (attachment_io_tx, attachment_io_rx) = std::sync::mpsc::channel();
+
         let mut app = Self {
             web_view_host,
             web_view,
@@ -767,7 +819,11 @@ impl EsMailApp {
             search_origins: Vec::new(),
             search_all_accounts: false,
             headers_stale: false,
-            download_progress: None,
+            progress: None,
+            bulk_action: None,
+            sends_in_flight: std::collections::HashSet::new(),
+            attachment_io_tx,
+            attachment_io_rx,
             tray,
             toast_click_rx,
             exit_requested: false,
@@ -827,6 +883,11 @@ impl EsMailApp {
                     }
                 }
                 ImapEvent::Error(e) => {
+                    // A failed `BulkDownload` reports through this generic
+                    // variant (it has no per-uid/req_id to attribute to), so
+                    // clear its bar rather than leaving it stuck at whatever
+                    // it last showed.
+                    self.clear_progress(ProgressKind::Index);
                     if let Some(view) = self.view_mut(&account) {
                         // A first connect that failed, or a reconnect that gave
                         // up (a revoked Google sign-in, say): either way the
@@ -903,17 +964,26 @@ impl EsMailApp {
                     self.push_account_banner(&account, format!("Could not load message: {error}"));
                 }
                 ImapEvent::Exported { path } => {
+                    self.clear_progress(ProgressKind::Export);
                     self.status = format!("Exported message to {}", path.display());
                 }
                 ImapEvent::ExportFailed { error } => {
+                    self.clear_progress(ProgressKind::Export);
                     self.push_account_banner(&account, format!("Could not export message: {error}"));
                 }
-                ImapEvent::DownloadProgress { current, total } => {
-                    if is_active {
-                        self.download_progress = Some((current, total));
-                        if current == total {
-                            self.download_progress = None;
+                ImapEvent::Progress { kind, progress: update } => {
+                    // Indexing is the active account's selected mailbox, so a
+                    // report for another account's is ignored; an append or an
+                    // export belongs to whichever account it was issued for,
+                    // so those show regardless.
+                    let indexing_done = kind == ProgressKind::Index
+                        && matches!(update, Progress::Counted { current, total } if current == total);
+                    if kind != ProgressKind::Index || is_active {
+                        if indexing_done {
+                            self.clear_progress(ProgressKind::Index);
                             self.status = "Download complete".to_string();
+                        } else {
+                            self.set_progress(kind, update);
                         }
                     }
                 }
@@ -946,10 +1016,11 @@ impl EsMailApp {
                 ImapEvent::Appended { mailbox } => {
                     // B7: confirmation that the just-sent message was saved
                     // to `mailbox` (see the `Append` sent from
-                    // `handle_smtp_events`'s `Sent` arm). Nothing for the UI
-                    // to update -- the compose window and "Message sent"
+                    // `handle_smtp_events`'s `Sent` arm). Nothing else for the
+                    // UI to update -- the compose window and "Message sent"
                     // status already reflect the send itself, which
                     // succeeded independently of this.
+                    self.clear_progress(ProgressKind::Append);
                     log::debug!("appended sent message to {mailbox}");
                 }
                 ImapEvent::AppendFailed { mailbox, error } => {
@@ -962,6 +1033,7 @@ impl EsMailApp {
                     // sent" instead of only being able to overwrite it --
                     // which is exactly the problem that made this event a
                     // log-only affair up to now.
+                    self.clear_progress(ProgressKind::Append);
                     log::warn!("could not save sent message to {mailbox}: {error}");
                     self.push_account_banner(&account, format!("Sent, but could not save a copy to {mailbox}: {error}"));
                 }
@@ -985,6 +1057,7 @@ impl EsMailApp {
                     log::warn!("background new-mail poll for {account} failed: {e}");
                 }
                 ImapEvent::FlagsUpdated { mailbox, uid, flags, req_id: _ } => {
+                    self.advance_bulk_action(ProgressKind::Flags, uid);
                     // B8: reflect the server-confirmed flags back into the
                     // visible header list, any active search-results list,
                     // and the local cache. Only touches self.headers/
@@ -1034,9 +1107,11 @@ impl EsMailApp {
                     });
                 }
                 ImapEvent::FlagsUpdateFailed { mailbox: _, uid, error, req_id: _ } => {
+                    self.advance_bulk_action(ProgressKind::Flags, uid);
                     self.push_account_banner(&account, format!("Could not update flags on message {uid}: {error}"));
                 }
                 ImapEvent::Moved { mailbox, uid, dest, req_id: _ } => {
+                    self.advance_bulk_action(ProgressKind::Move, uid);
                     // B8: delete-to-Trash/archive succeeded -- drop the
                     // message from the visible list, any active
                     // search-results list, the cache, and any selection it
@@ -1090,6 +1165,7 @@ impl EsMailApp {
                     });
                 }
                 ImapEvent::MoveFailed { mailbox: _, uid, error, req_id: _ } => {
+                    self.advance_bulk_action(ProgressKind::Move, uid);
                     self.push_account_banner(&account, format!("Could not move message {uid}: {error}"));
                 }
                 ImapEvent::UnreadCounts(counts) => {
@@ -1182,7 +1258,9 @@ impl EsMailApp {
                                 self.outbox_in_flight.insert(item.id);
                                 self.outbox_owner.insert(synthetic_id, item.id);
                                 self.sending_from.insert(synthetic_id, item.account_id.clone());
-                                let _ = self.smtp_tx.try_send(smtp::SmtpCommand::Send { id: synthetic_id, account, compose: item.compose });
+                                if self.smtp_tx.try_send(smtp::SmtpCommand::Send { id: synthetic_id, account, compose: item.compose }).is_ok() {
+                                    self.mark_send_started(synthetic_id);
+                                }
                             }
                             None => {
                                 // No SMTP credential on file for this account
@@ -1268,6 +1346,7 @@ impl EsMailApp {
         while let Ok(evt) = self.smtp_rx.try_recv() {
             match evt {
                 smtp::SmtpEvent::Sent { id, raw } => {
+                    self.mark_send_finished(id);
                     // A message that had failed at least once (and so
                     // picked up an autosaved draft along the way) is done
                     // being a draft now that it's actually gone out.
@@ -1303,6 +1382,7 @@ impl EsMailApp {
                     }
                 }
                 smtp::SmtpEvent::Error { id, error } => {
+                    self.mark_send_finished(id);
                     self.sending_from.remove(&id);
                     // Durable retry: an id that already owns an outbox row
                     // (a retry, background or manual, failing again) just
@@ -1401,13 +1481,14 @@ impl EsMailApp {
             }
         }
         for (id, from, compose) in requests {
-            let Some(window) = self.compose_windows.iter().find(|w| w.id() == id) else { continue };
+            let Some(viewport_id) = self.compose_windows.iter().find(|w| w.id() == id).map(ComposeWindow::viewport_id) else { continue };
             let error = match from.as_deref().map(|from| (from, self.smtp_account_for(from))) {
                 Some((from, Some(account))) => {
                     // Remembered so `Sent` saves the copy to this account's
                     // Sent folder -- see `sending_from`.
                     self.sending_from.insert(id, from.to_string());
                     if self.smtp_tx.try_send(smtp::SmtpCommand::Send { id, account, compose }).is_ok() {
+                        self.mark_send_started(id);
                         None
                     } else {
                         self.sending_from.remove(&id);
@@ -1418,10 +1499,18 @@ impl EsMailApp {
                 Some((_, None)) => Some("No SMTP password on file yet — connect once via IMAP first.".to_string()),
             };
             match error {
-                None => window.set_sending(true),
-                Some(error) => window.set_error(error),
+                None => {
+                    if let Some(window) = self.compose_windows.iter().find(|w| w.id() == id) {
+                        window.set_sending(true);
+                    }
+                }
+                Some(error) => {
+                    if let Some(window) = self.compose_windows.iter().find(|w| w.id() == id) {
+                        window.set_error(error);
+                    }
+                }
             }
-            ctx.request_repaint_of(window.viewport_id());
+            ctx.request_repaint_of(viewport_id);
         }
     }
 
@@ -1602,6 +1691,14 @@ impl EsMailApp {
         }
         if self.active.as_deref() == Some(account) {
             self.active = None;
+            // A bulk action's replies are dropped once its account is gone
+            // (see `handle_imap_events`'s removal guard), so without this an
+            // in-flight one would leave the status bar and the disabled
+            // buttons stuck forever.
+            self.bulk_action = None;
+            self.clear_progress(ProgressKind::Flags);
+            self.clear_progress(ProgressKind::Move);
+            self.clear_progress(ProgressKind::Index);
             self.headers.clear();
             self.search_results = None;
             self.search_origins.clear();
@@ -1729,6 +1826,105 @@ impl EsMailApp {
         self.next_req_id
     }
 
+    /// Show `kind` as the operation the status bar is reporting, replacing
+    /// whatever was there before (one slot at a time -- see [`ProgressView`]).
+    fn set_progress(&mut self, kind: ProgressKind, progress: Progress) {
+        self.progress = Some(ProgressView { kind, progress });
+    }
+
+    /// Clear the status bar, but only if it is still showing `kind`: a
+    /// terminal event for an operation another one already replaced must not
+    /// blank the newer operation's indicator.
+    fn clear_progress(&mut self, kind: ProgressKind) {
+        if self.progress.as_ref().is_some_and(|view| view.kind == kind) {
+            self.progress = None;
+        }
+    }
+
+    /// Whether a bulk action is already running, in which case starting a
+    /// second one is disabled rather than shown concurrently (issue #79).
+    /// Covers both a flag/move loop tracked here and an indexing run reported
+    /// by the IMAP actor.
+    fn bulk_action_in_flight(&self) -> bool {
+        self.bulk_action.is_some()
+            || self.progress.as_ref().is_some_and(|view| view.kind.is_bulk())
+    }
+
+    /// Start the status bar counting a bulk action's `targets`, and remember
+    /// them so [`Self::advance_bulk_action`] knows when it is done.
+    fn begin_bulk_action(&mut self, kind: ProgressKind, targets: &[u32]) {
+        let total = targets.len() as u32;
+        // A single-message action is one round trip and needs no progress UI
+        // (issue #79); only an aggregate loop over a selection does.
+        if total < 2 {
+            return;
+        }
+        self.bulk_action = Some(BulkAction { kind, total, pending: targets.iter().copied().collect() });
+        self.set_progress(kind, Progress::Counted { current: 0, total });
+    }
+
+    /// Tick a bulk action's progress for one message. A reply for a `uid` this
+    /// action did not target (e.g. B8's delayed mark-as-read firing while a
+    /// bulk flag change is running) is ignored.
+    fn advance_bulk_action(&mut self, kind: ProgressKind, uid: u32) {
+        let Some(action) = self.bulk_action.as_mut() else { return };
+        if action.kind != kind || !action.pending.remove(&uid) {
+            return;
+        }
+        let done = action.total - action.pending.len() as u32;
+        let total = action.total;
+        let finished = action.pending.is_empty();
+        if finished {
+            self.bulk_action = None;
+            self.clear_progress(kind);
+        } else {
+            self.set_progress(kind, Progress::Counted { current: done, total });
+        }
+    }
+
+    /// Record a send as started and show "Sending…" until every send in
+    /// flight has come back.
+    fn mark_send_started(&mut self, id: ComposeId) {
+        self.sends_in_flight.insert(id);
+        self.set_progress(ProgressKind::Send, Progress::Indeterminate);
+    }
+
+    /// Record a send as finished; the indicator only clears once no send is
+    /// still outstanding.
+    fn mark_send_finished(&mut self, id: ComposeId) {
+        self.sends_in_flight.remove(&id);
+        if self.sends_in_flight.is_empty() {
+            self.clear_progress(ProgressKind::Send);
+        }
+    }
+
+    /// Drain finished background attachment writes. Failures are surfaced as
+    /// a banner (a user-initiated save/open that silently does nothing is the
+    /// worst kind of failure) as well as logged.
+    fn handle_attachment_io(&mut self) {
+        while let Ok(event) = self.attachment_io_rx.try_recv() {
+            match event {
+                AttachmentIoEvent::Saved { path, error } => {
+                    self.clear_progress(ProgressKind::Attachment);
+                    match error {
+                        None => self.status = format!("Saved attachment to {}", path.display()),
+                        Some(error) => {
+                            log::warn!("could not save attachment to {}: {error}", path.display());
+                            self.push_banner(format!("Could not save attachment: {error}"));
+                        }
+                    }
+                }
+                AttachmentIoEvent::Opened { filename, error } => {
+                    self.clear_progress(ProgressKind::Attachment);
+                    if let Some(error) = error {
+                        log::warn!("could not open attachment {filename}: {error}");
+                        self.push_banner(format!("Could not open attachment: {error}"));
+                    }
+                }
+            }
+        }
+    }
+
     /// Send `FetchHeaders`, recording its request id as the only one whose
     /// reply `handle_imap_events` will still accept.
     fn fetch_headers(&mut self, mailbox: String, page: u32) {
@@ -1744,6 +1940,25 @@ impl EsMailApp {
         self.send_imap(ImapCommand::FetchBody { mailbox, uid, req_id });
     }
 
+    /// Save-as, via a native picker pre-filled with the attachment's name.
+    /// The picker is a native modal and stays on this thread; the write goes
+    /// to a background thread so a large attachment can't stall a frame
+    /// (issue #79). Does nothing if the dialog is cancelled.
+    fn save_attachment(&mut self, filename: String, data: Vec<u8>, ctx: &egui::Context) {
+        let Some(path) = rfd::FileDialog::new().set_file_name(&filename).save_file() else {
+            return;
+        };
+        self.set_progress(ProgressKind::Attachment, Progress::Indeterminate);
+        spawn_attachment_write(self.attachment_io_tx.clone(), AttachmentWrite::Save { path, data }, ctx.clone());
+    }
+
+    /// Open-with: write the attachment to a temp file and hand that to the
+    /// OS's default handler, both on a background thread (issue #79).
+    fn open_attachment(&mut self, filename: String, data: Vec<u8>, ctx: &egui::Context) {
+        self.set_progress(ProgressKind::Attachment, Progress::Indeterminate);
+        spawn_attachment_write(self.attachment_io_tx.clone(), AttachmentWrite::Open { filename, data }, ctx.clone());
+    }
+
     /// Save the open message's raw RFC822 source as an `.eml` file, chosen
     /// through a native save dialog. The fetch and the write happen on the
     /// IMAP body worker (`ImapCommand::ExportMessage`), not here. Does
@@ -1757,6 +1972,7 @@ impl EsMailApp {
             return;
         };
         self.status = format!("Exporting message to {}...", path.display());
+        self.set_progress(ProgressKind::Export, Progress::Indeterminate);
         self.send_imap(ImapCommand::ExportMessage {
             mailbox: self.selected_mailbox.clone(),
             uid: header.uid,
@@ -1831,10 +2047,17 @@ impl EsMailApp {
         }
     }
 
-    /// Send `StoreFlags` for every target in [`Self::action_targets`].
+    /// Send `StoreFlags` for every target in [`Self::action_targets`],
+    /// reporting `done/total` in the status bar as each reply arrives. A
+    /// no-op while another bulk action is already running (issue #79).
     fn store_flags_on_selection(&mut self, add: Vec<String>, remove: Vec<String>) {
+        if self.bulk_action_in_flight() {
+            return;
+        }
+        let targets = self.action_targets();
         let mailbox = self.selected_mailbox.clone();
-        for uid in self.action_targets() {
+        self.begin_bulk_action(ProgressKind::Flags, &targets);
+        for uid in targets {
             let req_id = self.next_req_id();
             self.send_imap(ImapCommand::StoreFlags {
                 mailbox: mailbox.clone(),
@@ -1929,8 +2152,13 @@ impl EsMailApp {
     /// silently flip messages the user never intended to touch whenever a
     /// multi-selection has mixed flag states.
     fn toggle_star_on_selection(&mut self) {
+        if self.bulk_action_in_flight() {
+            return;
+        }
+        let targets = self.action_targets();
         let mailbox = self.selected_mailbox.clone();
-        for uid in self.action_targets() {
+        self.begin_bulk_action(ProgressKind::Flags, &targets);
+        for uid in targets {
             let req_id = self.next_req_id();
             let (add, remove) = if self.is_flagged_uid(uid) {
                 (vec![], vec![imap::FLAG_FLAGGED.to_string()])
@@ -1948,10 +2176,16 @@ impl EsMailApp {
     }
 
     /// Send `MoveMessage` (Archive/Delete-to-Trash) for every target in
-    /// [`Self::action_targets`].
+    /// [`Self::action_targets`], reporting `done/total` in the status bar as
+    /// each reply arrives. A no-op while another bulk action is running.
     fn move_selection(&mut self, dest: &str) {
+        if self.bulk_action_in_flight() {
+            return;
+        }
+        let targets = self.action_targets();
         let mailbox = self.selected_mailbox.clone();
-        for uid in self.action_targets() {
+        self.begin_bulk_action(ProgressKind::Move, &targets);
+        for uid in targets {
             let req_id = self.next_req_id();
             self.send_imap(ImapCommand::MoveMessage {
                 mailbox: mailbox.clone(),
@@ -2345,6 +2579,9 @@ impl eframe::App for EsMailApp {
         // already-drained channel is just a no-op), so running it again in
         // `ui()` on a visible frame costs nothing.
         self.handle_db_events();
+        // Same idempotent drain so a finished attachment write is acted on
+        // even if it lands while the main window is hidden.
+        self.handle_attachment_io();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2397,6 +2634,7 @@ impl eframe::App for EsMailApp {
         self.handle_oauth_events();
         self.handle_imap_events();
         self.handle_db_events();
+        self.handle_attachment_io();
 
         // The main (folder pane + message list) view is shown as soon as
         // there is any account at all -- the login form is no longer a gate
@@ -2889,24 +3127,26 @@ impl eframe::App for EsMailApp {
                 // shown (rather than only once something's selected) so
                 // their availability doesn't jump around as selection
                 // changes -- each is simply a no-op send if there's nothing
-                // to act on.
+                // to act on. Disabled while one is already running, so a
+                // second can't be started on top of it (issue #79).
+                let bulk_busy = self.bulk_action_in_flight();
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("Mark read").clicked() {
+                    if ui.add_enabled(!bulk_busy, egui::Button::new("Mark read")).clicked() {
                         self.store_flags_on_selection(vec![imap::FLAG_SEEN.to_string()], vec![]);
                     }
-                    if ui.button("Mark unread").clicked() {
+                    if ui.add_enabled(!bulk_busy, egui::Button::new("Mark unread")).clicked() {
                         self.store_flags_on_selection(vec![], vec![imap::FLAG_SEEN.to_string()]);
                     }
-                    if ui.button("★ Star").clicked() {
+                    if ui.add_enabled(!bulk_busy, egui::Button::new("★ Star")).clicked() {
                         self.store_flags_on_selection(vec![imap::FLAG_FLAGGED.to_string()], vec![]);
                     }
-                    if ui.button("☆ Unstar").clicked() {
+                    if ui.add_enabled(!bulk_busy, egui::Button::new("☆ Unstar")).clicked() {
                         self.store_flags_on_selection(vec![], vec![imap::FLAG_FLAGGED.to_string()]);
                     }
-                    if ui.button("Archive").clicked() {
+                    if ui.add_enabled(!bulk_busy, egui::Button::new("Archive")).clicked() {
                         self.archive_selection();
                     }
-                    if ui.button("Delete").clicked() {
+                    if ui.add_enabled(!bulk_busy, egui::Button::new("Delete")).clicked() {
                         self.delete_selection();
                     }
                 });
@@ -2997,12 +3237,19 @@ impl eframe::App for EsMailApp {
                 });
             });
 
-            if let Some((current, total)) = self.download_progress {
+            if let Some(view) = &self.progress {
                 egui::Panel::bottom("progress_status").show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(format!("Indexing {}... ", self.selected_mailbox));
-                        ui.add(egui::ProgressBar::new(current as f32 / total as f32)
-                            .text(format!("{}/{}", current, total)));
+                        ui.label(progress_label(view.kind, &self.selected_mailbox));
+                        match view.progress {
+                            Progress::Counted { current, total } => {
+                                let fraction = if total == 0 { 0.0 } else { current as f32 / total as f32 };
+                                ui.add(egui::ProgressBar::new(fraction).text(format!("{current}/{total}")));
+                            }
+                            Progress::Indeterminate => {
+                                ui.spinner();
+                            }
+                        }
                     });
                 });
             }
@@ -3065,16 +3312,17 @@ impl eframe::App for EsMailApp {
                                 // common "just this one" case without first
                                 // needing to select it in the list.
                                 let star_label = if header.is_flagged() { "☆ Unstar" } else { "★ Star" };
-                                if ui.button(star_label).clicked() {
+                                let bulk_busy = self.bulk_action_in_flight();
+                                if ui.add_enabled(!bulk_busy, egui::Button::new(star_label)).clicked() {
                                     self.toggle_star_on_selection();
                                 }
-                                if ui.button("Mark unread").clicked() {
+                                if ui.add_enabled(!bulk_busy, egui::Button::new("Mark unread")).clicked() {
                                     self.store_flags_on_selection(vec![], vec![imap::FLAG_SEEN.to_string()]);
                                 }
-                                if ui.button("Archive").clicked() {
+                                if ui.add_enabled(!bulk_busy, egui::Button::new("Archive")).clicked() {
                                     self.archive_selection();
                                 }
-                                if ui.button("Delete").clicked() {
+                                if ui.add_enabled(!bulk_busy, egui::Button::new("Delete")).clicked() {
                                     self.delete_selection();
                                 }
                                 if ui
@@ -3140,9 +3388,15 @@ impl eframe::App for EsMailApp {
                     }
 
                     if !self.current_attachments.is_empty() {
+                        // The clicks are collected first and acted on after the
+                        // loop: `save_attachment`/`open_attachment` take
+                        // `&mut self`, which can't coexist with the borrow of
+                        // `self.current_attachments` the loop holds.
+                        let ctx = ui.ctx().clone();
+                        let (mut save, mut open) = (None, None);
                         egui::Panel::top("attachments_bar").show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
-                                for attachment in &self.current_attachments {
+                                for (i, attachment) in self.current_attachments.iter().enumerate() {
                                     ui.group(|ui| {
                                         ui.label(format!(
                                             "{} — {}, {}",
@@ -3151,17 +3405,29 @@ impl eframe::App for EsMailApp {
                                             format_size(attachment.data.len())
                                         ));
                                         if ui.button("Save…").clicked() {
-                                            save_attachment(attachment);
+                                            save = Some(i);
                                         }
                                         if ui.button("Open").clicked() {
-                                            if let Err(e) = open_attachment(attachment) {
-                                                log::warn!("could not open attachment {}: {e}", attachment.filename);
-                                            }
+                                            open = Some(i);
                                         }
                                     });
                                 }
                             });
                         });
+                        if let Some(i) = save {
+                            let (filename, data) = {
+                                let attachment = &self.current_attachments[i];
+                                (attachment.filename.clone(), attachment.data.clone())
+                            };
+                            self.save_attachment(filename, data, &ctx);
+                        }
+                        if let Some(i) = open {
+                            let (filename, data) = {
+                                let attachment = &self.current_attachments[i];
+                                (attachment.filename.clone(), attachment.data.clone())
+                            };
+                            self.open_attachment(filename, data, &ctx);
+                        }
                     }
                 }
 
@@ -3255,30 +3521,61 @@ fn spawn_account_view(
 }
 
 
-/// Save-as, via a native file picker pre-filled with the attachment's own
-/// name. Does nothing if the user cancels the dialog; a write failure is
-/// logged rather than surfaced (mirroring the "log, don't crash the UI over
-/// it" treatment other best-effort I/O gets in this file).
-fn save_attachment(attachment: &render::Attachment) {
-    let Some(path) = rfd::FileDialog::new().set_file_name(&attachment.filename).save_file() else {
-        return;
-    };
-    if let Err(e) = std::fs::write(&path, &attachment.data) {
-        log::warn!("could not save attachment to {}: {e}", path.display());
+impl AttachmentWrite {
+    /// Runs the disk half of the operation. Called on the background thread.
+    fn run(self) -> AttachmentIoEvent {
+        match self {
+            AttachmentWrite::Save { path, data } => {
+                let error = std::fs::write(&path, &data).err().map(|e| e.to_string());
+                AttachmentIoEvent::Saved { path, error }
+            }
+            AttachmentWrite::Open { filename, data } => {
+                let error = Self::open(&filename, &data).err().map(|e| e.to_string());
+                AttachmentIoEvent::Opened { filename, error }
+            }
+        }
+    }
+
+    /// Write `data` to a temp file and hand it to the OS's default handler.
+    /// The temp file is left behind rather than cleaned up immediately, since
+    /// the opened application may still be reading it after this returns.
+    fn open(filename: &str, data: &[u8]) -> std::io::Result<()> {
+        let dir = paths::attachments_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(safe_attachment_filename(filename));
+        std::fs::write(&path, data)?;
+        opener::open(&path).map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
 
-/// Open-with: write the attachment to a temp file (there is no path for it
-/// yet — it only exists as bytes in memory) and hand that to the OS's
-/// default handler for its type. The temp file is left behind rather than
-/// cleaned up immediately, since the opened application may still be reading
-/// it after this call returns.
-fn open_attachment(attachment: &render::Attachment) -> std::io::Result<()> {
-    let dir = paths::attachments_dir();
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(safe_attachment_filename(&attachment.filename));
-    std::fs::write(&path, &attachment.data)?;
-    opener::open(&path).map_err(|e| std::io::Error::other(e.to_string()))
+/// Run an attachment disk write on a background thread and wake `ctx` when it
+/// is done, so a large file never stalls a frame (issue #79). A failure is
+/// not silent -- [`EsMailApp::handle_attachment_io`] turns it into a banner.
+fn spawn_attachment_write(tx: std::sync::mpsc::Sender<AttachmentIoEvent>, task: AttachmentWrite, ctx: egui::Context) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("esmail-attachment-io".to_string())
+        .spawn(move || {
+            let event = task.run();
+            let _ = tx.send(event);
+            ctx.request_repaint();
+        })
+    {
+        log::warn!("could not spawn attachment I/O thread: {e}");
+    }
+}
+
+/// The user-facing label for a progress report. Kept here rather than in the
+/// protocol modules so all UI copy stays in one place (see [`ProgressKind`]).
+fn progress_label(kind: ProgressKind, mailbox: &str) -> String {
+    match kind {
+        ProgressKind::Index => format!("Indexing {mailbox}..."),
+        ProgressKind::Flags => "Updating flags...".to_string(),
+        ProgressKind::Move => "Moving messages...".to_string(),
+        ProgressKind::Append => "Saving to Sent...".to_string(),
+        ProgressKind::Export => "Exporting message...".to_string(),
+        ProgressKind::Attachment => "Saving attachment...".to_string(),
+        ProgressKind::Send => "Sending message...".to_string(),
+    }
 }
 
 /// `filename` comes straight from the message's own
