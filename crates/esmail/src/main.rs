@@ -3,6 +3,7 @@
 // builds keep the console so `cargo run` shows the log.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+use esmail::ipc::message::ToGui;
 use esmail::{auth, compose, config, contacts, db, emoji, icons, imap, oauth, paths, progress, render, screenshot, search_query, secrets, session, shell, smtp, uninstall};
 use progress::{Progress, ProgressKind};
 mod accounts;
@@ -10,9 +11,11 @@ mod compose_ui;
 mod compose_window;
 mod config_saver;
 mod listener;
+mod listener_client;
 mod settings;
 mod window_fit;
 use config_saver::ConfigSaver;
+use listener_client::ListenerClient;
 /// Tray icon + new-mail toasts (B10): the OS-specific side lives behind
 /// `platform`, so nothing below names a platform.
 use esmail::platform;
@@ -474,10 +477,24 @@ struct EsMailApp {
     /// allowed to actually close the app instead of being redirected to
     /// "hide to tray". See `EsMailApp::logic`.
     exit_requested: bool,
+    /// The link to the background listener, if one is running. See
+    /// `listener_client`: while it is connected the listener owns the tray and
+    /// the toasts, so the GUI drops its own tray and closing the window exits
+    /// the process.
+    listener: ListenerClient,
+    /// Mutes this process's own new-mail toasts while the listener (which
+    /// toasts the same mail) is connected, so the user sees one, not two.
+    /// Shared with the session hook set in `new`.
+    toast_enabled: Arc<AtomicBool>,
+    /// An account a toast click or `--open-account` asked for, waiting for its
+    /// session to come up. See [`Self::open_pending_account`].
+    pending_open_account: Option<String>,
 }
 
 impl EsMailApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// `open_account` is the `--open-account <id>` argument, if any: the
+    /// account to select once its session comes up.
+    fn new(cc: &eframe::CreationContext<'_>, open_account: Option<String>) -> Self {
         init_logging();
         
         // Every account's events arrive here, tagged with the account id by
@@ -530,8 +547,18 @@ impl EsMailApp {
                 ctx.request_repaint_of(egui::ViewportId::ROOT);
             }
         });
+        // The listener toasts the same mail; while it is connected this
+        // process's own hook is muted so the user sees one toast, not two.
+        let toast_enabled = Arc::new(AtomicBool::new(true));
         let session_hooks = Hooks {
-            notify: Arc::new(platform::show_new_mail_toast),
+            notify: {
+                let enabled = Arc::clone(&toast_enabled);
+                Arc::new(move |account: &str, title: &str, body: &str| {
+                    if enabled.load(Ordering::Relaxed) {
+                        platform::show_new_mail_toast(account, title, body);
+                    }
+                })
+            },
             repaint: {
                 let ctx = egui_ctx.clone();
                 // `request_repaint_of(ROOT)`: the events this wakes
@@ -722,6 +749,10 @@ impl EsMailApp {
             None
         };
 
+        // Start the resident listener if none is running, and hold a link to
+        // it. Preview/screenshot runs stay single-process.
+        let listener = if preview.is_none() { ListenerClient::start() } else { ListenerClient::disabled() };
+
         let initial_theme = config.theme;
 
         // Connect every saved account whose credential the keyring still has
@@ -828,6 +859,9 @@ impl EsMailApp {
             tray,
             toast_click_rx,
             exit_requested: false,
+            listener,
+            toast_enabled,
+            pending_open_account: open_account,
             use_oauth,
             oauth_tx,
             oauth_rx,
@@ -860,6 +894,11 @@ impl EsMailApp {
                         view.state = ConnState::Connected;
                     }
                     self.persist_pending(&account);
+                    // A newly added account (not a reconnect) is a change to
+                    // the saved list the listener should pick up.
+                    if from_form {
+                        self.listener.notify_config_changed();
+                    }
                     // An account connecting in the background (a saved one
                     // at startup, or a reconnect) must not dismiss the Add
                     // account form someone is typing into; only the account
@@ -1736,6 +1775,7 @@ impl EsMailApp {
             config::ThemeMode::System => egui::ThemePreference::System,
         });
         self.config_saver.save(&self.config);
+        self.listener.notify_config_changed();
     }
 
     /// Persist `self.config` after a small preference change (image trust,
@@ -2477,32 +2517,52 @@ fn bring_window_to_front(ctx: &egui::Context) {
 impl EsMailApp {
     fn handle_tray(&mut self, ctx: &egui::Context) {
         // A later launch of esMail left a request for this one: come forward
-        // (an ordinary second launch) or exit (`esmail --quit`, used by the
-        // installer). Polled, since nothing wakes a hidden window for it.
+        // (an ordinary second launch), come forward and select an account
+        // (`--open-account`, and the listener's tray), or exit (`esmail
+        // --quit`, used by the installer). Polled, since nothing wakes a
+        // hidden window for it.
         match shell::take_request() {
             Some(shell::Request::Show) => bring_window_to_front(ctx),
+            Some(shell::Request::OpenAccount(account)) => {
+                self.pending_open_account = Some(account);
+                bring_window_to_front(ctx);
+            }
             Some(shell::Request::Quit) => {
                 self.exit_requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             None => {}
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(250));
-        // A clicked toast: open the account the mail arrived in, at the mailbox
-        // being watched, so the new message is right there.
-        while let Ok(account) = self.toast_click_rx.try_recv() {
-            if self.view(&account).is_some() {
-                let mailbox = self
-                    .config
-                    .accounts
-                    .iter()
-                    .find(|a| a.id == account)
-                    .and_then(|a| a.watch_mailbox.clone())
-                    .unwrap_or_else(|| session::DEFAULT_WATCH_MAILBOX.to_string());
-                self.adding_account = false;
-                self.activate(&account, mailbox);
+        // What a connected listener asks of this GUI. Nothing sends these yet
+        // (the listener raises the window through `show.request`), but the
+        // protocol defines them for its tray and a future toast click-through.
+        while let Some(message) = self.listener.try_recv() {
+            match message {
+                ToGui::Show => bring_window_to_front(ctx),
+                ToGui::OpenAccount { account } => {
+                    self.pending_open_account = Some(account);
+                    bring_window_to_front(ctx);
+                }
+                ToGui::Quit => self.request_quit(ctx),
+                ToGui::Welcome { .. } => {}
             }
         }
+        // Once the listener is connected it owns the tray and the toasts: drop
+        // the GUI's own tray (there is one icon, in the listener) and mute the
+        // in-process toast hook. Closing the window then exits (see `ui`).
+        let listener_connected = self.listener.is_connected();
+        if listener_connected && self.tray.is_some() {
+            self.tray = None;
+        }
+        self.toast_enabled.store(!listener_connected, Ordering::Relaxed);
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        // A clicked toast, or `--open-account`, asks for an account; select it
+        // once its session has a view.
+        while let Ok(account) = self.toast_click_rx.try_recv() {
+            self.pending_open_account = Some(account);
+        }
+        self.open_pending_account();
         // The tooltip carries the unread total over all accounts.
         let unread: u32 = self.accounts.iter().map(AccountView::total_unread).sum();
         // Without a tray a close request really closes -- unless a compose
@@ -2551,6 +2611,28 @@ impl EsMailApp {
         // does that for us just because a tray click landed in `tray-icon`'s
         // own event channel, so ask again here to keep polling it promptly.
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+
+    /// Select the account a toast click or `--open-account` asked for, once its
+    /// session has a view. Kept pending while it is saved but not connected (a
+    /// Google account whose sign-in has not happened yet); dropped when no
+    /// saved account has that id.
+    fn open_pending_account(&mut self) {
+        let Some(account) = self.pending_open_account.clone() else { return };
+        if self.view(&account).is_some() {
+            let mailbox = self
+                .config
+                .accounts
+                .iter()
+                .find(|a| a.id == account)
+                .and_then(|a| a.watch_mailbox.clone())
+                .unwrap_or_else(|| session::DEFAULT_WATCH_MAILBOX.to_string());
+            self.adding_account = false;
+            self.activate(&account, mailbox);
+            self.pending_open_account = None;
+        } else if !self.config.accounts.iter().any(|a| a.id == account) {
+            self.pending_open_account = None;
+        }
     }
 }
 
@@ -2798,6 +2880,7 @@ impl eframe::App for EsMailApp {
                             }
                             if let Some(id) = to_remove {
                                 self.remove_account(&id);
+                                self.listener.notify_config_changed();
                             }
                             ui.separator();
                         }
@@ -3802,6 +3885,18 @@ fn is_dev_run() -> bool {
     std::env::var_os("ESMAIL_PREVIEW").is_some() || std::env::var_os("ESMAIL_SCREENSHOT").is_some()
 }
 
+/// The account id in `esmail --open-account <id>`, if the flag is present with
+/// a value.
+fn open_account_arg() -> Option<String> {
+    parse_open_account(std::env::args())
+}
+
+fn parse_open_account(args: impl Iterator<Item = String>) -> Option<String> {
+    let mut args = args.skip_while(|arg| arg != "--open-account");
+    args.next()?;
+    args.next().filter(|id| !id.is_empty())
+}
+
 fn main() -> eframe::Result {
     init_logging();
     // See `platform::disable_background_throttling`'s doc: without this,
@@ -3816,7 +3911,7 @@ fn main() -> eframe::Result {
     // before replacing or removing the program files) and return.
     if std::env::args().any(|arg| arg == "--quit") {
         if shell::acquire_single_instance() == shell::Instance::AlreadyRunning {
-            let _ = shell::send_request(shell::Request::Quit);
+            let _ = shell::send_request(&shell::Request::Quit);
         }
         return Ok(());
     }
@@ -3850,11 +3945,18 @@ fn main() -> eframe::Result {
 }
 
 async fn run_gui() -> eframe::Result {
+    // `esmail --open-account <id>`: select that account, either in the running
+    // instance (through the request file) or once this new one has loaded it.
+    let open_account = open_account_arg();
     if !is_dev_run() {
         // esMail lives in the tray: a second launch should raise the window
         // that is already there, not start a competing process.
         if shell::acquire_single_instance() == shell::Instance::AlreadyRunning {
-            let _ = shell::send_request(shell::Request::Show);
+            let request = match &open_account {
+                Some(id) => shell::Request::OpenAccount(id.clone()),
+                None => shell::Request::Show,
+            };
+            let _ = shell::send_request(&request);
             return Ok(());
         }
 
@@ -3875,8 +3977,7 @@ async fn run_gui() -> eframe::Result {
     // a second time here (`EsMailApp::new` also loads it, for the account
     // list and theme) rather than threading a pre-loaded `Config` through
     // `run_native`'s `Box<dyn FnOnce>` closure -- a second cheap file read on
-    // startup is a small price for keeping `EsMailApp::new`'s signature
-    // (`&eframe::CreationContext`, same as every other eframe app) untouched.
+    // startup is a small price for not widening `EsMailApp::new` any further.
     let mut viewport = egui::ViewportBuilder::default().with_inner_size([1280.0, 720.0]);
     if let Some(icon) = icons::window_icon() {
         viewport = viewport.with_icon(egui::IconData::from(icon));
@@ -3894,7 +3995,7 @@ async fn run_gui() -> eframe::Result {
     eframe::run_native(
         "esMail",
         native_options,
-        Box::new(|cc| Ok(Box::new(EsMailApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(EsMailApp::new(cc, open_account)))),
     )
 }
 
@@ -3985,6 +4086,15 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_open_account_takes_the_id_after_the_flag() {
+        let args = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter();
+        assert_eq!(parse_open_account(args(&["esmail", "--open-account", "a@b"])), Some("a@b".to_string()));
+        assert_eq!(parse_open_account(args(&["esmail", "--open-account"])), None);
+        assert_eq!(parse_open_account(args(&["esmail", "--open-account", ""])), None);
+        assert_eq!(parse_open_account(args(&["esmail"])), None);
+    }
 
     #[test]
     fn format_size_uses_bytes_below_one_kb() {
