@@ -1269,82 +1269,101 @@ fn spawn_body_worker(
         let mut session: Option<async_imap::Session<TlsStream<TcpStream>>> = None;
 
         while let Some(cmd) = cmd_rx.recv().await {
-            if session.is_none() {
-                match ensure_worker_connected(&credentials).await {
-                    Ok(s) => session = Some(s),
-                    Err(e) => {
-                        // Report against the specific request that hit this,
-                        // not a generic `Error`, so a `FetchBody` whose
-                        // connection attempt failed still gets a reply
-                        // `main.rs` can match against `current_body_req` and
-                        // use to clear "Loading message..." -- see
-                        // `ImapEvent::BodyFailed`'s doc. `BulkDownload` has
-                        // no single uid/req_id to attribute to, so it keeps
-                        // the generic `Error`.
-                        match cmd {
-                            WorkerCommand::FetchBody { uid, req_id, .. } => {
-                                let _ = event_tx.send(ImapEvent::BodyFailed {
-                                    uid,
-                                    req_id,
-                                    error: format!("could not open a connection for this request: {e}"),
-                                }).await;
-                            }
-                            WorkerCommand::BulkDownload { .. } => {
-                                let _ = event_tx.send(ImapEvent::Error(format!("could not open a connection for this request: {e}"))).await;
-                            }
-                            WorkerCommand::ExportMessage { .. } => {
-                                let _ = event_tx.send(ImapEvent::ExportFailed {
-                                    error: format!("could not open a connection for this request: {e}"),
-                                }).await;
-                            }
+            // A command that fails against an existing session is retried
+            // once on a fresh connection before the failure is surfaced
+            // (issue #80): both a transient empty fetch and a dead/aborted
+            // socket are things a manual retry already resolves today, so
+            // automating that here avoids an error banner for a failure the
+            // very next attempt would silently clear. One retry, not a
+            // backoff loop -- `ensure_worker_connected` already contributes
+            // the bounded backoff for the reconnect itself.
+            let mut retried = false;
+            loop {
+                if session.is_none() {
+                    match ensure_worker_connected(&credentials).await {
+                        Ok(s) => session = Some(s),
+                        Err(e) => {
+                            let err = anyhow!("could not open a connection for this request: {e}");
+                            report_worker_failure(&cmd, &event_tx, &err).await;
+                            break;
                         }
-                        continue;
                     }
                 }
-            }
-            let sess = session.as_mut().expect("just verified Some above");
+                let sess = session.as_mut().expect("just verified Some above");
 
-            match cmd {
-                WorkerCommand::FetchBody { mailbox, uid, req_id } => {
-                    match ImapActor::fetch_body(sess, &mailbox, uid).await {
-                        Ok((html, attachments)) => {
-                            let _ = event_tx.send(ImapEvent::Body { uid, html, attachments, req_id }).await;
-                        }
-                        Err(e) => {
-                            session = None; // let the next command's ensure_worker_connected retry
-                            let _ = event_tx.send(ImapEvent::BodyFailed { uid, req_id, error: e.to_string() }).await;
-                        }
-                    }
-                }
-                WorkerCommand::ExportMessage { mailbox, uid, path } => {
-                    match ImapActor::fetch_raw(sess, &mailbox, uid).await {
-                        Ok(raw) => match tokio::fs::write(&path, raw).await {
-                            Ok(()) => {
-                                let _ = event_tx.send(ImapEvent::Exported { path }).await;
-                            }
-                            // A local file error says nothing about the
-                            // IMAP session, so keep it.
-                            Err(e) => {
-                                let _ = event_tx.send(ImapEvent::ExportFailed {
-                                    error: format!("could not write {}: {e}", path.display()),
-                                }).await;
-                            }
-                        },
-                        Err(e) => {
-                            session = None;
-                            let _ = event_tx.send(ImapEvent::ExportFailed { error: format!("{e:#}") }).await;
-                        }
-                    }
-                }
-                WorkerCommand::BulkDownload { mailbox } => {
-                    if let Err(e) = ImapActor::bulk_download(sess, &mailbox, &event_tx).await {
+                match run_worker_command(&cmd, sess, &event_tx).await {
+                    Ok(()) => break,
+                    Err(e) => {
+                        // Drop the session so the retry -- or, once this
+                        // command has already used its one retry, the next
+                        // command -- connects fresh.
                         session = None;
-                        let _ = event_tx.send(ImapEvent::Error(e.to_string())).await;
+                        if retried {
+                            report_worker_failure(&cmd, &event_tx, &e).await;
+                            break;
+                        }
+                        retried = true;
                     }
                 }
             }
         }
     });
+}
+
+/// Runs one [`WorkerCommand`] against `session`, emitting its success event
+/// (or, for a failure that says nothing about the session, its own failure
+/// event). Returns `Err` only for a failure that implicates the session and
+/// has *not* been reported yet, so `spawn_body_worker` can reconnect and
+/// retry it once before surfacing it -- see the retry loop there.
+async fn run_worker_command(
+    cmd: &WorkerCommand,
+    session: &mut async_imap::Session<TlsStream<TcpStream>>,
+    event_tx: &mpsc::Sender<ImapEvent>,
+) -> anyhow::Result<()> {
+    match cmd {
+        WorkerCommand::FetchBody { mailbox, uid, req_id } => {
+            let (html, attachments) = ImapActor::fetch_body(session, mailbox, *uid).await?;
+            let _ = event_tx.send(ImapEvent::Body { uid: *uid, html, attachments, req_id: *req_id }).await;
+            Ok(())
+        }
+        WorkerCommand::ExportMessage { mailbox, uid, path } => {
+            let raw = ImapActor::fetch_raw(session, mailbox, *uid).await?;
+            match tokio::fs::write(path, raw).await {
+                Ok(()) => {
+                    let _ = event_tx.send(ImapEvent::Exported { path: path.clone() }).await;
+                    Ok(())
+                }
+                // A local file error says nothing about the IMAP session, so
+                // report it here and don't ask the caller to reconnect.
+                Err(e) => {
+                    let _ = event_tx.send(ImapEvent::ExportFailed { error: format!("could not write {}: {e}", path.display()) }).await;
+                    Ok(())
+                }
+            }
+        }
+        WorkerCommand::BulkDownload { mailbox } => ImapActor::bulk_download(session, mailbox, event_tx).await,
+    }
+}
+
+/// Surfaces a [`WorkerCommand`] failure that survived its retry (or whose
+/// reconnect failed), attributed to the request that hit it so `main.rs` can
+/// resolve the matching placeholder -- see `ImapEvent::BodyFailed`'s and
+/// `ExportFailed`'s docs. `BulkDownload` has no single uid/req_id to
+/// attribute to, so it keeps the generic `Error`.
+async fn report_worker_failure(cmd: &WorkerCommand, event_tx: &mpsc::Sender<ImapEvent>, error: &anyhow::Error) {
+    match cmd {
+        WorkerCommand::FetchBody { uid, req_id, .. } => {
+            let _ = event_tx
+                .send(ImapEvent::BodyFailed { uid: *uid, req_id: *req_id, error: error.to_string() })
+                .await;
+        }
+        WorkerCommand::BulkDownload { .. } => {
+            let _ = event_tx.send(ImapEvent::Error(error.to_string())).await;
+        }
+        WorkerCommand::ExportMessage { .. } => {
+            let _ = event_tx.send(ImapEvent::ExportFailed { error: format!("{error:#}") }).await;
+        }
+    }
 }
 
 /// Connect-with-backoff for [`spawn_body_worker`], mirroring

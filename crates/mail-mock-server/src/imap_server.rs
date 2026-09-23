@@ -333,6 +333,18 @@ where
                 let wants_envelope = items.contains("ENVELOPE");
                 let wants_rfc822 = items.contains("RFC822");
 
+                if wants_rfc822 {
+                    let mut guard = store.lock().unwrap();
+                    if std::mem::take(&mut guard.drop_next_rfc822_fetch) {
+                        // Test-only fault injection: close the connection
+                        // without answering, so the client sees this fetch fail
+                        // on a dead/aborted socket. The flag was just cleared,
+                        // so the client's retry on a fresh connection succeeds
+                        // (issue #80).
+                        return Ok(());
+                    }
+                }
+
                 // A bare UID (`5`) is its own one-message range; `async_imap`
                 // also sends open-ended ranges (`5:*`) for "from this UID
                 // onward" fetches -- `*` here always means "the highest UID
