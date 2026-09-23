@@ -65,6 +65,13 @@ pub struct AccountConfig {
     /// settable by editing `config.toml` for now.
     #[serde(default)]
     pub watch_mailbox: Option<String>,
+    /// Unix seconds a fresh "Sign in with Google" issued this account's
+    /// refresh token, written so the app can warn before Google's Testing-mode
+    /// 7-day expiry ([`crate::oauth::refresh_token_expiring_soon`]). `None`
+    /// for a password account, or a token restored from the keyring whose
+    /// issue time predates this field.
+    #[serde(default)]
+    pub oauth_token_issued_at: Option<i64>,
 }
 
 impl AccountConfig {
@@ -86,6 +93,7 @@ impl AccountConfig {
             username,
             auth: AuthKind::Password,
             watch_mailbox: None,
+            oauth_token_issued_at: None,
         }
     }
 }
@@ -624,6 +632,7 @@ username = \"a\"
         "#;
         let parsed: Config = toml::from_str(toml).unwrap();
         assert_eq!(parsed.accounts[0].auth, AuthKind::Password);
+        assert_eq!(parsed.accounts[0].oauth_token_issued_at, None);
         assert_eq!(parsed.google_oauth, None);
     }
 
@@ -631,6 +640,7 @@ username = \"a\"
     fn oauth_account_and_client_round_trip_through_toml() {
         let mut account = AccountConfig::new("Me".into(), "imap.gmail.com".into(), 993, "me@gmail.com".into());
         account.auth = AuthKind::GoogleOAuth;
+        account.oauth_token_issued_at = Some(1_700_000_000);
         let config = Config {
             accounts: vec![account],
             google_oauth: Some(OAuthClientConfig { client_id: "id".into(), client_secret: Some("secret".into()) }),

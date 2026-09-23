@@ -253,6 +253,14 @@ impl EsMailApp {
             // IMAP and SMTP both derive their access tokens from it.
             auth::Auth::OAuth(source) => {
                 account.auth = config::AuthKind::GoogleOAuth;
+                // A fresh browser sign-in is when Google issues the refresh
+                // token and starts its Testing-mode 7-day clock; remember that
+                // so the app can warn before the lapse (see
+                // `oauth::refresh_token_expiring_soon`). Reusing a keyring
+                // token reports no new issue time and leaves the stored one.
+                if let Some(issued_at) = source.issued_at() {
+                    account.oauth_token_issued_at = Some(issued_at);
+                }
                 if let Err(e) = secrets::set_password(&account.id, "oauth", &source.refresh_token()) {
                     log::warn!("could not save the Google sign-in to the OS keyring: {e}");
                 }
@@ -265,6 +273,7 @@ impl EsMailApp {
             // `AccountConfig::username` is documented as used for both.
             auth::Auth::Password(password) => {
                 account.auth = config::AuthKind::Password;
+                account.oauth_token_issued_at = None;
                 // ...and the reverse: a live refresh token for an account
                 // that now uses a password.
                 secrets::delete_password(&account.id, "oauth");

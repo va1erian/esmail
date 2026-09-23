@@ -56,6 +56,14 @@ const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Google's access tokens last an hour; anything claiming longer than a day
 /// is clamped to a day rather than trusted.
 const MAX_TOKEN_LIFETIME_SECS: u64 = 24 * 60 * 60;
+/// Google expires a refresh token after this long while the OAuth app is
+/// still in "Testing" (unverified). Testing mode is accepted for now (issue
+/// #71); the app warns before the lapse rather than only failing on the next
+/// connect.
+pub const TESTING_MODE_REFRESH_TOKEN_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Start warning this long before that expiry: long enough to act, short
+/// enough not to nag.
+pub const REFRESH_TOKEN_WARNING_MARGIN: Duration = Duration::from_secs(2 * 24 * 60 * 60);
 
 /// The saved sign-in can no longer be used and only a fresh browser sign-in
 /// will help. Its own type so retry loops can tell it from a transient
@@ -71,6 +79,27 @@ impl std::fmt::Display for SignInExpired {
 }
 
 impl std::error::Error for SignInExpired {}
+
+/// Unix seconds right now -- the clock [`refresh_token_expiring_soon`] and
+/// `AccountConfig::oauth_token_issued_at` are expressed in.
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether a Google account whose refresh token was issued at `issued_at`
+/// (unix seconds) should be warned, at `now`, that Google's Testing-mode
+/// expiry is close. `None` -- an account saved before the issue time was
+/// recorded, or a token restored from the keyring -- is never a warning:
+/// there is nothing to base a countdown on, and the [`SignInExpired`] path
+/// still catches it on the next connect.
+pub fn refresh_token_expiring_soon(issued_at: Option<i64>, now: i64) -> bool {
+    let Some(issued_at) = issued_at else { return false };
+    now.saturating_add(REFRESH_TOKEN_WARNING_MARGIN.as_secs() as i64)
+        >= issued_at.saturating_add(TESTING_MODE_REFRESH_TOKEN_LIFETIME.as_secs() as i64)
+}
 
 /// A registered OAuth application.
 #[derive(Clone)]
@@ -408,6 +437,10 @@ pub struct TokenSource {
     /// A plain mutex, never held across an `.await`, so the UI thread can
     /// read it synchronously to save the token to the keyring.
     refresh_token: StdMutex<SecretString>,
+    /// Unix seconds a fresh sign-in issued the refresh token, for the
+    /// Testing-mode expiry warning; `None` for a token restored from the
+    /// keyring, whose issue time predates this.
+    issued_at: Option<i64>,
     /// Also serializes refreshes: the actor, the body worker and the IDLE
     /// watch can all need a token at once, and all but the first should find
     /// a fresh one waiting rather than each hitting the token endpoint.
@@ -417,7 +450,7 @@ pub struct TokenSource {
 impl TokenSource {
     /// From a refresh token saved earlier; the first use fetches an access token.
     pub fn from_refresh_token(client: OAuthClient, refresh_token: SecretString) -> Arc<Self> {
-        Arc::new(Self { client, refresh_token: StdMutex::new(refresh_token), access: tokio::sync::Mutex::new(None) })
+        Arc::new(Self { client, refresh_token: StdMutex::new(refresh_token), issued_at: None, access: tokio::sync::Mutex::new(None) })
     }
 
     /// From a fresh sign-in, reusing the access token it already returned.
@@ -431,6 +464,7 @@ impl TokenSource {
         Ok(Arc::new(Self {
             client,
             refresh_token: StdMutex::new(refresh_token),
+            issued_at: Some(now_unix()),
             access: tokio::sync::Mutex::new(Some((grant.access_token, grant.expires_at))),
         }))
     }
@@ -438,6 +472,12 @@ impl TokenSource {
     /// The current refresh token, for saving to the keyring.
     pub fn refresh_token(&self) -> SecretString {
         self.refresh_token.lock().expect("refresh token mutex is never poisoned").clone()
+    }
+
+    /// Unix seconds a fresh sign-in issued this refresh token (`from_grant`),
+    /// or `None` for one restored from the keyring.
+    pub fn issued_at(&self) -> Option<i64> {
+        self.issued_at
     }
 
     /// A valid access token, refreshing it first if needed.
@@ -543,6 +583,23 @@ mod tests {
         assert!(err.contains("redirect_uri_mismatch"), "{err}");
         let err = parse_token_response(502, "<html>Bad gateway</html>", Instant::now()).err().unwrap().to_string();
         assert!(err.contains("502"), "{err}");
+    }
+
+    #[test]
+    fn refresh_token_warning_starts_two_days_before_the_seven_day_expiry() {
+        const DAY: i64 = 24 * 60 * 60;
+        let issued = 1_700_000_000;
+        assert!(!refresh_token_expiring_soon(Some(issued), issued), "brand new");
+        assert!(!refresh_token_expiring_soon(Some(issued), issued + 5 * DAY - 1), "just outside the margin");
+        assert!(refresh_token_expiring_soon(Some(issued), issued + 5 * DAY), "enters the margin");
+        assert!(refresh_token_expiring_soon(Some(issued), issued + 7 * DAY), "at the expiry");
+        assert!(refresh_token_expiring_soon(Some(issued), issued + 30 * DAY), "long past it");
+    }
+
+    #[test]
+    fn an_unrecorded_issue_time_is_never_a_warning() {
+        assert!(!refresh_token_expiring_soon(None, 0));
+        assert!(!refresh_token_expiring_soon(None, i64::MAX));
     }
 
     fn pair(id: &str, secret: &str) -> (Option<String>, Option<String>) {
