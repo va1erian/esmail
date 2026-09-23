@@ -500,7 +500,7 @@ pub enum ImapEvent {
     Exported { path: std::path::PathBuf },
     /// `ExportMessage` failed (fetching the message or writing the file).
     ExportFailed { error: String },
-    MailData { mailbox: String, header: MailHeader, body: String },
+    MailData { mailbox: String, header: MailHeader, body: String, attachments: Vec<crate::render::Attachment> },
     /// Reply to `PollMailbox` (B10).
     MailboxPolled { mailbox: String, state: MailboxState },
     /// Reply to `FetchNewHeaders` (B10).
@@ -1038,10 +1038,12 @@ impl ImapActor {
             let body_query = format!("{}", uid);
             let mut body_fetches = session.uid_fetch(body_query, "RFC822").await?;
             let mut body = String::new();
+            let mut attachments = Vec::new();
             if let Some(body_msg) = body_fetches.next().await {
                 let body_msg = body_msg?;
                 if let Some(bytes) = body_msg.body() {
                     body = crate::render::render_message(bytes);
+                    attachments = crate::render::extract_attachments(bytes);
                 }
             }
 
@@ -1049,6 +1051,7 @@ impl ImapActor {
                 mailbox: mailbox_name.to_string(),
                 header,
                 body,
+                attachments,
             }).await;
 
             let _ = event_tx.send(ImapEvent::DownloadProgress {

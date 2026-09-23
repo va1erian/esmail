@@ -903,12 +903,13 @@ impl EsMailApp {
                         }
                     }
                 }
-                ImapEvent::MailData { mailbox, header, body } => {
+                ImapEvent::MailData { mailbox, header, body, attachments } => {
                     let _ = self.db_tx.try_send(DbCommand::IndexMail {
                         account_id: account,
                         mailbox,
                         header,
                         body,
+                        attachments,
                     });
                 }
                 ImapEvent::MailboxPolled { .. } => {
@@ -1093,10 +1094,11 @@ impl EsMailApp {
                     self.search_origins = hits.iter().map(|h| (h.account_id.clone(), h.mailbox.clone())).collect();
                     self.search_results = Some(hits.into_iter().map(|h| h.header).collect());
                 }
-                DbEvent::MailFetched { header, body } => {
+                DbEvent::MailFetched { header, body, attachments } => {
                     if self.selected_uid == Some(header.uid) {
                         self.current_message_html = body.clone();
                         self.web_view.load(WebViewSource::Html(body));
+                        self.current_attachments = attachments;
                     }
                 }
                 DbEvent::MailFetchFailed { uid, error } => {
