@@ -15,6 +15,7 @@ use rusqlite::{params, Connection};
 use tokio::sync::mpsc;
 use crate::compose::{ComposeId, ComposeState};
 use crate::imap::MailHeader;
+use crate::render::Attachment;
 
 /// Cap on rows in `bodies` across all accounts/mailboxes; the oldest
 /// (by `cached_at`) are evicted once a write pushes past it.
@@ -26,6 +27,11 @@ pub enum DbCommand {
         mailbox: String,
         header: MailHeader,
         body: String,
+        /// Attachments `imap.rs` decoded from the same raw bytes as `body`
+        /// (see `render::extract_attachments`). Cached alongside the body so a
+        /// search result opened from the cache shows the same chips a live
+        /// `FetchBody` would (issue #68).
+        attachments: Vec<Attachment>,
     },
     /// Metadata-only counterpart to `IndexMail` (B3): upserts `messages` for
     /// each header without a body to cache, since these come from
@@ -136,7 +142,7 @@ pub enum DbCommand {
 
 pub enum DbEvent {
     SearchResult { hits: Vec<SearchHit> },
-    MailFetched { header: MailHeader, body: String },
+    MailFetched { header: MailHeader, body: String, attachments: Vec<Attachment> },
     /// `FetchMail` (a cached search-result open) found no cached body --
     /// typically because `MAX_CACHED_BODIES`'s LRU cap evicted it since it
     /// was indexed, which is routine on a large mailbox. Carries `uid` (not
@@ -238,8 +244,8 @@ impl DbActor {
     fn run(&mut self) {
         while let Some(cmd) = self.cmd_rx.blocking_recv() {
             match cmd {
-                DbCommand::IndexMail { account_id, mailbox, header, body } => {
-                    if let Err(e) = index_mail(&self.conn, &account_id, &mailbox, &header, &body) {
+                DbCommand::IndexMail { account_id, mailbox, header, body, attachments } => {
+                    if let Err(e) = index_mail(&self.conn, &account_id, &mailbox, &header, &body, &attachments) {
                         let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
                     }
                 }
@@ -260,8 +266,8 @@ impl DbActor {
                 }
                 DbCommand::FetchMail { account_id, mailbox, uid } => {
                     match fetch_mail(&self.conn, &account_id, &mailbox, uid) {
-                        Ok((header, body)) => {
-                            let _ = self.event_tx.blocking_send(DbEvent::MailFetched { header, body });
+                        Ok((header, body, attachments)) => {
+                            let _ = self.event_tx.blocking_send(DbEvent::MailFetched { header, body, attachments });
                         }
                         Err(e) => {
                             let _ = self.event_tx.blocking_send(DbEvent::MailFetchFailed { uid, error: e.to_string() });
@@ -415,6 +421,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             mailbox     TEXT NOT NULL,
             uid         INTEGER NOT NULL,
             body        TEXT NOT NULL,
+            attachments TEXT NOT NULL DEFAULT '[]',
             cached_at   INTEGER NOT NULL,
             PRIMARY KEY (account_id, mailbox, uid)
         );
@@ -448,7 +455,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         ",
     )?;
     add_message_id_column_if_missing(conn)?;
-    add_flags_column_if_missing(conn)
+    add_flags_column_if_missing(conn)?;
+    add_attachments_column_if_missing(conn)
 }
 
 /// `messages.message_id` (B7) was added after `messages` itself (B3).
@@ -485,6 +493,19 @@ fn add_flags_column_if_missing(conn: &Connection) -> rusqlite::Result<()> {
     }
 }
 
+/// `bodies.attachments` (issue #68) was added after `bodies` itself (B3),
+/// same situation as `message_id`/`flags`: an existing `bodies` table from
+/// an earlier build is untouched by `CREATE TABLE IF NOT EXISTS`, so a later
+/// `index_mail`'s `INSERT INTO bodies (..., attachments)` would fail with
+/// "table bodies has no column named attachments" against it.
+fn add_attachments_column_if_missing(conn: &Connection) -> rusqlite::Result<()> {
+    match conn.execute("ALTER TABLE bodies ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'", []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Insert or update several messages' metadata only, with no body to cache
 /// (B3) -- see [`DbCommand::IndexHeaders`]'s doc for why this leaves
 /// `bodies`/`messages_fts` untouched. `size` is left at whatever it already
@@ -513,15 +534,17 @@ fn index_headers(
     Ok(())
 }
 
-/// Insert or update one message's metadata, cached body, and FTS row. Safe to
-/// call repeatedly for the same `(account_id, mailbox, uid)` — every table
-/// upserts rather than duplicating.
+/// Insert or update one message's metadata, cached body, attachments, and
+/// FTS row. Safe to call repeatedly for the same
+/// `(account_id, mailbox, uid)` — every table upserts rather than
+/// duplicating.
 fn index_mail(
     conn: &Connection,
     account_id: &str,
     mailbox: &str,
     header: &MailHeader,
     body: &str,
+    attachments: &[Attachment],
 ) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO messages (account_id, mailbox, uid, subject, from_addr, to_addr, date, message_id, size, flags)
@@ -549,13 +572,15 @@ fn index_mail(
     )?;
 
     let cached_at = now_unix();
+    let attachments_json = attachments_column(attachments)?;
     conn.execute(
-        "INSERT INTO bodies (account_id, mailbox, uid, body, cached_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO bodies (account_id, mailbox, uid, body, attachments, cached_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT (account_id, mailbox, uid) DO UPDATE SET
             body = excluded.body,
+            attachments = excluded.attachments,
             cached_at = excluded.cached_at",
-        params![account_id, mailbox, header.uid, body, cached_at],
+        params![account_id, mailbox, header.uid, body, attachments_json, cached_at],
     )?;
 
     // The FTS table has no natural key to upsert on, so replace-by-delete.
@@ -571,6 +596,47 @@ fn index_mail(
 
     evict_lru_bodies(conn, MAX_CACHED_BODIES)?;
     Ok(())
+}
+
+/// One attachment as `bodies.attachments` stores it: JSON, with `data` base64
+/// rather than serde's default array-of-numbers, which would inflate a binary
+/// attachment to several times its size on disk.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedAttachment {
+    filename: String,
+    mime_type: String,
+    data: String,
+}
+
+fn attachments_column(attachments: &[Attachment]) -> rusqlite::Result<String> {
+    use base64::Engine as _;
+    let cached: Vec<CachedAttachment> = attachments
+        .iter()
+        .map(|a| CachedAttachment {
+            filename: a.filename.clone(),
+            mime_type: a.mime_type.clone(),
+            data: base64::engine::general_purpose::STANDARD.encode(&a.data),
+        })
+        .collect();
+    serde_json::to_string(&cached).map_err(to_sql_err)
+}
+
+/// Inverse of [`attachments_column`]. A row written by an older build (or
+/// otherwise unparseable) yields no attachments rather than an error: a
+/// missing chip is not worth failing a message open over, matching
+/// `render::extract_attachments`'s own "degrade rather than propagate" choice.
+fn parse_attachments_column(s: &str) -> Vec<Attachment> {
+    use base64::Engine as _;
+    let Ok(cached) = serde_json::from_str::<Vec<CachedAttachment>>(s) else {
+        return Vec::new();
+    };
+    cached
+        .into_iter()
+        .filter_map(|c| {
+            let data = base64::engine::general_purpose::STANDARD.decode(&c.data).ok()?;
+            Some(Attachment { filename: c.filename, mime_type: c.mime_type, data })
+        })
+        .collect()
 }
 
 /// Delete the oldest-cached rows in `bodies` until at most `max_rows` remain.
@@ -651,15 +717,16 @@ fn fetch_mail(
     account_id: &str,
     mailbox: &str,
     uid: u32,
-) -> rusqlite::Result<(MailHeader, String)> {
+) -> rusqlite::Result<(MailHeader, String, Vec<Attachment>)> {
     conn.query_row(
-        "SELECT m.subject, m.from_addr, m.to_addr, m.date, m.message_id, b.body, m.flags
+        "SELECT m.subject, m.from_addr, m.to_addr, m.date, m.message_id, b.body, m.flags, b.attachments
          FROM messages m JOIN bodies b
             ON b.account_id = m.account_id AND b.mailbox = m.mailbox AND b.uid = m.uid
          WHERE m.account_id = ?1 AND m.mailbox = ?2 AND m.uid = ?3",
         params![account_id, mailbox, uid],
         |row| {
             let flags_str: String = row.get(6)?;
+            let attachments_json: String = row.get(7)?;
             Ok((
                 MailHeader {
                     uid,
@@ -671,6 +738,7 @@ fn fetch_mail(
                     flags: parse_flags_column(&flags_str),
                 },
                 row.get(5)?,
+                parse_attachments_column(&attachments_json),
             ))
         },
     )
@@ -979,9 +1047,9 @@ mod tests {
         .unwrap();
 
         init_schema(&conn).unwrap();
-        index_mail(&conn, "acc", "INBOX", &test_header(1), "body").unwrap();
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "body", &[]).unwrap();
 
-        let (header, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        let (header, _, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
         assert_eq!(header.message_id, "<msg1@example.com>");
     }
 
@@ -1006,9 +1074,9 @@ mod tests {
         init_schema(&conn).unwrap();
         let mut header = test_header(1);
         header.flags = vec!["\\Seen".to_string()];
-        index_mail(&conn, "acc", "INBOX", &header, "body").unwrap();
+        index_mail(&conn, "acc", "INBOX", &header, "body", &[]).unwrap();
 
-        let (fetched, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        let (fetched, _, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
         assert_eq!(fetched.flags, vec!["\\Seen".to_string()]);
     }
 
@@ -1017,12 +1085,47 @@ mod tests {
     #[test]
     fn index_then_fetch_round_trips() {
         let conn = test_conn();
-        index_mail(&conn, "acc", "INBOX", &test_header(1), "<p>hello</p>").unwrap();
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "<p>hello</p>", &[]).unwrap();
 
-        let (header, body) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        let (header, body, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
         assert_eq!(header.uid, 1);
         assert_eq!(header.subject, "Subject 1");
         assert_eq!(body, "<p>hello</p>");
+    }
+
+    #[test]
+    fn attachments_round_trip_through_the_cache() {
+        // Issue #68: a message opened from the search cache must show the
+        // same attachments a live fetch would, so `index_mail`/`fetch_mail`
+        // have to carry them alongside the body. Bytes that are not valid
+        // UTF-8 (0xFF, 0xFE) exercise the base64 encoding the column uses.
+        let conn = test_conn();
+        let attachment = Attachment {
+            filename: "report.pdf".to_string(),
+            mime_type: "application/pdf".to_string(),
+            data: vec![0x00, 0xFF, 0x10, 0xFE, 0x7F],
+        };
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "<p>see attached</p>", std::slice::from_ref(&attachment)).unwrap();
+
+        let (_, _, attachments) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "report.pdf");
+        assert_eq!(attachments[0].mime_type, "application/pdf");
+        assert_eq!(attachments[0].data, attachment.data);
+    }
+
+    #[test]
+    fn reindexing_replaces_the_cached_attachments() {
+        let conn = test_conn();
+        let old = Attachment { filename: "old.txt".to_string(), mime_type: "text/plain".to_string(), data: vec![1] };
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "v1", std::slice::from_ref(&old)).unwrap();
+
+        let new = Attachment { filename: "new.txt".to_string(), mime_type: "text/plain".to_string(), data: vec![2] };
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "v2", std::slice::from_ref(&new)).unwrap();
+
+        let (_, _, attachments) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "new.txt");
     }
 
     #[test]
@@ -1045,17 +1148,17 @@ mod tests {
     #[test]
     fn indexing_the_same_uid_twice_updates_rather_than_duplicates() {
         let conn = test_conn();
-        index_mail(&conn, "acc", "INBOX", &test_header(1), "<p>v1</p>").unwrap();
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "<p>v1</p>", &[]).unwrap();
         let mut updated = test_header(1);
         updated.subject = "Updated subject".to_string();
-        index_mail(&conn, "acc", "INBOX", &updated, "<p>v2</p>").unwrap();
+        index_mail(&conn, "acc", "INBOX", &updated, "<p>v2</p>", &[]).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
 
-        let (header, body) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        let (header, body, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
         assert_eq!(header.subject, "Updated subject");
         assert_eq!(body, "<p>v2</p>");
     }
@@ -1063,9 +1166,9 @@ mod tests {
     #[test]
     fn accounts_and_mailboxes_do_not_collide_on_the_same_uid() {
         let conn = test_conn();
-        index_mail(&conn, "acc1", "INBOX", &test_header(1), "acc1 inbox").unwrap();
-        index_mail(&conn, "acc2", "INBOX", &test_header(1), "acc2 inbox").unwrap();
-        index_mail(&conn, "acc1", "Archive", &test_header(1), "acc1 archive").unwrap();
+        index_mail(&conn, "acc1", "INBOX", &test_header(1), "acc1 inbox", &[]).unwrap();
+        index_mail(&conn, "acc2", "INBOX", &test_header(1), "acc2 inbox", &[]).unwrap();
+        index_mail(&conn, "acc1", "Archive", &test_header(1), "acc1 archive", &[]).unwrap();
 
         assert_eq!(fetch_mail(&conn, "acc1", "INBOX", 1).unwrap().1, "acc1 inbox");
         assert_eq!(fetch_mail(&conn, "acc2", "INBOX", 1).unwrap().1, "acc2 inbox");
@@ -1102,11 +1205,11 @@ mod tests {
         // this cache already has the body for). index_headers must not
         // regress that row back to bodyless.
         let conn = test_conn();
-        index_mail(&conn, "acc", "INBOX", &test_header(1), "<p>already cached</p>").unwrap();
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "<p>already cached</p>", &[]).unwrap();
 
         index_headers(&conn, "acc", "INBOX", &[test_header(1)]).unwrap();
 
-        let (_, body) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        let (_, body, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
         assert_eq!(body, "<p>already cached</p>");
     }
 
@@ -1117,20 +1220,20 @@ mod tests {
         let conn = test_conn();
         let mut header = test_header(1);
         header.flags = vec!["\\Seen".to_string(), "\\Flagged".to_string()];
-        index_mail(&conn, "acc", "INBOX", &header, "body").unwrap();
+        index_mail(&conn, "acc", "INBOX", &header, "body", &[]).unwrap();
 
-        let (fetched, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        let (fetched, _, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
         assert_eq!(fetched.flags, vec!["\\Seen", "\\Flagged"]);
     }
 
     #[test]
     fn update_flags_overwrites_a_cached_messages_flags() {
         let conn = test_conn();
-        index_mail(&conn, "acc", "INBOX", &test_header(1), "body").unwrap();
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "body", &[]).unwrap();
 
         update_flags(&conn, "acc", "INBOX", 1, &["\\Seen".to_string()]).unwrap();
 
-        let (header, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        let (header, _, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
         assert_eq!(header.flags, vec!["\\Seen"]);
     }
 
@@ -1144,8 +1247,8 @@ mod tests {
     #[test]
     fn remove_account_forgets_that_account_only() {
         let conn = test_conn();
-        index_mail(&conn, "gone", "INBOX", &test_header(1), "needle").unwrap();
-        index_mail(&conn, "kept", "INBOX", &test_header(1), "needle").unwrap();
+        index_mail(&conn, "gone", "INBOX", &test_header(1), "needle", &[]).unwrap();
+        index_mail(&conn, "kept", "INBOX", &test_header(1), "needle", &[]).unwrap();
         report_mailbox_state(&conn, "gone", "INBOX", 7, 2).unwrap();
         report_mailbox_state(&conn, "kept", "INBOX", 7, 2).unwrap();
 
@@ -1164,7 +1267,7 @@ mod tests {
     #[test]
     fn remove_message_deletes_from_every_table() {
         let conn = test_conn();
-        index_mail(&conn, "acc", "INBOX", &test_header(1), "body text").unwrap();
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "body text", &[]).unwrap();
 
         remove_message(&conn, "acc", "INBOX", 1).unwrap();
 
@@ -1178,7 +1281,7 @@ mod tests {
     #[test]
     fn search_finds_a_matching_subject() {
         let conn = test_conn();
-        index_mail(&conn, "acc", "INBOX", &test_header(1), "irrelevant body").unwrap();
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "irrelevant body", &[]).unwrap();
         let results = search(&conn, Some("acc"), "\"Subject 1\"", None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].header.uid, 1);
@@ -1187,8 +1290,8 @@ mod tests {
     #[test]
     fn search_is_scoped_to_the_given_account() {
         let conn = test_conn();
-        index_mail(&conn, "acc1", "INBOX", &test_header(1), "body").unwrap();
-        index_mail(&conn, "acc2", "INBOX", &test_header(2), "body").unwrap();
+        index_mail(&conn, "acc1", "INBOX", &test_header(1), "body", &[]).unwrap();
+        index_mail(&conn, "acc2", "INBOX", &test_header(2), "body", &[]).unwrap();
         let results = search(&conn, Some("acc1"), "body", None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].header.uid, 1);
@@ -1197,9 +1300,9 @@ mod tests {
     #[test]
     fn search_without_an_account_spans_all_of_them_and_says_where_each_hit_lives() {
         let conn = test_conn();
-        index_mail(&conn, "acc1", "INBOX", &test_header(1), "needle").unwrap();
-        index_mail(&conn, "acc2", "Archive", &test_header(1), "needle").unwrap();
-        index_mail(&conn, "acc3", "INBOX", &test_header(2), "haystack").unwrap();
+        index_mail(&conn, "acc1", "INBOX", &test_header(1), "needle", &[]).unwrap();
+        index_mail(&conn, "acc2", "Archive", &test_header(1), "needle", &[]).unwrap();
+        index_mail(&conn, "acc3", "INBOX", &test_header(2), "haystack", &[]).unwrap();
         let mut hits: Vec<(String, String, u32)> = search(&conn, None, "needle", None)
             .unwrap()
             .into_iter()
@@ -1219,7 +1322,7 @@ mod tests {
         // a mailbox name containing a quote must be treated as a literal
         // value, not splice into the query.
         let conn = test_conn();
-        index_mail(&conn, "acc", "INBOX", &test_header(1), "body").unwrap();
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "body", &[]).unwrap();
         let malicious_mailbox = "INBOX' OR '1'='1";
         // Must not error, and must not match anything (no mailbox has that
         // literal name), rather than the old code's behavior of the quote
@@ -1300,7 +1403,7 @@ mod tests {
     #[test]
     fn report_mailbox_state_wipes_cached_messages_on_uid_validity_change() {
         let conn = test_conn();
-        index_mail(&conn, "acc", "INBOX", &test_header(1), "body").unwrap();
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "body", &[]).unwrap();
         report_mailbox_state(&conn, "acc", "INBOX", 100, 50).unwrap();
 
         let plan = report_mailbox_state(&conn, "acc", "INBOX", 200, 50).unwrap();
