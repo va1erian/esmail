@@ -4,13 +4,18 @@
 //! ```text
 //! cargo run -p esmail-win32 --example message_list -- --rows 100000 --theme light
 //! cargo run -p esmail-win32 --example message_list -- --screenshot out.png --theme dark --select 3..8
+//! cargo run -p esmail-win32 --example message_list --release -- --bench-scroll
+//! cargo run -p esmail-win32 --example message_list -- --trace-scroll --verbose
 //! ```
 //!
 //! `--rows N` sets the row count, `--theme light|dark` the palette,
 //! `--screenshot out.png` captures once and exits, `--scroll N` scrolls so row
 //! `N` is visible, and `--select A..B` selects that inclusive range before the
-//! capture. The capture path is guarded by a timer, so a screenshot run always
-//! has an exit path.
+//! capture. `--bench-scroll` drives the widget with synthetic `WM_VSCROLL` /
+//! `WM_MOUSEWHEEL` input and prints latency percentiles before exiting;
+//! `--trace-scroll` prints per-event timestamps while a human scrolls for real.
+//! `--verbose` turns on the per-event diagnostics that release builds keep
+//! quiet. Every mode has a timer-guarded exit path.
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -23,6 +28,8 @@ use esmail_win32::MessageList;
 use win32ui::prelude::*;
 use win32ui::{column, split_row};
 
+use crate::bench;
+
 enum Msg {
     Selected(Vec<usize>),
     Open(usize),
@@ -34,12 +41,22 @@ enum Msg {
 
 struct App {
     list: MessageList<Msg>,
+    rows: usize,
     screenshot: Option<String>,
     scroll: Option<usize>,
     select: Option<(usize, usize)>,
     hold: Option<u64>,
+    bench: Option<bench::Bench>,
+    trace: bool,
+    verbose: bool,
     applied: bool,
     ticks: u64,
+    /// The paint sequence number last reported by `--trace-scroll`.
+    last_traced_paint: u64,
+    /// The scroll sequence number last reported by `--trace-scroll`.
+    last_traced_scroll: u64,
+    /// App start, for absolute `--trace-scroll` timestamps.
+    started: std::time::Instant,
 }
 
 /// A `TreeSource` of fixed fake mailbox names.
@@ -67,6 +84,9 @@ pub(crate) fn main() {
     let mut scroll: Option<usize> = None;
     let mut select: Option<(usize, usize)> = None;
     let mut hold: Option<u64> = None;
+    let mut bench = false;
+    let mut trace = false;
+    let mut verbose = false;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -97,6 +117,9 @@ pub(crate) fn main() {
                 hold = args.get(i + 1).and_then(|s| s.parse().ok());
                 i += 1;
             }
+            "--bench-scroll" => bench = true,
+            "--trace-scroll" => trace = true,
+            "--verbose" => verbose = true,
             other => {
                 eprintln!("message_list: unknown flag {other}");
                 std::process::exit(2);
@@ -129,18 +152,34 @@ pub(crate) fn main() {
                 .position(dip(200.0))
                 .min(dip(120.0), dip(300.0))]);
 
-            let timer = screenshot.as_ref().and_then(|_| ui.set_timer(50).ok());
+            // A timer drives the screenshot capture, the bench and the trace
+            // poll; a plain interactive run has none.
+            let millis = if bench || trace {
+                5
+            } else if screenshot.is_some() {
+                50
+            } else {
+                0
+            };
+            let timer = (millis > 0).then(|| ui.set_timer(millis).ok()).flatten();
             if let Some(timer) = timer {
                 ui.on_timer(move |id| (id == timer).then_some(Msg::Tick));
             }
             App {
                 list,
+                rows,
                 screenshot,
                 scroll,
                 select,
                 hold,
+                bench: bench.then(bench::Bench::new),
+                trace,
+                verbose,
                 applied: false,
                 ticks: 0,
+                last_traced_paint: 0,
+                last_traced_scroll: 0,
+                started: std::time::Instant::now(),
             }
         },
     );
@@ -155,12 +194,30 @@ impl win32ui::App for App {
 
     fn update(&mut self, msg: Msg, ui: &mut Ui<Msg>) {
         match msg {
-            Msg::Selected(rows) => eprintln!("message_list: selected {rows:?}"),
-            Msg::Open(row) => eprintln!("message_list: open row {row}"),
-            Msg::Delete(rows) => eprintln!("message_list: delete {rows:?}"),
-            Msg::ToggleFlag(row) => eprintln!("message_list: toggle flag on row {row}"),
+            Msg::Selected(rows) => {
+                if self.verbose {
+                    eprintln!("message_list: selected {rows:?}");
+                }
+            }
+            Msg::Open(row) => {
+                if self.verbose {
+                    eprintln!("message_list: open row {row}");
+                }
+            }
+            Msg::Delete(rows) => {
+                if self.verbose {
+                    eprintln!("message_list: delete {rows:?}");
+                }
+            }
+            Msg::ToggleFlag(row) => {
+                if self.verbose {
+                    eprintln!("message_list: toggle flag on row {row}");
+                }
+            }
             Msg::Context(row, at) => {
-                eprintln!("message_list: context on row {row} at {at:?}");
+                if self.verbose {
+                    eprintln!("message_list: context on row {row} at {at:?}");
+                }
             }
             Msg::Tick => self.tick(ui),
         }
@@ -181,8 +238,22 @@ impl App {
                 // selection fill rather than the unfocused grey.
                 self.list.focus();
             }
+            // The bench starts part-way down so every input kind has room to
+            // scroll in both directions.
+            if self.bench.is_some() {
+                self.list.ensure_visible(self.rows / 2);
+            }
             self.applied = true;
         }
+
+        if self.bench.is_some() {
+            self.drive_bench(ui);
+            return;
+        }
+        if self.trace {
+            self.trace_scroll();
+        }
+
         if self.screenshot.is_some() && self.applied && self.ticks > 2 {
             self.finish_screenshot(ui);
         } else if let Some(hold) = self.hold {
@@ -193,6 +264,86 @@ impl App {
             // A run that never settles must still have an exit path.
             eprintln!("message_list: timed out waiting to capture");
             ui.quit();
+        }
+    }
+
+    /// Advances the bench one step per timer tick: waits for the paint that
+    /// follows the previous input, records its latency, then sends the next.
+    fn drive_bench(&mut self, ui: &mut Ui<Msg>) {
+        let hwnd = self.list.control().hwnd();
+        let timing = self.list.timing();
+        let Some(bench) = self.bench.as_mut() else { return };
+
+        if let Some((pending, kind)) = bench.pending {
+            if timing.paint_seq >= bench.awaiting {
+                let begin = timing.paint_begin.unwrap_or(pending);
+                bench.samples.push(bench::Sample {
+                    kind,
+                    latency_ns: begin.saturating_duration_since(pending).as_nanos(),
+                    layout_us: timing.phases.layout,
+                    draw_us: timing.phases.draw,
+                    paint_us: timing.paint_micros,
+                });
+                bench.paints += 1;
+                bench.pending = None;
+            } else if pending.elapsed() > std::time::Duration::from_millis(2000) {
+                // A scroll that does not repaint within two seconds is the
+                // bug this bench exists to catch; report it and exit rather
+                // than hang forever.
+                eprintln!(
+                    "bench-scroll: no paint within 2s of input {} ({}) — the scroll host moved the offset without repainting",
+                    bench.sent,
+                    kind.name(),
+                );
+                ui.quit();
+                return;
+            } else {
+                // The paint for the last input has not run yet; wait.
+                return;
+            }
+        }
+
+        if bench.sent >= bench::INPUTS {
+            bench::report(&bench.samples, bench.paints, bench.started);
+            ui.quit();
+            return;
+        }
+
+        let seq_before = self.list.timing().paint_seq;
+        bench.kind.send(hwnd);
+        bench.pending = Some((std::time::Instant::now(), bench.kind));
+        bench.awaiting = seq_before + 1;
+        bench.sent += 1;
+        bench.step();
+    }
+
+    /// Prints one line per scroll/paint event so a human can watch the
+    /// timestamps while scrolling with a real mouse.
+    fn trace_scroll(&mut self) {
+        let timing = self.list.timing();
+        let since = |t: std::time::Instant| (t - self.started).as_secs_f64() * 1_000.0;
+        if timing.scroll_seq != self.last_traced_scroll {
+            self.last_traced_scroll = timing.scroll_seq;
+            if let Some(at) = timing.scroll_at {
+                eprintln!(
+                    "trace-scroll: scroll #{:<4} at {:>9.3} ms",
+                    timing.scroll_seq,
+                    since(at),
+                );
+            }
+        }
+        if timing.paint_seq != self.last_traced_paint {
+            self.last_traced_paint = timing.paint_seq;
+            if let Some(begin) = timing.paint_begin {
+                eprintln!(
+                    "trace-scroll: paint  #{:<4} at {:>9.3} ms (paint {:.1} us, layout {:.1} us, draw {:.1} us)",
+                    timing.paint_seq,
+                    since(begin),
+                    timing.paint_micros,
+                    timing.phases.layout,
+                    timing.phases.draw,
+                );
+            }
         }
     }
 

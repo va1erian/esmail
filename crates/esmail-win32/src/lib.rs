@@ -45,5 +45,8 @@
 mod message_list;
 mod paint;
 mod state;
+mod timing;
 
 pub use message_list::{MessageList, MessageListEvent};
+pub use paint::Phases;
+pub use timing::Timing;

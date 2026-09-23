@@ -84,9 +84,26 @@ pub struct RowVisual {
     pub focused: bool,
 }
 
-/// Paints one row into `canvas`. `rect` is the row's rectangle in document
-/// coordinates (device-independent pixels); the canvas is already translated
-/// by the scroll offset.
+/// Time spent in the two measured phases of one paint, in microseconds,
+/// accumulated across every row by [`paint_row`]. Read by the bench example to
+/// diagnose scroll jank; `layout` is text measurement + DirectWrite layout
+/// creation, `draw` is every fill / `draw_text` / `draw_line` call. EndDraw
+/// (present) happens after `paint_row` returns and is not observable from the
+/// widget side, so it is not included.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Phases {
+    /// Text measurement and DirectWrite layout creation.
+    pub layout: f64,
+    /// Fill and text drawing.
+    pub draw: f64,
+}
+
+/// Paints one row into `canvas`, splitting its work into three phases recorded
+/// in `phases`' two buckets: the background/accent fills and the text/line
+/// drawing accumulate into `draw`, the text measurement + DirectWrite layout
+/// creation into `layout`. `rect` is the row's rectangle in document
+/// coordinates (device-independent pixels); the canvas is already translated by
+/// the scroll offset.
 pub fn paint_row(
     canvas: &mut D2dCanvas<'_>,
     row: &RowModel,
@@ -94,10 +111,14 @@ pub fn paint_row(
     visual: RowVisual,
     fonts: &Fonts,
     theme: &Theme,
+    phases: &mut Phases,
 ) {
     let unread = !row.seen;
     let subject_color = if row.seen { theme.text_secondary } else { theme.text };
 
+    // Phase 1: fills, so both the row background and the accent bar sit under
+    // the text.
+    let mut mark = std::time::Instant::now();
     if visual.selected {
         let fill = if visual.focused {
             theme.selection
@@ -115,7 +136,11 @@ pub fn paint_row(
             theme.accent,
         );
     }
+    phases.draw += mark.elapsed().as_secs_f64() * 1_000_000.0;
 
+    // Phase 2: measure and lay out every piece of text before drawing any of
+    // it, so the two phases can be timed separately.
+    mark = std::time::Instant::now();
     let text_left = rect.left + ACCENT + PAD_X;
     let right = rect.right - PAD_X;
     let full_width = (rect.width() - ACCENT - PAD_X * 2.0).max(0.0);
@@ -141,37 +166,49 @@ pub fn paint_row(
         &fonts.sender
     };
     let sender_text = ellipsize(sender_font, &row.sender, sender_w);
+    let subject_text = ellipsize(&fonts.subject, &row.subject, subject_w);
+
+    let sender_layout = sender_font.layout(&sender_text, f32::INFINITY).ok();
+    let time_layout = time.and_then(|t| fonts.timestamp.layout(t, f32::INFINITY).ok());
+    let star_layout = star.and_then(|s| fonts.sender.layout(s, f32::INFINITY).ok());
+    let subject_layout = fonts.subject.layout(&subject_text, f32::INFINITY).ok();
+    let date_layout = date.and_then(|d| fonts.timestamp.layout(d, f32::INFINITY).ok());
+    phases.layout += mark.elapsed().as_secs_f64() * 1_000_000.0;
+
+    // Phase 3: draw the laid-out text, then the row's bottom border.
+    mark = std::time::Instant::now();
     let sender_origin = PointF::new(text_left, rect.top + PAD_Y);
     let sender_line_h = fonts.sender.metrics().line_height();
-    if let Ok(sender_layout) = sender_font.layout(&sender_text, f32::INFINITY) {
+    if let Some(sender_layout) = sender_layout {
         canvas.draw_text(&sender_layout, sender_origin, theme.text);
-        if let Some(time) = time {
-            if let Ok(line) = fonts.timestamp.layout(time, f32::INFINITY) {
-                let y = sender_origin.y + sender_line_h - line.height();
-                canvas.draw_text(&line, PointF::new(right - line.width(), y), subject_color);
-            }
+        if let Some(time_layout) = time_layout {
+            let y = sender_origin.y + sender_line_h - time_layout.height();
+            canvas.draw_text(
+                &time_layout,
+                PointF::new(right - time_layout.width(), y),
+                subject_color,
+            );
         }
-        if let Some(star) = star {
-            if let Ok(line) = fonts.sender.layout(star, f32::INFINITY) {
-                canvas.draw_text(
-                    &line,
-                    PointF::new(right - reserved_time - line.width(), sender_origin.y),
-                    theme.warning,
-                );
-            }
+        if let Some(star_layout) = star_layout {
+            canvas.draw_text(
+                &star_layout,
+                PointF::new(right - reserved_time - star_layout.width(), sender_origin.y),
+                theme.warning,
+            );
         }
     }
 
-    let subject_text = ellipsize(&fonts.subject, &row.subject, subject_w);
     let subject_origin = PointF::new(text_left, sender_origin.y + sender_line_h + LINE_GAP);
     let subject_line_h = fonts.subject.metrics().line_height();
-    if let Ok(subject_layout) = fonts.subject.layout(&subject_text, f32::INFINITY) {
+    if let Some(subject_layout) = subject_layout {
         canvas.draw_text(&subject_layout, subject_origin, subject_color);
-        if let Some(date) = date {
-            if let Ok(line) = fonts.timestamp.layout(date, f32::INFINITY) {
-                let y = subject_origin.y + subject_line_h - line.height();
-                canvas.draw_text(&line, PointF::new(right - line.width(), y), subject_color);
-            }
+        if let Some(date_layout) = date_layout {
+            let y = subject_origin.y + subject_line_h - date_layout.height();
+            canvas.draw_text(
+                &date_layout,
+                PointF::new(right - date_layout.width(), y),
+                subject_color,
+            );
         }
     }
 
@@ -181,6 +218,7 @@ pub fn paint_row(
         theme.border,
         Stroke::solid(1.0),
     );
+    phases.draw += mark.elapsed().as_secs_f64() * 1_000_000.0;
 }
 
 /// Truncates `text` to fit on one line within `max_width` device-independent
