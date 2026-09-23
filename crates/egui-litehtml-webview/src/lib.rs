@@ -45,7 +45,10 @@
 //! self-referential-struct problem. The worker sidesteps that: it stores only
 //! the container (which holds the fonts and decoded images, reused across
 //! jobs) and builds a `Document` fresh for each pass, dropping it straight
-//! after.
+//! after. The decoded images have no eviction API of their own, so the worker
+//! drops and rebuilds the whole engine once it has decoded past its budget:
+//! rare, but it keeps a long-lived view from accumulating one texture per
+//! image ever shown.
 //!
 //! # Text selection without a `Document`
 //!
@@ -865,6 +868,16 @@ enum Output {
 /// Most raw image bytes [`Worker::fetched`] keeps before it starts over.
 const FETCHED_CACHE_LIMIT: usize = 64 * 1024 * 1024;
 
+/// Most raw image bytes the worker will decode into one engine before dropping
+/// it -- and with it every decoded texture -- and building a fresh one. The
+/// engine's decoded-image cache has no eviction API of its own (see
+/// `painter.rs`), and its decoded size is not visible from here, so the bytes
+/// handed to `load_image_data` stand in for it; left alone the cache grows for
+/// as long as the view lives, one texture per image URL ever shown. Rebuilding
+/// also re-discovers system fonts, so this is deliberately generous: a backstop
+/// against a long session, not a per-message cost.
+const DECODED_IMAGE_LIMIT: usize = 64 * 1024 * 1024;
+
 /// Everything that lives on the worker thread.
 struct Worker {
     /// Created on first use, on this thread (it is `!Send`).
@@ -888,6 +901,10 @@ struct Worker {
     /// again does not download its images a second time.
     fetched: HashMap<String, Arc<Vec<u8>>>,
     fetched_bytes: usize,
+    /// Raw image bytes handed to the engine since it was built, the worker's
+    /// proxy for the size of its decoded-image cache (see
+    /// [`DECODED_IMAGE_LIMIT`]). Starts over whenever the engine is dropped.
+    decoded_bytes: usize,
 }
 
 impl Worker {
@@ -907,6 +924,7 @@ impl Worker {
             reset_images_next: false,
             fetched: HashMap::new(),
             fetched_bytes: 0,
+            decoded_bytes: 0,
         }
     }
 
@@ -954,6 +972,9 @@ impl Worker {
     /// Run one render job; see the crate module doc for the sequence.
     fn render(&mut self, job: &RenderJob) {
         let t_total = Instant::now();
+        if self.evict_decoded_images_if_over(DECODED_IMAGE_LIMIT) {
+            log::debug!("decoded images passed {DECODED_IMAGE_LIMIT} bytes; dropped the engine");
+        }
         if job.reset_images || std::mem::take(&mut self.reset_images_next) {
             self.engine().clear_pending_images();
         }
@@ -1053,11 +1074,29 @@ impl Worker {
     fn load_images(&mut self, images: Vec<(String, Arc<Vec<u8>>)>) -> bool {
         let mut any = false;
         for (url, bytes) in images {
+            self.decoded_bytes += bytes.len();
             self.engine().load_image_data(&url, &bytes);
             self.total_images_loaded += 1;
             any = true;
         }
         any
+    }
+
+    /// Drop the engine -- releasing every decoded image texture with it --
+    /// once more than `limit` image bytes have been decoded into it since it
+    /// was built, and start the accounting over. Returns whether it dropped
+    /// one.
+    ///
+    /// Called between render jobs, never mid-pass: the engine must outlive the
+    /// pass still using it. A single document whose own images pass `limit`
+    /// is therefore rebuilt once per job rather than thrashing within one.
+    fn evict_decoded_images_if_over(&mut self, limit: usize) -> bool {
+        if self.decoded_bytes <= limit {
+            return false;
+        }
+        self.painter = None;
+        self.decoded_bytes = 0;
+        true
     }
 
     /// Send the engine's current display list to the UI.
@@ -1896,6 +1935,57 @@ mod tests {
         let frame = last_frame(&outputs);
         assert_eq!(frame.id, 2);
         assert_eq!(image_rects(frame).len(), 1, "and still draw it");
+    }
+
+    #[test]
+    fn the_engine_is_rebuilt_once_its_decoded_images_pass_the_budget() {
+        let (out_tx, _out_rx) = mpsc::channel();
+        let mut worker = Worker::new(
+            egui::Context::default(),
+            Arc::new(DefaultHandler),
+            out_tx,
+            Arc::new(AtomicU64::new(1)),
+        );
+        let html = Arc::new(format!(
+            r#"<body style="margin:0"><img src="{RED_10X100_PNG}" width="10" height="100"></body>"#
+        ));
+        let job = |id| RenderJob { id, html: html.clone(), width: 100.0, scale: 1.0, reset_images: true };
+
+        worker.render(&job(1));
+        assert_eq!(worker.total_images_loaded, 1);
+        assert!(worker.decoded_bytes > 0, "the image was decoded into the engine");
+
+        // Pretend enough images have been decoded to pass the budget.
+        worker.decoded_bytes = DECODED_IMAGE_LIMIT + 1;
+        worker.latest_id.store(2, Ordering::SeqCst);
+        worker.render(&job(2));
+
+        assert_eq!(
+            worker.total_images_loaded, 2,
+            "an over-budget engine must be dropped, so its image is decoded again"
+        );
+    }
+
+    #[test]
+    fn evicting_decoded_images_leaves_an_under_budget_engine_alone() {
+        let (out_tx, _out_rx) = mpsc::channel();
+        let mut worker = Worker::new(
+            egui::Context::default(),
+            Arc::new(DefaultHandler),
+            out_tx,
+            Arc::new(AtomicU64::new(1)),
+        );
+        assert!(!worker.evict_decoded_images_if_over(0), "there is no engine yet");
+
+        let html =
+            format!(r#"<body style="margin:0"><img src="{RED_1X1_PNG}" width="20" height="20"></body>"#);
+        worker.render(&RenderJob { id: 1, html: Arc::new(html), width: 100.0, scale: 1.0, reset_images: true });
+        let decoded = worker.decoded_bytes;
+        assert!(worker.painter.is_some());
+
+        assert!(!worker.evict_decoded_images_if_over(DECODED_IMAGE_LIMIT), "well under the budget");
+        assert!(worker.painter.is_some(), "an under-budget engine must survive");
+        assert_eq!(worker.decoded_bytes, decoded, "a no-op eviction must not reset the accounting");
     }
 
     #[test]
