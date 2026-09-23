@@ -5,6 +5,7 @@
 
 use esmail::ipc::message::ToGui;
 use esmail::{auth, compose, config, contacts, db, emoji, icons, imap, oauth, paths, progress, render, screenshot, search_query, secrets, session, shell, smtp, uninstall};
+use esmail::view_model::{export_file_name, find_special_use_mailbox, format_size, progress_label, safe_attachment_filename, select_range, RowModel};
 use progress::{Progress, ProgressKind};
 mod accounts;
 mod compose_ui;
@@ -3271,7 +3272,7 @@ impl eframe::App for EsMailApp {
                             let in_open_context = !is_search || self.in_open_context(i);
                             let is_selected = in_open_context
                                 && (self.selected_uids.contains(&header.uid) || self.selected_uid == Some(header.uid));
-                            let resp = message_row(ui, header, is_selected);
+                            let resp = message_row(ui, &RowModel::from_header(header), is_selected);
                             if show_origin {
                                 if let Some((account, mailbox)) = self.search_origins.get(i) {
                                     ui.add(
@@ -3648,57 +3649,6 @@ fn spawn_attachment_write(tx: std::sync::mpsc::Sender<AttachmentIoEvent>, task: 
     }
 }
 
-/// The user-facing label for a progress report. Kept here rather than in the
-/// protocol modules so all UI copy stays in one place (see [`ProgressKind`]).
-fn progress_label(kind: ProgressKind, mailbox: &str) -> String {
-    match kind {
-        ProgressKind::Index => format!("Indexing {mailbox}..."),
-        ProgressKind::Flags => "Updating flags...".to_string(),
-        ProgressKind::Move => "Moving messages...".to_string(),
-        ProgressKind::Append => "Saving to Sent...".to_string(),
-        ProgressKind::Export => "Exporting message...".to_string(),
-        ProgressKind::Attachment => "Saving attachment...".to_string(),
-        ProgressKind::Send => "Sending message...".to_string(),
-    }
-}
-
-/// `filename` comes straight from the message's own
-/// Content-Disposition/Content-Type header — an attacker-controlled sender's
-/// mail. Taking only the final path component (and falling back to a fixed
-/// name if that leaves nothing usable) keeps a crafted `"../../../whatever"`
-/// or an absolute path from writing outside the caller's chosen directory,
-/// since `Path::join` would otherwise honor either verbatim.
-///
-/// Splits on `/` *and* `\` manually rather than using `std::path::Path`:
-/// `Path`'s separator handling is host-OS-dependent, so on a Linux build
-/// `Path::new(r"C:\Windows\System32\evil.dll").file_name()` treats the
-/// whole string as one component (`\` isn't a separator on Unix) and
-/// returns it unstripped. A sender-controlled filename is untrusted
-/// regardless of which OS esmail happens to be running on, so the
-/// stripping has to be too.
-fn safe_attachment_filename(filename: &str) -> String {
-    match filename.rsplit(['/', '\\']).next() {
-        Some(name) if !name.is_empty() && name != "." && name != ".." => name.to_string(),
-        _ => "attachment".to_string(),
-    }
-}
-
-/// A default file name for exporting a message: its subject, reduced to
-/// characters that are safe in a file name on every OS, plus `.eml`. Falls
-/// back to the UID when the subject leaves nothing usable.
-fn export_file_name(subject: &str, uid: u32) -> String {
-    let cleaned: String = subject
-        .chars()
-        .map(|c| if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.') { c } else { '_' })
-        .collect();
-    let cleaned: String = cleaned.trim_matches(|c: char| c == '.' || c == '_' || c.is_whitespace()).chars().take(60).collect();
-    if cleaned.is_empty() {
-        format!("message-{uid}.eml")
-    } else {
-        format!("{}.eml", cleaned.trim_end())
-    }
-}
-
 /// One row of the message list: the sender on a first line, the subject
 /// beneath it, each cut off with an ellipsis rather than wrapped so every row
 /// has the same height.
@@ -3709,10 +3659,11 @@ fn export_file_name(subject: &str, uid: u32) -> String {
 /// subject in the normal colour; a read row has neither bar nor emphasis, a
 /// normal-colour sender and a dimmed subject. The message's local time sits at
 /// the right end of the sender line and its date at the right end of the
-/// subject line (see `MailHeader::local_date_time`); a starred message gets a
+/// subject line (see `RowModel::local_date_time`); a starred message gets a
 /// ★ just left of the time. Painted by hand, not with a `Button`, because a
-/// button cannot truncate two differently-styled lines.
-fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::Response {
+/// button cannot truncate two differently-styled lines. Everything it draws
+/// comes from a [`RowModel`], so a non-egui frontend can paint the same row.
+fn message_row(ui: &mut egui::Ui, row: &RowModel, selected: bool) -> egui::Response {
     const PAD_X: f32 = 10.0;
     const PAD_Y: f32 = 6.0;
     const ACCENT_BAR_WIDTH: f32 = 3.0;
@@ -3723,7 +3674,7 @@ fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::
     /// Space kept between a line's text and whatever is at its right end.
     const RIGHT_GAP: f32 = 8.0;
 
-    let unread = !header.is_seen();
+    let unread = !row.seen;
     let visuals = ui.visuals();
     let (sender_color, subject_color) = if selected {
         (visuals.selection.stroke.color, visuals.selection.stroke.color)
@@ -3746,13 +3697,13 @@ fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::
     };
 
     let width = ui.available_width();
-    let star = header
-        .is_flagged()
+    let star = row
+        .flagged
         .then(|| one_line(ui, "\u{2605}", SENDER_SIZE, star_color, f32::INFINITY));
-    let (date, time) = match header.local_date_time() {
+    let (date, time) = match &row.local_date_time {
         Some((date, time)) => (
-            Some(one_line(ui, &date, TIMESTAMP_SIZE, subject_color, f32::INFINITY)),
-            Some(one_line(ui, &time, TIMESTAMP_SIZE, subject_color, f32::INFINITY)),
+            Some(one_line(ui, date, TIMESTAMP_SIZE, subject_color, f32::INFINITY)),
+            Some(one_line(ui, time, TIMESTAMP_SIZE, subject_color, f32::INFINITY)),
         ),
         None => (None, None),
     };
@@ -3761,9 +3712,8 @@ fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::
     let sender_width = (full_width - reserved(&time) - reserved(&star)).max(0.0);
     let subject_width = (full_width - reserved(&date)).max(0.0);
 
-    let sender = header.sender_name();
-    let sender = if sender.is_empty() { "(unknown sender)" } else { sender.as_str() };
-    let subject = if header.subject.is_empty() { "(no subject)" } else { header.subject.as_str() };
+    let sender = row.sender.as_str();
+    let subject = row.subject.as_str();
     // Emoji are laid out as placeholders and painted as coloured images over
     // them below -- see `emoji.rs`.
     let sender_text = emoji::prepare(sender);
@@ -3777,13 +3727,13 @@ fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::
     // conveyed by colour and an icon (they used to be a "●"/"★" in the button
     // text), so they are spelled out here.
     response.widget_info(|| {
-        let state = match (unread, header.is_flagged()) {
+        let state = match (unread, row.flagged) {
             (true, true) => "Unread, starred. ",
             (true, false) => "Unread. ",
             (false, true) => "Starred. ",
             (false, false) => "",
         };
-        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, format!("{state}{sender}: {subject}. {}", header.date))
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, format!("{state}{sender}: {subject}. {}", row.raw_date))
     });
 
     if ui.is_rect_visible(rect) {
@@ -3827,55 +3777,9 @@ fn message_row(ui: &mut egui::Ui, header: &MailHeader, selected: bool) -> egui::
     }
 
     response.on_hover_ui(|ui| {
-        ui.label(&header.from);
-        ui.label(&header.subject);
+        ui.label(&row.from);
+        ui.label(&row.raw_subject);
     })
-}
-
-/// The set of UIDs between `anchor` and `uid` (inclusive) in `list`'s
-/// current order, for shift-click range selection (B8). Falls back to just
-/// `{uid}` if either isn't actually in `list` (e.g. the anchor was on a page
-/// that's since been paged away from).
-fn select_range(list: &[MailHeader], anchor: u32, uid: u32) -> std::collections::BTreeSet<u32> {
-    let idx_a = list.iter().position(|h| h.uid == anchor);
-    let idx_b = list.iter().position(|h| h.uid == uid);
-    match (idx_a, idx_b) {
-        (Some(a), Some(b)) => {
-            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-            list[lo..=hi].iter().map(|h| h.uid).collect()
-        }
-        _ => std::iter::once(uid).collect(),
-    }
-}
-
-/// The real mailbox name for a special-use role, from whichever
-/// `MailboxRow` in `rows` classifies as `want` -- pure half of
-/// `EsMailApp::special_use_mailbox`, pulled out so it's testable without
-/// constructing a whole `EsMailApp`. Falls back to `default` if no row
-/// matches (e.g. before `Mailboxes` has arrived, or a server that
-/// advertises no special-use attributes and has no conventionally-named
-/// folder for `want` either -- see `imap::SpecialUse::from_name`).
-fn find_special_use_mailbox(rows: &[imap::MailboxRow], want: imap::SpecialUse, default: &str) -> String {
-    rows.iter()
-        .find(|row| row.special_use == Some(want))
-        .and_then(|row| row.full_name.clone())
-        .unwrap_or_else(|| default.to_string())
-}
-
-/// A human-readable size, e.g. `"4.2 KB"`. Only goes up to MB since a mail
-/// attachment in the GB range would be unusual enough to want the exact byte
-/// count anyway.
-fn format_size(bytes: usize) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    let bytes = bytes as f64;
-    if bytes >= MB {
-        format!("{:.1} MB", bytes / MB)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes / KB)
-    } else {
-        format!("{} B", bytes as u64)
-    }
 }
 
 /// Development runs that render one page and exit (`ESMAIL_PREVIEW`,
@@ -4094,104 +3998,5 @@ mod tests {
         assert_eq!(parse_open_account(args(&["esmail", "--open-account"])), None);
         assert_eq!(parse_open_account(args(&["esmail", "--open-account", ""])), None);
         assert_eq!(parse_open_account(args(&["esmail"])), None);
-    }
-
-    #[test]
-    fn format_size_uses_bytes_below_one_kb() {
-        assert_eq!(format_size(0), "0 B");
-        assert_eq!(format_size(1023), "1023 B");
-    }
-
-    #[test]
-    fn format_size_uses_kb_between_one_kb_and_one_mb() {
-        assert_eq!(format_size(1024), "1.0 KB");
-        assert_eq!(format_size(4300), "4.2 KB");
-    }
-
-    #[test]
-    fn format_size_uses_mb_at_one_mb_and_above() {
-        assert_eq!(format_size(1024 * 1024), "1.0 MB");
-        assert_eq!(format_size(5 * 1024 * 1024 + 512 * 1024), "5.5 MB");
-    }
-
-    // ── safe_attachment_filename ─────────────────────────────────────────────
-
-    #[test]
-    fn safe_attachment_filename_passes_an_ordinary_name_through() {
-        assert_eq!(safe_attachment_filename("report.pdf"), "report.pdf");
-    }
-
-    #[test]
-    fn safe_attachment_filename_strips_relative_traversal() {
-        // Regression test: a crafted "../../../whatever" from a malicious
-        // sender's Content-Disposition header must not be able to write
-        // outside the caller's chosen directory when joined onto it.
-        assert_eq!(safe_attachment_filename("../../../evil.exe"), "evil.exe");
-        assert_eq!(safe_attachment_filename("../../etc/passwd"), "passwd");
-    }
-
-    #[test]
-    fn safe_attachment_filename_strips_a_windows_absolute_path() {
-        assert_eq!(
-            safe_attachment_filename(r"C:\Windows\System32\evil.dll"),
-            "evil.dll"
-        );
-    }
-
-    // ── export_file_name ─────────────────────────────────────────────────────
-
-    #[test]
-    fn export_file_name_uses_the_subject_with_unsafe_characters_replaced() {
-        assert_eq!(export_file_name("Votre projet: un coup de pouce.", 7), "Votre projet_ un coup de pouce.eml");
-        assert_eq!(export_file_name(r"a/b\c?d", 7), "a_b_c_d.eml");
-    }
-
-    #[test]
-    fn export_file_name_falls_back_to_the_uid() {
-        assert_eq!(export_file_name("", 42), "message-42.eml");
-        assert_eq!(export_file_name("???", 42), "message-42.eml");
-    }
-
-    #[test]
-    fn export_file_name_is_bounded() {
-        let name = export_file_name(&"x".repeat(500), 1);
-        assert_eq!(name.len(), 60 + ".eml".len());
-    }
-
-    // ── find_special_use_mailbox ─────────────────────────────────────────────
-
-    fn row(full_name: Option<&str>, special_use: Option<imap::SpecialUse>) -> imap::MailboxRow {
-        let label = full_name.unwrap_or("").to_string();
-        imap::MailboxRow { depth: 0, key: label.clone(), label, full_name: full_name.map(str::to_string), special_use, has_children: false }
-    }
-
-    #[test]
-    fn find_special_use_mailbox_prefers_a_classified_mailbox_over_the_default() {
-        // Regression test for issue #9: Gmail's Sent folder is
-        // "[Gmail]/Sent Mail", not "Sent" -- special-use discovery must
-        // pick the real name over the hardcoded fallback.
-        let rows = vec![
-            row(Some("INBOX"), Some(imap::SpecialUse::Inbox)),
-            row(Some("[Gmail]/Sent Mail"), Some(imap::SpecialUse::Sent)),
-        ];
-        assert_eq!(find_special_use_mailbox(&rows, imap::SpecialUse::Sent, "Sent"), "[Gmail]/Sent Mail");
-    }
-
-    #[test]
-    fn find_special_use_mailbox_falls_back_to_default_when_nothing_matches() {
-        let rows = vec![row(Some("INBOX"), Some(imap::SpecialUse::Inbox))];
-        assert_eq!(find_special_use_mailbox(&rows, imap::SpecialUse::Trash, "Trash"), "Trash");
-    }
-
-    #[test]
-    fn find_special_use_mailbox_falls_back_when_mailboxes_have_not_loaded_yet() {
-        assert_eq!(find_special_use_mailbox(&[], imap::SpecialUse::Archive, "Archive"), "Archive");
-    }
-
-    #[test]
-    fn safe_attachment_filename_falls_back_when_nothing_usable_remains() {
-        assert_eq!(safe_attachment_filename(""), "attachment");
-        assert_eq!(safe_attachment_filename(".."), "attachment");
-        assert_eq!(safe_attachment_filename("/"), "attachment");
     }
 }
