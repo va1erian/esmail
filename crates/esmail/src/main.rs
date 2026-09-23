@@ -468,8 +468,7 @@ impl EsMailApp {
             let ctx = egui_ctx.clone();
             move |account| {
                 let _ = toast_click_tx.try_send(account);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                bring_window_to_front(&ctx);
                 ctx.request_repaint_of(egui::ViewportId::ROOT);
             }
         });
@@ -2199,6 +2198,17 @@ impl EsMailApp {
     }
 }
 
+/// Bring the main window to the front: restore it if it was minimized, show it
+/// if it was hidden to the tray, and focus it. Every "come forward" path goes
+/// through here -- a second launch, the tray's Show, and a clicked new-mail
+/// toast -- so a window minimized to the taskbar (rather than hidden) is
+/// restored in all of them, not just the first.
+fn bring_window_to_front(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+}
+
 /// Tray icon polling + minimize-to-tray (B10), and clicks on new-mail toasts.
 /// Kept in its own `impl` block, called only from `EsMailApp::logic`. On a
 /// platform without a tray `self.tray` is `None` and this does nothing.
@@ -2208,11 +2218,7 @@ impl EsMailApp {
         // (an ordinary second launch) or exit (`esmail --quit`, used by the
         // installer). Polled, since nothing wakes a hidden window for it.
         match shell::take_request() {
-            Some(shell::Request::Show) => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
+            Some(shell::Request::Show) => bring_window_to_front(ctx),
             Some(shell::Request::Quit) => {
                 self.exit_requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2253,10 +2259,7 @@ impl EsMailApp {
 
         for action in tray.poll_actions() {
             match action {
-                platform::TrayAction::Show => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
+                platform::TrayAction::Show => bring_window_to_front(ctx),
                 platform::TrayAction::Quit => {
                     // Hidden windows don't organically generate another
                     // close-request -- nothing is clicking their (invisible)
