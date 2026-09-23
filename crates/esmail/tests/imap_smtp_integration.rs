@@ -160,6 +160,42 @@ async fn fetch_body_for_a_missing_uid_reports_a_matchable_body_failure() {
     }
 }
 
+/// Regression test for GitHub issue #80: a body fetch that fails against an
+/// *existing* body-worker session must be retried once on a fresh connection
+/// before the failure is surfaced, rather than reporting `BodyFailed`
+/// immediately. The mock server drops the connection on the next RFC822
+/// fetch to simulate the dead/aborted socket from the report; the worker's
+/// retry reconnects and the fetch then succeeds.
+#[tokio::test]
+async fn fetch_body_retries_once_on_a_fresh_connection_after_a_dropped_socket() {
+    skip_unless_ca_trusted!();
+    let mut h = start_harness(0).await;
+
+    h.imap_cmd.send(ImapCommand::FetchHeaders { mailbox: "INBOX".to_string(), page: 1, req_id: 1 }).await.unwrap();
+    let headers = match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Headers { headers, .. } => headers,
+        other => panic!("expected Headers, got {other:?}"),
+    };
+    let uid = headers.iter().find(|h| h.subject.contains("Report with image")).expect("fixture message present").uid;
+
+    // A successful fetch first, so the body worker has its own live session
+    // and the injected failure really hits an existing one.
+    h.imap_cmd.send(ImapCommand::FetchBody { mailbox: "INBOX".to_string(), uid, req_id: 2 }).await.unwrap();
+    assert!(matches!(
+        timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap(),
+        ImapEvent::Body { req_id: 2, .. }
+    ));
+
+    h.server.store.lock().unwrap().drop_next_rfc822_fetch = true;
+    h.imap_cmd.send(ImapCommand::FetchBody { mailbox: "INBOX".to_string(), uid, req_id: 3 }).await.unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Body { uid: got_uid, req_id: 3, .. } => assert_eq!(got_uid, uid),
+        other => panic!(
+            "expected Body after the retry, got {other:?} -- issue #80: a FetchBody that fails on an existing session must be retried once on a fresh connection"
+        ),
+    }
+}
+
 #[tokio::test]
 async fn fetch_body_renders_html_resolves_cid_and_finds_the_attachment() {
     skip_unless_ca_trusted!();

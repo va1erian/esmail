@@ -112,12 +112,26 @@ pub struct Store {
     /// connections care about this" fan-out, and `send` on no subscribers is
     /// just a no-op `Err` every `deliver` call already ignores.
     pub notify: broadcast::Sender<String>,
+    /// Test-only fault injection (issue #80): when set, the next
+    /// `UID FETCH ... RFC822` -- the fetch `imap.rs::fetch_body`/`fetch_raw`
+    /// issue -- makes the server drop the connection instead of answering,
+    /// simulating the dead/aborted socket from the bug report. The flag
+    /// clears on use, so the client's retry on a fresh connection succeeds.
+    /// Never set by production code; the integration test that exercises the
+    /// body worker's one-command retry flips it directly.
+    pub drop_next_rfc822_fetch: bool,
 }
 
 impl Store {
     pub fn new() -> Self {
         let (notify, _) = broadcast::channel(32);
-        Store { users: HashMap::new(), oauth_tokens: HashMap::new(), mailboxes: HashMap::new(), notify }
+        Store {
+            users: HashMap::new(),
+            oauth_tokens: HashMap::new(),
+            mailboxes: HashMap::new(),
+            notify,
+            drop_next_rfc822_fetch: false,
+        }
     }
 
     pub fn add_user(&mut self, username: &str, password: &str) {
