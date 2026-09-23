@@ -63,6 +63,12 @@ impl TrayState {
     /// treats that as "no tray this session" and leaves window-close
     /// behaving normally, rather than stranding the user with a hidden
     /// window and no way to bring it back.
+    ///
+    /// Must be called on a thread that pumps Win32 messages: the icon is
+    /// backed by a hidden window of `tray-icon`'s, and its clicks and menu
+    /// events arrive through that window's procedure. No *esMail* window is
+    /// needed -- the background listener creates this inside a winit event
+    /// loop with no windows, which pumps the thread's messages just the same.
     pub fn new() -> anyhow::Result<Self> {
         let light_glyph = shell::taskbar_is_dark();
         let menu = Menu::new();

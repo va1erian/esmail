@@ -9,6 +9,7 @@ mod accounts;
 mod compose_ui;
 mod compose_window;
 mod config_saver;
+mod listener;
 mod settings;
 mod window_fit;
 use config_saver::ConfigSaver;
@@ -3801,8 +3802,7 @@ fn is_dev_run() -> bool {
     std::env::var_os("ESMAIL_PREVIEW").is_some() || std::env::var_os("ESMAIL_SCREENSHOT").is_some()
 }
 
-#[tokio::main]
-async fn main() -> eframe::Result {
+fn main() -> eframe::Result {
     init_logging();
     // See `platform::disable_background_throttling`'s doc: without this,
     // compose windows (#34) and the tray/toast machinery can go unresponsive
@@ -3829,6 +3829,27 @@ async fn main() -> eframe::Result {
         std::process::exit(if problems.is_empty() { 0 } else { 1 });
     }
 
+    // `esmail --background`: the resident listener (see `listener.rs` and
+    // docs/BACKGROUND-LISTENER.md). It owns the main thread for the message
+    // pump its tray needs, so it must not run inside the GUI's runtime.
+    if std::env::args().any(|arg| arg == "--background") {
+        if let Err(e) = listener::run() {
+            log::error!("the background listener stopped: {e:#}");
+            eprintln!("esmail: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // The GUI spawns its actors with `tokio::spawn`, so it needs a runtime.
+    // `--background` above deliberately does not go through this:
+    // `listener::run` starts its own on another thread, and blocking on a
+    // runtime from inside one would panic.
+    let runtime = tokio::runtime::Runtime::new().expect("could not start the tokio runtime");
+    runtime.block_on(run_gui())
+}
+
+async fn run_gui() -> eframe::Result {
     if !is_dev_run() {
         // esMail lives in the tray: a second launch should raise the window
         // that is already there, not start a competing process.

@@ -445,12 +445,22 @@ pub struct TokenSource {
     /// watch can all need a token at once, and all but the first should find
     /// a fresh one waiting rather than each hitting the token endpoint.
     access: tokio::sync::Mutex<Option<(SecretString, Instant)>>,
+    /// Notified with the new token whenever a refresh rotates the refresh
+    /// token, so a caller that can persist it (the background listener) can
+    /// write it back to the keyring. Unset for every other caller.
+    rotation: StdMutex<Option<Arc<dyn Fn(&SecretString) + Send + Sync>>>,
 }
 
 impl TokenSource {
     /// From a refresh token saved earlier; the first use fetches an access token.
     pub fn from_refresh_token(client: OAuthClient, refresh_token: SecretString) -> Arc<Self> {
-        Arc::new(Self { client, refresh_token: StdMutex::new(refresh_token), issued_at: None, access: tokio::sync::Mutex::new(None) })
+        Arc::new(Self {
+            client,
+            refresh_token: StdMutex::new(refresh_token),
+            issued_at: None,
+            access: tokio::sync::Mutex::new(None),
+            rotation: StdMutex::new(None),
+        })
     }
 
     /// From a fresh sign-in, reusing the access token it already returned.
@@ -466,7 +476,17 @@ impl TokenSource {
             refresh_token: StdMutex::new(refresh_token),
             issued_at: Some(now_unix()),
             access: tokio::sync::Mutex::new(Some((grant.access_token, grant.expires_at))),
+            rotation: StdMutex::new(None),
         }))
+    }
+
+    /// Register `callback` to be called with the new refresh token each time a
+    /// refresh rotates it. The listener uses this to write the rotated token
+    /// back to the OS keyring; a caller that does not need to (the GUI's
+    /// IMAP/SMTP/IDLE sessions) simply leaves it unset. Registering again
+    /// replaces the previous callback.
+    pub fn on_rotation(&self, callback: impl Fn(&SecretString) + Send + Sync + 'static) {
+        *self.rotation.lock().expect("rotation mutex is never poisoned") = Some(Arc::new(callback));
     }
 
     /// The current refresh token, for saving to the keyring.
@@ -495,10 +515,23 @@ impl TokenSource {
         let grant = token_request(&self.client, form).await?;
 
         if let Some(rotated) = grant.refresh_token {
-            *self.refresh_token.lock().expect("refresh token mutex is never poisoned") = rotated;
+            self.rotate(rotated);
         }
         *cached = Some((grant.access_token.clone(), grant.expires_at));
         Ok(grant.access_token)
+    }
+
+    /// Replace the saved refresh token with a rotated one and tell the
+    /// rotation callback (if any) so a caller that persists it can. Called
+    /// only when the provider actually returns a new refresh token.
+    fn rotate(&self, rotated: SecretString) {
+        *self.refresh_token.lock().expect("refresh token mutex is never poisoned") = rotated.clone();
+        // Cloned out of the lock before it is called: the callback does keyring
+        // I/O, which must not hold a mutex that `refresh_token` also needs.
+        let callback = self.rotation.lock().expect("rotation mutex is never poisoned").clone();
+        if let Some(callback) = callback {
+            callback(&rotated);
+        }
     }
 }
 
@@ -575,6 +608,19 @@ mod tests {
         let now = Instant::now();
         let grant = parse_token_response(200, &format!(r#"{{"access_token":"a","expires_in":{}}}"#, u64::MAX), now).unwrap();
         assert_eq!(grant.expires_at, now + Duration::from_secs(MAX_TOKEN_LIFETIME_SECS));
+    }
+
+    #[test]
+    fn a_rotation_replaces_the_token_and_notifies_the_callback() {
+        let source = TokenSource::from_refresh_token(OAuthClient::google("id", None), SecretString::from("rt-old"));
+        let seen = Arc::new(StdMutex::new(None));
+        let sink = seen.clone();
+        source.on_rotation(move |token| *sink.lock().unwrap() = Some(token.expose_secret().to_string()));
+
+        source.rotate(SecretString::from("rt-new"));
+
+        assert_eq!(source.refresh_token().expose_secret(), "rt-new");
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("rt-new"));
     }
 
     #[test]
