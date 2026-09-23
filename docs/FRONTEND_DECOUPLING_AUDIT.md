@@ -263,11 +263,11 @@ Steps 1 and 2 of #98 are #96 and #97. The rest, in dependency order:
 
 | # | Title | #98 step | Contents | Size |
 |---|---|---|---|---|
-| 3/10 | Make egui optional in the `esmail` package (feature gate) | 6 (early) | a: move `emoji`/`screenshot`/`icons` egui halves out, optional egui deps behind `egui-frontend`, `listener` winit, CI job `cargo check --lib --no-default-features`; gives win32 a compile-time guarantee before the full split | S-M |
-| 4/10 | Shortcuts as data | 3 | `Shortcut{key,mods} -> Command` table and dispatch in the lib; egui adapter; theme conversion in one place | S-M |
-| 5/10 | AppCore skeleton: state types, runtime handle, `pump()` for IMAP events | 4 | move b.12 state, inject a tokio `Handle`, `Changes`, move `handle_imap_events` (b.2) and progress/bulk (b.7) | L |
-| 6/10 | AppCore `pump()`: db, smtp, attachment IO, oauth, toast/tray/shell/listener requests, timers | 4 | b.3, b.6 (part), b.9; one wake-driven pump, `next_deadline()`, remove the 250 ms polling, convert the last raw wake | L |
-| 7/10 | AppCore `dispatch()`: selection, message actions, search, accounts, compose, drafts/outbox | 5 | b.1, b.4, b.5, b.6, b.10; UI stops building actor commands | L |
-| 8/10 | Platform services and CLI in the lib | 7 | `Platform` trait (`open_path`, `open_url`), `listener_client` and `config_saver` to the lib, shared `cli` module for `--quit/--purge-data/--background/--open-account`, toast-click handler through the `Waker` | M |
-| 9/10 | Per-frontend window geometry and presentation state | 7 | opaque per-frontend geometry blob in `config.toml`, `emoji` segmentation/drawing split, colours for `ConnState`/banners out of `ui()` | S-M |
-| 10/10 | Split into `esmail-core` / `esmail-egui`, plus headless `AppCore` tests | 6 | crate split (binary stays `esmail`), tests driving `AppCore` against `mail-mock-server` for the scenarios in f | M-L |
+| 3/10 (#106) | Make egui optional in the `esmail` package (feature gate) | 6 (early) | a: move `emoji`/`screenshot`/`icons` egui halves out, optional egui deps behind `egui-frontend`, `listener` winit, CI job `cargo check --lib --no-default-features`; gives win32 a compile-time guarantee before the full split | S-M |
+| 4/10 (#107) | Shortcuts as data | 3 | `Shortcut{key,mods} -> Command` table and dispatch in the lib; egui adapter; theme conversion in one place | S-M |
+| 5/10 (#108) | AppCore skeleton: state types, runtime handle, `pump()` for IMAP events | 4 | move b.12 state, inject a tokio `Handle`, `Changes`, move `handle_imap_events` (b.2) and progress/bulk (b.7) | L |
+| 6/10 (#109) | AppCore `pump()`: db, smtp, attachment IO, oauth, toast/tray/shell/listener requests, timers | 4 | b.3, b.6 (part), b.9; one wake-driven pump, `next_deadline()`, remove the 250 ms polling, convert the last raw wake | L |
+| 7/10 (#110) | AppCore `dispatch()`: selection, message actions, search, accounts, compose, drafts/outbox | 5 | b.1, b.4, b.5, b.6, b.10; UI stops building actor commands | L |
+| 8/10 (#111) | Platform services and CLI in the lib | 7 | `Platform` trait (`open_path`, `open_url`), `listener_client` and `config_saver` to the lib, shared `cli` module for `--quit/--purge-data/--background/--open-account`, toast-click handler through the `Waker` | M |
+| 9/10 (#112) | Per-frontend window geometry and presentation state | 7 | opaque per-frontend geometry blob in `config.toml`, `emoji` segmentation/drawing split, colours for `ConnState`/banners out of `ui()` | S-M |
+| 10/10 (#113) | Split into `esmail-core` / `esmail-egui`, plus headless `AppCore` tests | 6 | crate split (binary stays `esmail`), tests driving `AppCore` against `mail-mock-server` for the scenarios in f | M-L |
