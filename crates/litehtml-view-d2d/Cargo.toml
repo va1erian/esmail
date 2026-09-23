@@ -1,0 +1,26 @@
+[package]
+name = "litehtml-view-d2d"
+description = "A prototype litehtml webview that lays out HTML with litehtml and paints it with Direct2D through win32ui. Internal to this workspace."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+litehtml.workspace = true
+image.workspace = true
+log.workspace = true
+
+# Windows-only: the Direct2D / DirectWrite backend and the widget host.
+[target.'cfg(windows)'.dependencies]
+win32ui = { git = "https://github.com/va1erian/win32ui.git", branch = "main" }
+
+[dev-dependencies]
+env_logger.workspace = true
+# Only the example writes a PNG (screenshots); the library itself stays free of it.
+png = "0.17"
+# The example can also render a `.eml` fixture, extracting its `text/html` body.
+mailparse.workspace = true
+
+[[example]]
+name = "view"
