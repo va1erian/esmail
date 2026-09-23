@@ -13,6 +13,12 @@ license = "GPL-3.0-only"
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "links", "x11", "wayland"] }
 egui = "0.36.2"
 egui_glow = "0.36.2"
+# Enumerating monitors for off-screen window recovery (window_fit.rs). Must
+# match the winit eframe builds against so `Frame::winit_window()`'s handle
+# type is the same crate instance; it is already in the tree via eframe. No
+# default features, or it would pull winit's Wayland CSD backend on top of
+# eframe's own configuration.
+winit = { version = "0.30", default-features = false }
 
 # HTML/CSS rendering engine for message bodies (litehtml migration -- see
 # PLAN.md). JS-less by design: no legitimate mail client executes JS in HTML

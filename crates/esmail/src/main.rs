@@ -7,7 +7,10 @@ use esmail::{auth, compose, config, contacts, db, emoji, icons, imap, oauth, pat
 mod accounts;
 mod compose_ui;
 mod compose_window;
+mod config_saver;
 mod settings;
+mod window_fit;
+use config_saver::ConfigSaver;
 /// Tray icon + new-mail toasts (B10): the OS-specific side lives behind
 /// `platform`, so nothing below names a platform.
 use esmail::platform;
@@ -270,6 +273,9 @@ struct EsMailApp {
     /// Saved accounts (host/port/username; no passwords — those are in the OS
     /// keyring, see `secrets`). Persisted to `config.toml`.
     config: Config,
+    /// Writes `config.toml` on a background thread so a theme toggle or a
+    /// fold/unfold click never waits on disk I/O. Flushed as the app exits.
+    config_saver: ConfigSaver,
 
     // The "Add account" form.
     host: String,
@@ -578,6 +584,13 @@ impl EsMailApp {
             }
         }
 
+        // Off-screen window recovery (B9): the saved position can name a
+        // monitor that is no longer connected. Windows does not clamp the
+        // window back on screen, so recenter it before the first frame.
+        if config.window.is_some() {
+            recover_offscreen_window(cc);
+        }
+
         // Apply the saved theme (B9) once, up front, rather than defaulting
         // to egui's own built-in dark theme for one frame first -- avoids a
         // visible flash on launch for a user who picked Light.
@@ -714,6 +727,7 @@ impl EsMailApp {
             smtp_tx: smtp_cmd_tx,
             smtp_rx: smtp_evt_rx,
             config,
+            config_saver: ConfigSaver::new(),
             host: host_str,
             port: port_str,
             username: username_str,
@@ -1613,7 +1627,8 @@ impl EsMailApp {
 
     /// Apply `theme` to both `self.config` (so it's saved) and the live
     /// `egui::Context` (so the toggle takes effect immediately, not just on
-    /// the next launch).
+    /// the next launch). The write itself goes to `config_saver`, off this
+    /// thread, so a slow disk can't stall the frame the button was clicked in.
     fn apply_theme(&mut self, ctx: &egui::Context, theme: config::ThemeMode) {
         self.theme = theme;
         self.config.theme = theme;
@@ -1622,25 +1637,21 @@ impl EsMailApp {
             config::ThemeMode::Light => egui::ThemePreference::Light,
             config::ThemeMode::System => egui::ThemePreference::System,
         });
-        if let Err(e) = self.config.save() {
-            log::warn!("could not persist theme preference: {e}");
-        }
+        self.config_saver.save(&self.config);
     }
 
     /// Persist `self.config` after a small preference change (image trust,
-    /// folded folders), logging rather than surfacing a failure: losing the
-    /// preference on the next launch is not worth a banner.
-    fn save_config(&self, what: &str) {
-        if let Err(e) = self.config.save() {
-            log::warn!("could not persist {what}: {e}");
-        }
+    /// folded folders) on the background saver, rather than blocking the
+    /// frame that made the change.
+    fn save_config(&self) {
+        self.config_saver.save(&self.config);
     }
 
     /// Add (`trusted`) or remove `address` on the always-load-images list
     /// and save it if that changed anything.
     fn set_image_sender_trusted(&mut self, address: &str, trusted: bool) {
         if self.config.set_image_trusted(address, trusted) {
-            self.save_config("remote-image sender list");
+            self.save_config();
         }
     }
 
@@ -1683,13 +1694,12 @@ impl EsMailApp {
 
     /// Persist the window's last-tracked outer rect (B9) into `config.toml`,
     /// if the platform ever reported one (see `window_geometry`'s doc).
-    /// Called once when a real close is going through — see `ui()`.
+    /// Called once when a real close is going through — see `ui()`; the
+    /// caller flushes the saver so the write lands before the process exits.
     fn save_window_geometry(&mut self) {
         if let Some(geometry) = self.window_geometry {
             self.config.window = Some(geometry);
-            if let Err(e) = self.config.save() {
-                log::warn!("could not persist window geometry: {e}");
-            }
+            self.config_saver.save(&self.config);
         }
     }
 
@@ -2365,6 +2375,9 @@ impl eframe::App for EsMailApp {
         if closing && !self.geometry_saved_on_close {
             self.geometry_saved_on_close = true;
             self.save_window_geometry();
+            // Block briefly so the write (and any preference saved moments
+            // earlier) is on disk before the process can exit.
+            self.config_saver.flush();
         }
 
         if self.preview {
@@ -2835,7 +2848,7 @@ impl eframe::App for EsMailApp {
                 });
                 if let Some((account, key, collapse)) = toggled_folder {
                     if self.config.set_folder_collapsed(&account, &key, collapse) {
-                        self.save_config("folded mailbox folders");
+                        self.save_config();
                     }
                 }
                 if let Some((account, mb)) = clicked_mailbox {
@@ -3565,6 +3578,46 @@ async fn main() -> eframe::Result {
         native_options,
         Box::new(|cc| Ok(Box::new(EsMailApp::new(cc)))),
     )
+}
+
+/// Move the root window back onto the primary monitor when the position
+/// restored from `config.toml` no longer overlaps any connected monitor (the
+/// screen it was saved on was unplugged, or the layout changed). Windows does
+/// not clamp the window back on screen itself, so without this it is simply
+/// invisible with no way to drag it back. Reads the real monitor rectangles
+/// through winit, then defers the arithmetic to [`window_fit`].
+fn recover_offscreen_window(cc: &eframe::CreationContext<'_>) {
+    let Some(window) = cc.winit_window() else {
+        return;
+    };
+    let Ok(position) = window.outer_position() else {
+        // Wayland and friends don't expose the position; a window there is
+        // never restored to an off-screen spot either, so there is nothing
+        // to recover.
+        return;
+    };
+    let size = window.outer_size();
+    let current = egui::Rect::from_min_size(
+        egui::pos2(position.x as f32, position.y as f32),
+        egui::vec2(size.width as f32, size.height as f32),
+    );
+    let monitor_rect = |monitor: &winit::monitor::MonitorHandle| {
+        let position = monitor.position();
+        let size = monitor.size();
+        egui::Rect::from_min_size(
+            egui::pos2(position.x as f32, position.y as f32),
+            egui::vec2(size.width as f32, size.height as f32),
+        )
+    };
+    let monitors: Vec<egui::Rect> = window.available_monitors().map(|m| monitor_rect(&m)).collect();
+    let Some(primary) = window.primary_monitor() else {
+        return;
+    };
+    let Some(position) = window_fit::recentered_position(current, monitor_rect(&primary), &monitors) else {
+        return;
+    };
+    window.set_outer_position(winit::dpi::PhysicalPosition::new(position.x as i32, position.y as i32));
+    log::info!("saved window position was off-screen; recentered on the primary monitor");
 }
 
 /// A page that exercises the parts of the webview we care about for mail:

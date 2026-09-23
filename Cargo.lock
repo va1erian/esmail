@@ -1286,6 +1286,7 @@ dependencies = [
  "url",
  "windows",
  "windows-registry",
+ "winit",
  "winresource",
 ]
 
