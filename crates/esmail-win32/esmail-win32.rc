@@ -1,0 +1,6 @@
+#include <winres.h>
+
+// Common Controls v6 + per-monitor-v2 DPI for the example binary. The manifest
+// is what gives the tree view the modern themed look; without it Windows falls
+// back to the v5 (Win9x-style) common controls.
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "esmail-win32.manifest"
