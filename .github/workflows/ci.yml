@@ -29,6 +29,18 @@ jobs:
       - name: Build
         run: cargo build
 
+      # The library must not drag in a frontend toolkit: a non-egui consumer
+      # (the future esmail-win32 crate) turns `egui-frontend` off. Fails the
+      # job if egui, eframe, glow or epaint show up in the normal dependency
+      # tree without the feature.
+      - name: Check the library without the egui frontend
+        run: |
+          cargo check --lib -p esmail --no-default-features
+          if cargo tree -p esmail --no-default-features -e normal | grep -i -E "egui|eframe|glow|epaint"; then
+            echo "::error::the esmail library still depends on egui with egui-frontend off"
+            exit 1
+          fi
+
       - name: Run unit tests
         run: cargo test --workspace
 
@@ -69,3 +81,15 @@ jobs:
         run: cargo build
         env:
           RUST_BACKTRACE: 1
+
+      # See build-linux: the library has no egui once `egui-frontend` is off.
+      - name: Check the library without the egui frontend
+        shell: pwsh
+        run: |
+          cargo check --lib -p esmail --no-default-features
+          $tree = cargo tree -p esmail --no-default-features -e normal
+          $matches = $tree | Select-String -Pattern 'egui|eframe|glow|epaint'
+          if ($matches) {
+            Write-Error "the esmail library still depends on egui with egui-frontend off:`n$($matches -join "`n")"
+            exit 1
+          }

@@ -4,7 +4,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use esmail::ipc::message::ToGui;
-use esmail::{auth, compose, config, contacts, db, emoji, icons, imap, oauth, paths, progress, render, screenshot, search_query, secrets, session, shell, smtp, uninstall};
+use esmail::{auth, compose, config, contacts, db, emoji, icons, imap, oauth, paths, progress, render, search_query, secrets, session, shell, smtp, uninstall};
 use esmail::view_model::{
     RowModel, export_file_name, find_special_use_mailbox, format_size, progress_label,
     safe_attachment_filename, select_range,
@@ -14,8 +14,10 @@ mod accounts;
 mod compose_ui;
 mod compose_window;
 mod config_saver;
+mod emoji_paint;
 mod listener;
 mod listener_client;
+mod screenshot;
 mod settings;
 mod window_fit;
 use config_saver::ConfigSaver;
@@ -40,6 +42,14 @@ use session::{AccountEvent, AccountId, AccountSession, Hooks, SessionParams};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// The egui view of an [`icons::Rgba`]. The `From` impl used to live in the
+/// library, but that would drag egui into it; the conversion belongs on the
+/// frontend side, and the orphan rule keeps an `impl From` for two foreign
+/// types out (see the decoupling audit).
+fn icon_data(icon: icons::Rgba) -> egui::IconData {
+    egui::IconData { rgba: icon.pixels, width: icon.width, height: icon.height }
+}
 
 /// Image-loading policy for the single [`WebView`] esmail reuses to show
 /// every message body.
@@ -852,7 +862,7 @@ impl EsMailApp {
             compose_windows: Vec::new(),
             compose_registry,
             next_compose_id: 0,
-            window_icon: icons::window_icon().map(|icon| Arc::new(egui::IconData::from(icon))),
+            window_icon: icons::window_icon().map(|icon| Arc::new(icon_data(icon))),
             confirm_quit: false,
             next_req_id: 0,
             current_headers_req: 0,
@@ -3070,7 +3080,7 @@ impl eframe::App for EsMailApp {
                                     // character: egui's bundled fonts have no
                                     // such glyph, and it came out as a box.
                                     let rect = response.rect.expand(2.0);
-                                    if !emoji::paint_in_rect(ui.ctx(), ui.painter(), rect, "\u{2709}\u{fe0f}") {
+                                    if !emoji_paint::paint_in_rect(ui.ctx(), ui.painter(), rect, "\u{2709}\u{fe0f}") {
                                         ui.painter().circle_filled(response.rect.center(), 4.0, status_color);
                                         return;
                                     }
@@ -3775,7 +3785,7 @@ fn message_row(ui: &mut egui::Ui, row: &RowModel, selected: bool) -> egui::Respo
         if unread {
             painter.galley(sender_pos + egui::vec2(0.5, 0.0), sender_galley.clone(), sender_color);
         }
-        emoji::paint(ui.ctx(), painter, &sender_galley, sender_pos, &sender_text.emoji);
+        emoji_paint::paint(ui.ctx(), painter, &sender_galley, sender_pos, &sender_text.emoji);
         let right = rect.right() - PAD_X;
         // The smaller timestamps are bottom-aligned to the text they share a
         // line with, so they sit on its baseline instead of floating at the
@@ -3794,7 +3804,7 @@ fn message_row(ui: &mut egui::Ui, row: &RowModel, selected: bool) -> egui::Respo
             painter.galley(egui::pos2(right - date.size().x, y), date, subject_color);
         }
         painter.galley(subject_pos, subject_galley.clone(), subject_color);
-        emoji::paint(ui.ctx(), painter, &subject_galley, subject_pos, &subject_text.emoji);
+        emoji_paint::paint(ui.ctx(), painter, &subject_galley, subject_pos, &subject_text.emoji);
         painter.hline(rect.x_range(), rect.bottom(), separator);
     }
 
@@ -3906,7 +3916,7 @@ async fn run_gui() -> eframe::Result {
     // startup is a small price for not widening `EsMailApp::new` any further.
     let mut viewport = egui::ViewportBuilder::default().with_inner_size([1280.0, 720.0]);
     if let Some(icon) = icons::window_icon() {
-        viewport = viewport.with_icon(egui::IconData::from(icon));
+        viewport = viewport.with_icon(icon_data(icon));
     }
     if let Some(geometry) = config::Config::load().window {
         viewport = viewport
