@@ -10,6 +10,7 @@ use anyhow::anyhow;
 
 use crate::auth::{Auth, XOAuth2};
 use crate::oauth::SignInExpired;
+use crate::progress::{Progress, ProgressKind};
 
 /// How many times [`ImapActor::ensure_connected`] retries a lost connection
 /// before giving up and reporting the error to the UI.
@@ -495,7 +496,12 @@ pub enum ImapEvent {
     /// it does for `Body` and replaces the placeholder with a real message
     /// instead of leaving it stuck.
     BodyFailed { uid: u32, req_id: u64, error: String },
-    DownloadProgress { current: u32, total: u32 },
+    /// Progress for a middle-to-long operation this actor (or its body
+    /// worker) owns, so the UI's status bar can say what is happening
+    /// (issue #79). One operation is shown at a time; a later report for a
+    /// different `kind` simply replaces the previous one. Terminal events
+    /// (`Exported`, `Appended`, ...) tell the UI to clear it.
+    Progress { kind: ProgressKind, progress: Progress },
     /// Reply to `ExportMessage`: the message's raw source was written to `path`.
     Exported { path: std::path::PathBuf },
     /// `ExportMessage` failed (fetching the message or writing the file).
@@ -722,6 +728,13 @@ impl ImapActor {
                         continue;
                     }
                     let session = self.session.as_mut().expect("ensure_connected just verified this");
+                    // The body upload can take a while for a message with
+                    // large attachments and looks identical to a hang, so say
+                    // what is happening before it starts (issue #79).
+                    let _ = self
+                        .event_tx
+                        .send(ImapEvent::Progress { kind: ProgressKind::Append, progress: Progress::Indeterminate })
+                        .await;
                     match session.append(&mailbox, &raw).await {
                         Ok(()) => {
                             let _ = self.event_tx.send(ImapEvent::Appended { mailbox }).await;
@@ -1020,7 +1033,9 @@ impl ImapActor {
             return Ok(());
         }
 
-        let _ = event_tx.send(ImapEvent::DownloadProgress { current: 0, total }).await;
+        let _ = event_tx
+            .send(ImapEvent::Progress { kind: ProgressKind::Index, progress: Progress::Counted { current: 0, total } })
+            .await;
 
         // Fetch all UIDs and Envelopes first to get metadata
         let query = format!("1:{}", total);
@@ -1054,10 +1069,12 @@ impl ImapActor {
                 attachments,
             }).await;
 
-            let _ = event_tx.send(ImapEvent::DownloadProgress {
-                current: (i + 1) as u32,
-                total,
-            }).await;
+            let _ = event_tx
+                .send(ImapEvent::Progress {
+                    kind: ProgressKind::Index,
+                    progress: Progress::Counted { current: (i + 1) as u32, total },
+                })
+                .await;
         }
 
         Ok(())

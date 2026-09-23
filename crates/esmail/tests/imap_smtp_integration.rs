@@ -17,6 +17,7 @@ use std::time::Duration;
 use esmail::compose::ComposeState;
 use esmail::idle_watch;
 use esmail::imap::{ImapActor, ImapCommand, ImapEvent};
+use esmail::progress::{Progress, ProgressKind};
 use esmail::smtp::{SmtpAccount, SmtpActor, SmtpCommand, SmtpEvent};
 use esmail::auth::Auth;
 use tokio::sync::mpsc;
@@ -302,7 +303,7 @@ async fn bulk_download_streams_every_message_with_progress() {
     let final_progress = loop {
         match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
             ImapEvent::MailData { .. } => mail_data_count += 1,
-            ImapEvent::DownloadProgress { current, total } => {
+            ImapEvent::Progress { kind: ProgressKind::Index, progress: Progress::Counted { current, total } } => {
                 assert_eq!(total, 12);
                 if current == total {
                     break current;
@@ -339,7 +340,7 @@ async fn bulk_download_does_not_block_a_concurrent_header_fetch() {
     let headers_arrived_while_bulk_still_running = loop {
         match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
             ImapEvent::Headers { req_id: 42, .. } => break !bulk_download_finished,
-            ImapEvent::DownloadProgress { current, total } => {
+            ImapEvent::Progress { kind: ProgressKind::Index, progress: Progress::Counted { current, total } } => {
                 if current == total {
                     bulk_download_finished = true;
                 }
@@ -621,6 +622,12 @@ async fn append_saves_a_sent_copy_that_fetch_headers_can_then_see() {
     assert!(String::from_utf8_lossy(&raw).contains("Copy me to Sent"), "raw bytes should be the actual sent message");
 
     h.imap_cmd.send(ImapCommand::Append { mailbox: "Sent".to_string(), raw }).await.unwrap();
+    // #79: the append reports it is in flight (an indeterminate step -- a
+    // large upload has no count) before its terminal event.
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Progress { kind: ProgressKind::Append, progress: Progress::Indeterminate } => {}
+        other => panic!("expected an Append progress report, got {other:?}"),
+    }
     match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
         ImapEvent::Appended { mailbox } => assert_eq!(mailbox, "Sent"),
         other => panic!("expected Appended, got {other:?}"),

@@ -17,6 +17,7 @@ pub mod imap;
 pub mod notify;
 pub mod oauth;
 pub mod paths;
+pub mod progress;
 pub mod render;
 pub mod screenshot;
 pub mod search_query;
