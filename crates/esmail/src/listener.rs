@@ -183,7 +183,12 @@ async fn serve(server: Server<LocalSocket>, mut tray: mpsc::UnboundedReceiver<Tr
             action = tray.recv() => match action {
                 Some(TrayAction::Quit) | None => break,
                 Some(TrayAction::Show) => {
-                    log::info!("listener: tray Open clicked (the GUI client arrives in phase 3)");
+                    // Raise the GUI through the same request file a second
+                    // launch writes, so this works whether or not the listener
+                    // currently has an ipc client (a GUI in fallback mode).
+                    if let Err(e) = shell::send_request(&shell::Request::Show) {
+                        log::warn!("listener: could not ask the GUI to show: {e}");
+                    }
                 }
             },
         }

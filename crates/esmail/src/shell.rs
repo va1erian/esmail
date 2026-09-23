@@ -11,8 +11,10 @@
 //!   the Start menu, say) must bring the existing window back rather than start
 //!   a second process fighting over the same cache. The first instance holds an
 //!   exclusive lock on a file in the data directory; a later launch fails to
-//!   take it, drops a request file next to it (`show`, or `quit` for the
-//!   installer) and exits. The running instance polls for that file.
+//!   take it, drops a request file next to it (`show`, `open-account` for
+//!   `--open-account`, or `quit` for the installer) and exits. The running
+//!   instance polls for that file. The background listener raises the GUI the
+//!   same way when its tray's "Show esMail" is clicked.
 //! * **Taskbar theme** query, so the tray icon can be light or dark.
 
 #![forbid(unsafe_code)]
@@ -30,21 +32,26 @@ const DISPLAY_NAME: &str = "esMail";
 const LOCK_FILE: &str = "esmail.lock";
 
 /// What a later launch of esMail can ask the running one to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// Come to the front (an ordinary second launch).
+    /// Come to the front (an ordinary second launch, or the listener's tray).
     Show,
+    /// Come to the front and select this account (`esmail --open-account`).
+    OpenAccount(String),
     /// Exit cleanly (`esmail --quit`, which the installer uses before it
     /// replaces or removes the program files).
     Quit,
 }
 
-impl Request {
-    const ALL: [Request; 2] = [Request::Quit, Request::Show];
+/// Every request file. The open-account one carries the account id as its
+/// contents; the others are empty.
+const REQUEST_FILES: [&str; 3] = ["quit.request", "show.request", "open-account.request"];
 
-    fn file_name(self) -> &'static str {
+impl Request {
+    fn file_name(&self) -> &'static str {
         match self {
             Request::Show => "show.request",
+            Request::OpenAccount(_) => "open-account.request",
             Request::Quit => "quit.request",
         }
     }
@@ -61,7 +68,7 @@ pub enum Instance {
 /// however that happens).
 static LOCK: OnceLock<File> = OnceLock::new();
 
-fn request_path(request: Request) -> Option<PathBuf> {
+fn request_path(request: &Request) -> Option<PathBuf> {
     crate::paths::data_dir().map(|dir| dir.join(request.file_name()))
 }
 
@@ -85,8 +92,8 @@ fn acquire_in(dir: &std::path::Path) -> Instance {
             // Requests left behind by an instance that died before reading
             // them must not be obeyed by this one (a stale `quit` would close
             // it the moment it starts).
-            for request in Request::ALL {
-                let _ = fs::remove_file(dir.join(request.file_name()));
+            for file in REQUEST_FILES {
+                let _ = fs::remove_file(dir.join(file));
             }
             let _ = LOCK.set(file);
             Instance::First
@@ -98,15 +105,35 @@ fn acquire_in(dir: &std::path::Path) -> Instance {
 
 /// Ask the running instance to do `request`. Call after
 /// [`acquire_single_instance`] returned [`Instance::AlreadyRunning`].
-pub fn send_request(request: Request) -> io::Result<()> {
+pub fn send_request(request: &Request) -> io::Result<()> {
     let path = request_path(request).ok_or_else(|| io::Error::other("no data directory"))?;
-    fs::write(path, b"")
+    let payload = match request {
+        Request::OpenAccount(account) => account.as_bytes(),
+        Request::Show | Request::Quit => &[],
+    };
+    fs::write(path, payload)
 }
 
 /// The request a later launch left for this instance, if any, consuming it.
 /// Cheap enough to call from the UI loop.
 pub fn take_request() -> Option<Request> {
-    Request::ALL.into_iter().find(|request| request_path(*request).is_some_and(|path| fs::remove_file(path).is_ok()))
+    crate::paths::data_dir().and_then(|dir| take_request_in(&dir))
+}
+
+fn take_request_in(dir: &std::path::Path) -> Option<Request> {
+    for file in REQUEST_FILES {
+        let path = dir.join(file);
+        let Ok(payload) = fs::read_to_string(&path) else { continue };
+        if fs::remove_file(&path).is_err() {
+            continue;
+        }
+        return Some(match file {
+            "quit.request" => Request::Quit,
+            "open-account.request" => Request::OpenAccount(payload.trim().to_string()),
+            _ => Request::Show,
+        });
+    }
+    None
 }
 
 /// Give the AppUserModelID a display name and icon for toast notifications.
@@ -225,11 +252,23 @@ mod tests {
     fn a_free_lock_is_taken_and_stale_requests_are_discarded() {
         let dir = scratch("stale");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(Request::Quit.file_name()), b"").unwrap();
-        fs::write(dir.join(Request::Show.file_name()), b"").unwrap();
+        for file in REQUEST_FILES {
+            fs::write(dir.join(file), b"").unwrap();
+        }
         assert_eq!(acquire_in(&dir), Instance::First);
-        assert!(!dir.join(Request::Quit.file_name()).exists(), "a stale quit would close the new instance");
-        assert!(!dir.join(Request::Show.file_name()).exists());
+        for file in REQUEST_FILES {
+            assert!(!dir.join(file).exists(), "a stale {file} must not survive into the new instance");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_open_account_request_carries_its_account_id() {
+        let dir = scratch("open-account");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(Request::OpenAccount(String::new()).file_name()), b"alice@example.com\n").unwrap();
+        assert_eq!(take_request_in(&dir), Some(Request::OpenAccount("alice@example.com".into())));
+        assert!(!dir.join("open-account.request").exists(), "the request is consumed once");
         let _ = fs::remove_dir_all(dir);
     }
 }

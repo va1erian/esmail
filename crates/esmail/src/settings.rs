@@ -183,6 +183,7 @@ impl EsMailApp {
                 Action::CancelSignIn(id) => self.cancel_google_sign_in(&id),
                 Action::Remove(id) => {
                     self.remove_account(&id);
+                    self.listener.notify_config_changed();
                     if state.account.as_ref().is_some_and(|d| d.id == id) {
                         state.account = None;
                     }
@@ -455,6 +456,9 @@ impl EsMailApp {
         if let Err(e) = self.config.save() {
             self.push_banner(format!("Could not save the account: {e}"));
         }
+        // The listener watches the same accounts: reload now rather than on
+        // its own next event.
+        self.listener.notify_config_changed();
 
         if switching_to_google {
             // The account keeps its old sign-in until Google has approved:
@@ -485,6 +489,7 @@ impl EsMailApp {
             Ok(()) => self.status = "Settings saved".to_string(),
             Err(e) => self.push_banner(format!("Could not save settings: {e}")),
         }
+        self.listener.notify_config_changed();
         // A first-time user who has just configured a client and is looking
         // at the Gmail defaults most likely wants Sign in with Google.
         if self.config.accounts.is_empty()
