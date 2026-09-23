@@ -5,7 +5,10 @@
 
 use esmail::ipc::message::ToGui;
 use esmail::{auth, compose, config, contacts, db, emoji, icons, imap, oauth, paths, progress, render, screenshot, search_query, secrets, session, shell, smtp, uninstall};
-use esmail::view_model::{export_file_name, find_special_use_mailbox, format_size, progress_label, safe_attachment_filename, select_range, RowModel};
+use esmail::view_model::{
+    RowModel, export_file_name, find_special_use_mailbox, format_size, progress_label,
+    safe_attachment_filename, select_range,
+};
 use progress::{Progress, ProgressKind};
 mod accounts;
 mod compose_ui;
