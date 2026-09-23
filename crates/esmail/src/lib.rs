@@ -1,5 +1,7 @@
 //! Library half of the `esmail` crate: `main.rs` (the binary) builds the
-//! eframe/egui app on top of these modules. Split out as a library purely so
+//! eframe/egui app on top of these modules -- as the default `egui-frontend`
+//! feature, so a non-egui consumer can turn it off and link the library
+//! without egui. Split out as a library purely so
 //! `tests/imap_smtp_integration.rs` (an external test crate) can drive
 //! `ImapActor`/`SmtpActor` directly against `mail-mock-server` — nothing
 //! about the app's own structure or module boundaries changes.
@@ -20,7 +22,6 @@ pub mod oauth;
 pub mod paths;
 pub mod progress;
 pub mod render;
-pub mod screenshot;
 pub mod search_query;
 pub mod secrets;
 pub mod session;

@@ -24,12 +24,6 @@ pub struct Rgba {
     pub height: u32,
 }
 
-impl From<Rgba> for egui::IconData {
-    fn from(icon: Rgba) -> Self {
-        Self { rgba: icon.pixels, width: icon.width, height: icon.height }
-    }
-}
-
 fn decode(png: &[u8]) -> Option<Rgba> {
     let image = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?.into_rgba8();
     let (width, height) = image.dimensions();
