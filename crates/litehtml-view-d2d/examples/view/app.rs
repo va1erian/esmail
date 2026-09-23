@@ -10,8 +10,6 @@
 //! exits (the capture path is guarded by a timer so a render always has an
 //! exit path). `--width`/`--height` set the window size in design units.
 
-#![cfg(windows)]
-
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -49,7 +47,7 @@ const DEMO: &str = r#"<!doctype html>
 <h2 id="bottom">Bottom of the page</h2>
 "#;
 
-fn main() {
+pub(crate) fn main() {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
