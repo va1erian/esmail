@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use win32ui::d2d::{D2dCanvas, RectF, TextSystem};
 use win32ui::gdi::Canvas;
 use win32ui::{
-    Color, CustomWidget, CursorShape, Hwnd, Input, Key, MouseButton, Rect as PxRect, Size, Theme,
-    WidgetCx,
+    Color, CustomWidget, CursorShape, Hwnd, Input, Key, MouseButton, Rect as PxRect, Renderer,
+    Size, Theme, WidgetCx,
 };
 
 use crate::geom::{Point, Rect};
@@ -281,6 +281,10 @@ impl CustomWidget for HtmlWidget {
 
     // This widget is Direct2D-only; the GDI fallback (used only when Direct2D
     // cannot create a surface) leaves the page blank.
+    fn renderer(&self) -> Renderer {
+        Renderer::Direct2D
+    }
+
     fn paint(&self, _canvas: &Canvas, _bounds: PxRect, _theme: &Theme) {}
 
     fn paint_d2d(&self, canvas: &mut D2dCanvas, bounds: RectF, _theme: &Theme) {

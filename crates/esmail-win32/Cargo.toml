@@ -1,0 +1,29 @@
+[package]
+name = "esmail-win32"
+description = "The esMail message list rebuilt as a reusable win32ui component (Direct2D + DirectWrite, virtualized). Internal to this workspace."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true
+
+# Windows-only: the Direct2D/DirectWrite backend, the widget host, and the
+# `esmail` library half (for `view_model::RowModel`).
+[target.'cfg(windows)'.dependencies]
+esmail = { path = "../esmail" }
+win32ui = { git = "https://github.com/va1erian/win32ui.git", branch = "main" }
+
+[dev-dependencies]
+env_logger.workspace = true
+# Only the example writes a PNG (screenshots); the library itself stays free of it.
+png = "0.17"
+
+# `build.rs` only embeds the example's Common Controls v6 manifest on Windows;
+# the crate itself is plain Rust and builds everywhere.
+[build-dependencies]
+embed-resource = "3"
+
+[[example]]
+name = "message_list"
