@@ -133,8 +133,9 @@ fn add_prefix(subject: &str, prefix: &str) -> String {
 
 /// Split a comma-joined address field (as `imap.rs`'s envelope parsing and
 /// `MailHeader.to` produce it) back into its individual `"Name <user@host>"`
-/// entries.
-fn split_addresses(field: &str) -> Vec<String> {
+/// entries. `pub(crate)` for `contacts.rs`, which splits recipient fields the
+/// same way.
+pub(crate) fn split_addresses(field: &str) -> Vec<String> {
     field.split(',').map(str::trim).filter(|a| !a.is_empty()).map(str::to_string).collect()
 }
 

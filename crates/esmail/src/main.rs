@@ -3,8 +3,9 @@
 // builds keep the console so `cargo run` shows the log.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use esmail::{auth, compose, config, db, emoji, icons, imap, oauth, paths, render, screenshot, search_query, secrets, session, shell, smtp, uninstall};
+use esmail::{auth, compose, config, contacts, db, emoji, icons, imap, oauth, paths, render, screenshot, search_query, secrets, session, shell, smtp, uninstall};
 mod accounts;
+mod compose_ui;
 mod compose_window;
 mod settings;
 /// Tray icon + new-mail toasts (B10): the OS-specific side lives behind
@@ -1413,11 +1414,27 @@ impl EsMailApp {
     /// Declares every compose window to egui; called each frame the main
     /// window is drawn (see `ComposeWindow::show`).
     fn show_compose_windows(&self, ctx: &egui::Context) {
+        if self.compose_windows.is_empty() {
+            return;
+        }
         let accounts: Vec<(String, String)> =
             self.accounts.iter().map(|v| (v.id().to_string(), v.label().to_string())).collect();
+        // One shared contact set for every window this frame: it is the same
+        // for all of them and can be a few hundred addresses.
+        let contacts = std::sync::Arc::new(self.recipient_contacts());
         for window in &self.compose_windows {
-            window.show(ctx, accounts.clone(), self.window_icon.clone());
+            window.show(ctx, accounts.clone(), contacts.clone(), self.window_icon.clone());
         }
+    }
+
+    /// Addresses compose windows offer as recipient autocomplete: everyone in
+    /// the loaded mailbox and any open search results, plus the accounts' own
+    /// addresses. Rebuilt from what is in memory each frame -- there is no
+    /// persistent address book yet (see #62).
+    fn recipient_contacts(&self) -> contacts::Contacts {
+        let headers = self.headers.iter().chain(self.search_results.iter().flatten());
+        let own = self.config.accounts.iter().map(|account| account.username.as_str());
+        contacts::Contacts::from_headers(headers, own)
     }
 
     /// The "unsent messages" question raised by [`Self::request_quit`].

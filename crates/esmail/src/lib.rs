@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod compose;
 pub mod config;
+pub mod contacts;
 pub mod css;
 pub mod db;
 pub mod emoji;
