@@ -34,6 +34,7 @@
 //! isn't user-visible and so doesn't need to be prompt.
 
 use super::*;
+use esmail::contacts::Contacts;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Where the caret goes when a window first opens.
@@ -46,28 +47,34 @@ pub(super) enum Focus {
 }
 
 /// The state the window and the app share.
-struct Shared {
-    state: ComposeState,
+pub(super) struct Shared {
+    pub(super) state: ComposeState,
     /// What the window opened with; `state != initial` means there is
     /// something to lose ([`ComposeWindow::is_dirty`]).
-    initial: ComposeState,
+    pub(super) initial: ComposeState,
     /// `(account id, label)` for the From selector, refreshed by the app
     /// every frame it draws the main window.
-    accounts: Vec<(String, String)>,
+    pub(super) accounts: Vec<(String, String)>,
+    /// Recipient autocomplete candidates, refreshed by the app the same way
+    /// `accounts` is (see [`Contacts`]).
+    pub(super) contacts: Arc<Contacts>,
+    /// Autocomplete state for whichever recipient field has focus; only one
+    /// can, so there is one of these rather than one per field.
+    pub(super) suggest: compose_ui::SuggestState,
     /// The last thing that went wrong (a failed send, an unreadable
     /// attachment); shown in red until the next Send.
-    error: Option<String>,
+    pub(super) error: Option<String>,
     /// A send is in flight: the form is locked and Send is disabled.
-    sending: bool,
+    pub(super) sending: bool,
     /// Send was clicked; the app takes this in `logic()`.
-    send_requested: bool,
+    pub(super) send_requested: bool,
     /// The user chose to be done with the message (Discard, or confirmed
     /// closing the OS window): the app drops the window.
-    finished: bool,
+    pub(super) finished: bool,
     /// The "discard this unsent message?" question is showing in place of the
     /// buttons.
-    confirm_discard: bool,
-    focus: Option<Focus>,
+    pub(super) confirm_discard: bool,
+    pub(super) focus: Option<Focus>,
 }
 
 /// Cheap to clone (an id plus an `Arc`): a copy lives in `EsMailApp`'s
@@ -86,6 +93,8 @@ impl ComposeWindow {
             initial: state.clone(),
             state,
             accounts: Vec::new(),
+            contacts: Arc::new(Contacts::default()),
+            suggest: compose_ui::SuggestState::default(),
             error: None,
             sending: false,
             send_requested: false,
@@ -199,10 +208,17 @@ impl ComposeWindow {
 
     /// Declares the window for this frame. Must be called every frame the
     /// main window draws, or egui closes the OS window (see the module docs).
-    pub(super) fn show(&self, ctx: &egui::Context, accounts: Vec<(String, String)>, icon: Option<Arc<egui::IconData>>) {
+    pub(super) fn show(
+        &self,
+        ctx: &egui::Context,
+        accounts: Vec<(String, String)>,
+        contacts: Arc<Contacts>,
+        icon: Option<Arc<egui::IconData>>,
+    ) {
         let title = {
             let mut s = self.lock();
             s.accounts = accounts;
+            s.contacts = contacts;
             if s.state.subject.trim().is_empty() {
                 "New message — esMail".to_string()
             } else {
@@ -220,7 +236,7 @@ impl ComposeWindow {
         ctx.show_viewport_deferred(self.viewport_id(), builder, move |ui, _class| {
             let mut s = shared.lock().unwrap_or_else(PoisonError::into_inner);
             let before = (s.send_requested, s.finished);
-            draw(ui, &mut s);
+            compose_ui::draw(ui, &mut s);
             if (s.send_requested, s.finished) != before {
                 // Only the main viewport's `logic()` acts on these.
                 ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
@@ -239,170 +255,11 @@ impl ComposeWindow {
 /// past it without asking is how a message the user just discarded still got
 /// sent and filed to Sent behind their back (#34 review) -- that case goes
 /// through the same confirmation as the close button.
-fn discard_clicked(s: &mut Shared) {
+pub(super) fn discard_clicked(s: &mut Shared) {
     if s.sending {
         s.confirm_discard = true;
     } else {
         s.finished = true;
-    }
-}
-
-fn draw(ui: &mut egui::Ui, s: &mut Shared) {
-    let ctx = ui.ctx().clone();
-
-    // Something would be lost by closing right now: unsaved typing, or a
-    // send that's still in flight (there's no cancelling it once issued --
-    // see `smtp.rs` -- so walking away from it silently would either lose
-    // the message from view while it still gets sent, or, if it fails,
-    // leave the error with nobody to show it to). An unedited Reply/Forward
-    // sent as-is (`state == initial`) is exactly the case `state` alone
-    // would miss.
-    let unsent = s.state != s.initial || s.sending;
-
-    // The OS window's own close button (or Alt+F4). Unsent text or an
-    // in-flight send is asked about first; otherwise the app is told to
-    // drop the window.
-    if ctx.input(|i| i.viewport().close_requested()) {
-        if unsent && !s.finished {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            s.confirm_discard = true;
-        } else {
-            s.finished = true;
-        }
-    }
-
-    // Ctrl+Enter sends. Consumed up front so the text field does not also
-    // insert a line break.
-    let ctrl_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
-    let mut send = ctrl_enter && !s.sending && !s.confirm_discard;
-
-    egui::Panel::bottom("compose_actions").show(ui, |ui| {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if s.confirm_discard {
-                if s.sending {
-                    ui.label("A send is still in progress and can't be stopped -- discard this window anyway?");
-                } else {
-                    ui.label("Discard this unsent message?");
-                }
-                if ui.button("Discard").clicked() {
-                    s.finished = true;
-                }
-                if ui.button("Keep editing").clicked() {
-                    s.confirm_discard = false;
-                }
-            } else {
-                if ui.add_enabled(!s.sending, egui::Button::new("Send")).on_hover_text("Ctrl+Enter").clicked() {
-                    send = true;
-                }
-                if ui.button("Discard").clicked() {
-                    discard_clicked(s);
-                }
-                if s.sending {
-                    ui.spinner();
-                    ui.weak("Sending…");
-                } else if let Some(error) = &s.error {
-                    ui.label(egui::RichText::new(error).color(egui::Color32::RED));
-                }
-            }
-        });
-        ui.add_space(4.0);
-    });
-
-    egui::CentralPanel::default().show(ui, |ui| {
-        let Shared { state, accounts, error, sending, focus, .. } = &mut *s;
-        ui.add_enabled_ui(!*sending, |ui| {
-            egui::Grid::new("compose_grid").num_columns(2).show(ui, |ui| {
-                // Which account this is sent from -- and whose Sent folder
-                // gets the copy. Chosen when the window opened (the account
-                // of the message being replied to, else the active one).
-                ui.label("From:");
-                let selected = state
-                    .account_id
-                    .as_deref()
-                    .and_then(|id| accounts.iter().find(|(a, _)| a == id))
-                    .map_or("(choose an account)", |(_, label)| label.as_str());
-                egui::ComboBox::from_id_salt("compose_from").selected_text(selected).show_ui(ui, |ui| {
-                    for (id, label) in accounts.iter() {
-                        ui.selectable_value(&mut state.account_id, Some(id.clone()), label);
-                    }
-                });
-                ui.end_row();
-
-                ui.label("To:");
-                let to = ui.add(egui::TextEdit::singleline(&mut state.to).desired_width(f32::INFINITY));
-                if matches!(focus, Some(Focus::To)) {
-                    to.request_focus();
-                    *focus = None;
-                }
-                ui.end_row();
-
-                ui.label("Cc:");
-                ui.add(egui::TextEdit::singleline(&mut state.cc).desired_width(f32::INFINITY));
-                ui.end_row();
-
-                ui.label("Bcc:");
-                ui.add(egui::TextEdit::singleline(&mut state.bcc).desired_width(f32::INFINITY));
-                ui.end_row();
-
-                ui.label("Subject:");
-                ui.add(egui::TextEdit::singleline(&mut state.subject).desired_width(f32::INFINITY));
-                ui.end_row();
-            });
-
-            ui.separator();
-
-            let mut remove = None;
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Attach file…").clicked() {
-                    // Not parented to this window: egui hands a viewport's
-                    // callback no native window handle to parent it to.
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        match std::fs::read(&path) {
-                            Ok(data) => {
-                                let filename = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| "attachment".to_string());
-                                state.attachments.push((filename, data));
-                            }
-                            Err(e) => {
-                                *error = Some(format!("Could not read {}: {e}", path.display()));
-                            }
-                        }
-                    }
-                }
-                for (i, (filename, data)) in state.attachments.iter().enumerate() {
-                    ui.label(format!("{filename} ({})", format_size(data.len())));
-                    if ui.small_button("✕").on_hover_text("Remove").clicked() {
-                        remove = Some(i);
-                    }
-                }
-            });
-            if let Some(i) = remove {
-                state.attachments.remove(i);
-            }
-
-            // The body takes whatever room is left and scrolls past it, so it
-            // follows the window as it is resized.
-            let room = ui.available_size();
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                let body = ui.add(
-                    egui::TextEdit::multiline(&mut state.body)
-                        .desired_width(f32::INFINITY)
-                        .min_size(room),
-                );
-                if matches!(focus, Some(Focus::Body)) {
-                    body.request_focus();
-                    *focus = None;
-                }
-            });
-        });
-    });
-
-    if send {
-        s.send_requested = true;
-        s.error = None;
     }
 }
 
