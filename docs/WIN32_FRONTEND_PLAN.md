@@ -43,6 +43,25 @@ The route is three tracks that can run partly in parallel:
   screenshots.
 - `windows` crate (not `windows-sys`): the COM APIs (Direct2D, DirectWrite,
   task dialog, UI Automation) need it.
+- **2026-09-23: win32ui gets a widget layer above the Win32 model**
+  ([README → Architecture](https://github.com/va1erian/win32ui#architecture)).
+  Rust doesn't do widget class hierarchies well, and Win32's synchronous
+  re-entry makes `Rc<RefCell>` callback designs panic. So:
+  - widget events are mapped to the app's own `Msg` and delivered to an
+    `App::update(&mut self, msg, ui)` that is never re-entered
+    ([#33](https://github.com/va1erian/win32ui/issues/33));
+  - shared behaviour comes from `AsControl`/`ControlExt` and capability traits;
+  - there are no control ids;
+  - the window owns a layout tree
+    ([#34](https://github.com/va1erian/win32ui/issues/34));
+  - models are typed (`ListView<T>`, `TreeView<K>`, `ComboBox<T>`);
+  - design values are `Dip` ([#32](https://github.com/va1erian/win32ui/issues/32));
+  - worker threads use `Proxy<Msg>` ([#4](https://github.com/va1erian/win32ui/issues/4)).
+
+  The platform layer (`Window`/`WindowHandler`/`Message`) stays as the
+  escape hatch. **For esMail this lines up exactly with §3:** the frontend's
+  `Msg` *is* `esmail_core::app::Intent` (plus purely-UI messages), the core's
+  `Waker` is a `Proxy`, and `apply(Changes)` happens in `update`.
 
 ---
 
@@ -450,17 +469,19 @@ depends on it.
 
 ```
 crates/esmail-win32/src/
-  main.rs            init, --background dispatch, single-instance/IPC, run()
-  app.rs             MainWindow: WindowHandler owning AppCore + views; Wake → pump → apply(Changes)
-  layout.rs          toolbar / splitter(tree | list | reading) / status bar
-  views/mailbox_tree.rs   TreeView + TreeSource over AppCore::mailbox_rows
-  views/message_list.rs   ListView + row painter (DirectWrite: bold unread, accent bar, colour emoji)
-  views/reading_pane.rs   header block, remote-images bar, attachment chips, WebViewControl
-  views/banner.rs         error/info banners (custom control)
-  compose.rs         one top-level Window per ComposeId (Edit controls, From ComboBox, attachments)
-  settings.rs        owned modal window with Tab control; account dialog
-  accelerators.rs    from core's shortcut table
-  theme.rs           system light/dark + accent → win32ui Theme; WM_SETTINGCHANGE
+  main.rs            init, --background dispatch, single-instance/IPC, win32ui::run_app
+  app.rs             MainWindow: impl win32ui::App { type Msg = UiMsg } owning AppCore + widgets;
+                     UiMsg = Intent(Intent) | CoreWoke | UI-only messages;
+                     AppCore's Waker is a win32ui Proxy sending CoreWoke → update: pump → apply(Changes)
+  layout.rs          ui.set_layout(column![toolbar, split_row![tree, split_row![list, reading]], status])
+  views/mailbox_tree.rs   TreeView<MailboxKey> over AppCore::mailbox_rows (badges via NodeStyle)
+  views/message_list.rs   ListView<RowModel> + row painter (bold unread, accent bar, colour emoji)
+  views/reading_pane.rs   header block, remote-images bar, attachment chips (CustomWidget), WebView widget
+  views/banner.rs         error/info banners (CustomWidget)
+  compose.rs         one top-level App window per ComposeId (Edit, ComboBox<AccountId>, attachments)
+  settings.rs        modal window with tabs![…]; account dialog
+  accelerators.rs    ui.accelerator(..) from core's shortcut table
+  theme.rs           ui.follow_system_theme(true); user override from config
 ```
 
 **Size.** Compared with today's 11.5 MiB egui build, it drops eframe, egui,
