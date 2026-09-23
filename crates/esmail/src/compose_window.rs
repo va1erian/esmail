@@ -35,6 +35,7 @@
 
 use super::*;
 use esmail::contacts::Contacts;
+use esmail::waker::Waker;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Where the caret goes when a window first opens.
@@ -85,10 +86,17 @@ pub(super) struct Shared {
 pub(super) struct ComposeWindow {
     id: ComposeId,
     shared: Arc<Mutex<Shared>>,
+    /// Wakes the main window, the only one that acts on `send_requested` and
+    /// `finished`.
+    wake_app: Waker,
+    /// Wakes this window's own viewport. Built by whoever owns the egui
+    /// context so this type needs no viewport addressing of its own: the
+    /// core's `Waker` is deliberately viewport-agnostic.
+    wake_window: Waker,
 }
 
 impl ComposeWindow {
-    pub(super) fn new(id: ComposeId, state: ComposeState, focus: Focus) -> Self {
+    pub(super) fn new(id: ComposeId, state: ComposeState, focus: Focus, wake_app: Waker, wake_window: Waker) -> Self {
         let shared = Shared {
             initial: state.clone(),
             state,
@@ -102,15 +110,24 @@ impl ComposeWindow {
             confirm_discard: false,
             focus: Some(focus),
         };
-        Self { id, shared: Arc::new(Mutex::new(shared)) }
+        Self { id, shared: Arc::new(Mutex::new(shared)), wake_app, wake_window }
     }
 
     pub(super) fn id(&self) -> ComposeId {
         self.id
     }
 
+    pub(super) fn viewport_id_of(id: ComposeId) -> egui::ViewportId {
+        egui::ViewportId::from_hash_of(("esmail-compose", id))
+    }
+
     pub(super) fn viewport_id(&self) -> egui::ViewportId {
-        egui::ViewportId::from_hash_of(("esmail-compose", self.id))
+        Self::viewport_id_of(self.id)
+    }
+
+    /// Wakes this window's own viewport.
+    pub(super) fn wake(&self) {
+        (self.wake_window)();
     }
 
     fn lock(&self) -> MutexGuard<'_, Shared> {
@@ -201,9 +218,9 @@ impl ComposeWindow {
     /// [`Self::set_error`], plus waking this window's own viewport directly
     /// rather than relying on the main window's `logic()` to do it -- same
     /// reasoning as [`Self::mark_sent_and_hide`].
-    pub(super) fn set_error_and_wake(&self, ctx: &egui::Context, error: String) {
+    pub(super) fn set_error_and_wake(&self, error: String) {
         self.set_error(error);
-        ctx.request_repaint_of(self.viewport_id());
+        self.wake();
     }
 
     /// Declares the window for this frame. Must be called every frame the
@@ -233,13 +250,14 @@ impl ComposeWindow {
             builder = builder.with_icon(icon);
         }
         let shared = self.shared.clone();
+        let wake_app = Arc::clone(&self.wake_app);
         ctx.show_viewport_deferred(self.viewport_id(), builder, move |ui, _class| {
             let mut s = shared.lock().unwrap_or_else(PoisonError::into_inner);
             let before = (s.send_requested, s.finished);
             compose_ui::draw(ui, &mut s);
             if (s.send_requested, s.finished) != before {
                 // Only the main viewport's `logic()` acts on these.
-                ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                wake_app();
             }
         });
     }
@@ -267,8 +285,12 @@ pub(super) fn discard_clicked(s: &mut Shared) {
 mod tests {
     use super::*;
 
+    fn test_window(id: ComposeId, state: ComposeState) -> ComposeWindow {
+        ComposeWindow::new(id, state, Focus::To, esmail::waker::noop(), esmail::waker::noop())
+    }
+
     fn window() -> ComposeWindow {
-        ComposeWindow::new(1, ComposeState { subject: "Hi".to_string(), ..Default::default() }, Focus::To)
+        test_window(1, ComposeState { subject: "Hi".to_string(), ..Default::default() })
     }
 
     #[test]
@@ -343,9 +365,9 @@ mod tests {
 
     #[test]
     fn windows_have_distinct_viewport_ids() {
-        let a = ComposeWindow::new(1, ComposeState::default(), Focus::To);
-        let b = ComposeWindow::new(2, ComposeState::default(), Focus::To);
+        let a = test_window(1, ComposeState::default());
+        let b = test_window(2, ComposeState::default());
         assert_ne!(a.viewport_id(), b.viewport_id());
-        assert_eq!(a.viewport_id(), ComposeWindow::new(1, ComposeState::default(), Focus::To).viewport_id());
+        assert_eq!(a.viewport_id(), test_window(1, ComposeState::default()).viewport_id());
     }
 }

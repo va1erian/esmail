@@ -28,6 +28,7 @@ pub mod shell;
 pub mod smtp;
 pub mod uninstall;
 pub mod view_model;
+pub mod waker;
 pub mod watcher;
 /// Tray icon and new-mail toasts (B10): the OS-specific implementation is
 /// chosen inside `platform`, see its module doc.

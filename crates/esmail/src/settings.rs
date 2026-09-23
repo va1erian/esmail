@@ -179,7 +179,7 @@ impl EsMailApp {
                 }
                 Action::Connect(id) => self.connect_saved(&id),
                 Action::Disconnect(id) => self.disconnect_account(&id),
-                Action::SignIn(id) => self.sign_in_again(ctx, &id),
+                Action::SignIn(id) => self.sign_in_again(&id),
                 Action::CancelSignIn(id) => self.cancel_google_sign_in(&id),
                 Action::Remove(id) => {
                     self.remove_account(&id);
@@ -192,7 +192,7 @@ impl EsMailApp {
                     if let Some(dialog) = state.account.take() {
                         // Kept open when it could not be applied (a bad
                         // number, a missing password), so nothing typed is lost.
-                        if let Some(dialog) = self.apply_account_dialog(ctx, dialog) {
+                        if let Some(dialog) = self.apply_account_dialog(dialog) {
                             state.account = Some(dialog);
                         }
                     }
@@ -406,7 +406,7 @@ impl EsMailApp {
 
     /// Save the per-account dialog. Returns the dialog back when it could not
     /// be applied, so it stays open with what was typed; `None` once done.
-    fn apply_account_dialog(&mut self, ctx: &egui::Context, dialog: AccountDialog) -> Option<AccountDialog> {
+    fn apply_account_dialog(&mut self, dialog: AccountDialog) -> Option<AccountDialog> {
         let Some(index) = self.config.accounts.iter().position(|a| a.id == dialog.id) else {
             return None; // Removed while the dialog was open.
         };
@@ -465,7 +465,7 @@ impl EsMailApp {
             // `persist_pending` switches it over once the new session connects.
             let mut google = account;
             google.auth = config::AuthKind::GoogleOAuth;
-            self.begin_google_sign_in(ctx, google);
+            self.begin_google_sign_in(google);
         } else if self.view(&account.id).is_some() || new_password.is_some() {
             // A live session keeps the label, ports and password it started
             // with; replace it so the change takes effect.

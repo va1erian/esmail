@@ -29,19 +29,13 @@ async fn run_google_sign_in(
     client: &oauth::OAuthClient,
     username: &str,
     tx: &mpsc::Sender<OAuthMessage>,
-    ctx: &egui::Context,
+    waker: &Waker,
 ) -> anyhow::Result<Arc<oauth::TokenSource>> {
     let pending = oauth::begin(client, username).await?;
     if let Err(e) = opener::open_browser(&pending.url) {
         log::warn!("could not open the browser for Google sign-in: {e}");
         let _ = tx.send(OAuthMessage::BrowserUnavailable { url: pending.url.clone() }).await;
-        // `_of(ROOT)`: this runs on a background task with no viewport pass of
-        // its own, so the ambiguous `request_repaint()` can end up waking
-        // whichever viewport (e.g. a compose window animating its own
-        // spinner) last ran a pass instead of the root viewport that
-        // actually drains `OAuthMessage` -- see `main.rs`'s `session_hooks`
-        // for the fuller version of this note.
-        ctx.request_repaint_of(egui::ViewportId::ROOT);
+        waker();
     }
     let grant = pending.finish(client).await?;
     oauth::TokenSource::from_grant(client.clone(), grant)
@@ -110,7 +104,7 @@ impl EsMailApp {
     /// The Connect button. With a password that just connects. With Google
     /// sign-in it reuses the refresh token saved from an earlier approval, and
     /// only sends the user to the browser when there is none.
-    pub(super) fn connect_clicked(&mut self, ctx: &egui::Context) {
+    pub(super) fn connect_clicked(&mut self) {
         let account = self.account_from_form();
         // The form stays up until this account has connected (the `Connected`
         // handler dismisses it), so a failure can be corrected in place.
@@ -126,7 +120,7 @@ impl EsMailApp {
                 let source = oauth::TokenSource::from_refresh_token(client, refresh_token);
                 self.connect_account(account, auth::Auth::OAuth(source), true);
             }
-            None => self.begin_google_sign_in(ctx, account),
+            None => self.begin_google_sign_in(account),
         }
     }
 
@@ -175,7 +169,7 @@ impl EsMailApp {
     /// as an [`OAuthMessage`]. Replaces a sign-in already in progress for the
     /// *same* account; other accounts' sign-ins are independent (each has its
     /// own local redirect port).
-    pub(super) fn begin_google_sign_in(&mut self, ctx: &egui::Context, account: AccountConfig) {
+    pub(super) fn begin_google_sign_in(&mut self, account: AccountConfig) {
         if account.username.trim().is_empty() {
             self.push_banner("Enter your Gmail address in the Username field first.".to_string());
             return;
@@ -185,27 +179,26 @@ impl EsMailApp {
             previous.abort();
         }
         let tx = self.oauth_tx.clone();
-        let ctx = ctx.clone();
+        let waker = Arc::clone(&self.waker);
         self.status = format!("Waiting for Google sign-in of {} in your browser...", account.display_name);
         let id = account.id.clone();
         let task = tokio::spawn(async move {
-            let message = match run_google_sign_in(&client, &account.username, &tx, &ctx).await {
+            let message = match run_google_sign_in(&client, &account.username, &tx, &waker).await {
                 Ok(source) => OAuthMessage::Authorized { auth: auth::Auth::OAuth(source), account },
                 Err(e) => OAuthMessage::Failed { account_id: account.id.clone(), error: format!("{e:#}") },
             };
             let _ = tx.send(message).await;
-            // See `run_google_sign_in`'s note above on why `_of(ROOT)`.
-            ctx.request_repaint_of(egui::ViewportId::ROOT);
+            waker();
         });
         self.oauth_tasks.insert(id, task);
     }
 
     /// Sign in again to a saved Google account (a revoked or expired token, or
     /// simply wanting to redo the consent page).
-    pub(super) fn sign_in_again(&mut self, ctx: &egui::Context, account_id: &str) {
+    pub(super) fn sign_in_again(&mut self, account_id: &str) {
         let Some(mut account) = self.config.accounts.iter().find(|a| a.id == account_id).cloned() else { return };
         account.auth = config::AuthKind::GoogleOAuth;
-        self.begin_google_sign_in(ctx, account);
+        self.begin_google_sign_in(account);
     }
 
     /// Stop waiting for an account's browser sign-in. Aborting the task
