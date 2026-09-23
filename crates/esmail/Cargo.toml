@@ -21,6 +21,7 @@ ureq.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_glow.workspace = true
+winit.workspace = true
 
 tokio.workspace = true
 tokio-native-tls.workspace = true

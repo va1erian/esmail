@@ -4,8 +4,16 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+
+/// Serialises `Config::save` calls. The theme toggle now writes from a
+/// background thread (`config_saver`), and other preferences are still saved
+/// from the UI thread; two `std::fs::write`s racing would truncate the file
+/// mid-write and leave `config.toml` unparseable, which `Config::load` treats
+/// as "no accounts".
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 /// How to secure a connection to a mail server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,8 +310,10 @@ impl Config {
         }
     }
 
-    /// Write `config.toml`, creating the config directory if needed.
+    /// Write `config.toml`, creating the config directory if needed. Serialised
+    /// against every other save, including the background `config_saver`'s.
     pub fn save(&self) -> anyhow::Result<()> {
+        let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = crate::paths::config_file().ok_or_else(|| anyhow::anyhow!("no config directory available"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
