@@ -28,6 +28,7 @@ use crate::auth::Auth;
 use crate::idle_watch;
 use crate::imap::{ImapActor, ImapCommand, ImapEvent};
 use crate::notify;
+use crate::waker::{self, Waker};
 
 /// Stable identifier of an account -- `AccountConfig::id`, the same
 /// `username@host` string `db.rs` keys its cache on and the keyring keys
@@ -66,8 +67,6 @@ pub struct SessionParams {
 /// Shows a new-mail toast: `(account id, title, body)`. The id is what a click
 /// on the toast reports back, so it can open that account.
 pub type NotifyFn = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
-/// Asks the UI to repaint.
-pub type RepaintFn = Arc<dyn Fn() + Send + Sync>;
 
 /// Callbacks into the UI layer. Plain closures so this module needs neither
 /// egui nor the Windows toast API, and tests can observe the toasts.
@@ -77,13 +76,13 @@ pub struct Hooks {
     /// account.
     pub notify: NotifyFn,
     /// Ask the UI to repaint because an event was queued for it.
-    pub repaint: RepaintFn,
+    pub repaint: Waker,
 }
 
 impl Hooks {
     /// Hooks that do nothing, for headless use.
     pub fn none() -> Self {
-        Self { notify: Arc::new(|_, _, _| {}), repaint: Arc::new(|| {}) }
+        Self { notify: Arc::new(|_, _, _| {}), repaint: waker::noop() }
     }
 }
 

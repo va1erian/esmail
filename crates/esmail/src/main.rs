@@ -23,6 +23,7 @@ use listener_client::ListenerClient;
 /// Tray icon + new-mail toasts (B10): the OS-specific side lives behind
 /// `platform`, so nothing below names a platform.
 use esmail::platform;
+use esmail::waker::Waker;
 
 use egui_litehtml_webview::{
     ImageRequest, InterceptOutcome, WebView, WebViewConfig, WebViewHandler, WebViewHost,
@@ -309,6 +310,10 @@ struct EsMailApp {
     /// Where the browser round trips report back; see `accounts.rs`.
     oauth_tx: mpsc::Sender<accounts::OAuthMessage>,
     oauth_rx: mpsc::Receiver<accounts::OAuthMessage>,
+    /// Wakes the root viewport for whatever a background task queued for it.
+    waker: Waker,
+    /// Only to build each compose window's own-viewport waker.
+    egui_ctx: egui::Context,
     /// The running browser round trips, one per account (several accounts can
     /// be waiting for their consent page at once). Aborting one closes its
     /// local redirect listener, which is how "Cancel" works.
@@ -513,6 +518,14 @@ impl EsMailApp {
         let (db_evt_tx, db_evt_rx) = mpsc::channel(32);
 
         let egui_ctx = cc.egui_ctx.clone();
+        // `request_repaint_of(ROOT)`: everything a `Waker` wakes is only ever
+        // drained by the root viewport's `logic()`/`ui()`, so that's the one
+        // that must wake up -- see the heartbeat thread below for why that
+        // alone isn't always prompt on Windows.
+        let waker: Waker = {
+            let ctx = egui_ctx.clone();
+            Arc::new(move || ctx.request_repaint_of(egui::ViewportId::ROOT))
+        };
 
         // A safety-net heartbeat for the root viewport (#34's compose windows
         // exposed this): on Windows, once no esMail window has focus -- which,
@@ -545,10 +558,11 @@ impl EsMailApp {
         let (toast_click_tx, toast_click_rx) = mpsc::channel(8);
         platform::set_toast_click_handler({
             let ctx = egui_ctx.clone();
+            let waker = Arc::clone(&waker);
             move |account| {
                 let _ = toast_click_tx.try_send(account);
                 bring_window_to_front(&ctx);
-                ctx.request_repaint_of(egui::ViewportId::ROOT);
+                waker();
             }
         });
         // The listener toasts the same mail; while it is connected this
@@ -563,24 +577,16 @@ impl EsMailApp {
                     }
                 })
             },
-            repaint: {
-                let ctx = egui_ctx.clone();
-                // `request_repaint_of(ROOT)`: the events this wakes
-                // (`handle_imap_events` and friends) are only ever drained by
-                // the root viewport's `logic()`/`ui()`, so that's the one
-                // that must wake up -- see the heartbeat thread above for why
-                // that alone isn't always prompt on Windows.
-                Arc::new(move || ctx.request_repaint_of(egui::ViewportId::ROOT))
-            },
+            repaint: Arc::clone(&waker),
         };
 
         // Wrap DB events
         let (tx_db, mut rx_db) = mpsc::channel(32);
-        let ctx_clone_db = egui_ctx.clone();
+        let waker_db = Arc::clone(&waker);
         tokio::spawn(async move {
             while let Some(evt) = rx_db.recv().await {
                 let _ = db_evt_tx.send(evt).await;
-                ctx_clone_db.request_repaint_of(egui::ViewportId::ROOT);
+                waker_db();
             }
         });
         DbActor::spawn(db_cmd_rx, tx_db);
@@ -592,6 +598,7 @@ impl EsMailApp {
         let (smtp_evt_tx, smtp_evt_rx) = mpsc::channel(8);
         let (tx_smtp, mut rx_smtp) = mpsc::channel(8);
         let ctx_clone_smtp = egui_ctx.clone();
+        let waker_smtp = Arc::clone(&waker);
         let compose_registry_smtp = compose_registry.clone();
         tokio::spawn(async move {
             while let Some(evt) = rx_smtp.recv().await {
@@ -609,7 +616,7 @@ impl EsMailApp {
                     match &evt {
                         smtp::SmtpEvent::Sent { .. } => window.mark_sent_and_hide(&ctx_clone_smtp),
                         smtp::SmtpEvent::Error { error, .. } => {
-                            window.set_error_and_wake(&ctx_clone_smtp, format!("Send failed: {error}"));
+                            window.set_error_and_wake(format!("Send failed: {error}"));
                         }
                     }
                 }
@@ -619,7 +626,7 @@ impl EsMailApp {
                 // saving the Sent copy) isn't user-visible, so it can wait for
                 // the root viewport's own pace -- `_of(ROOT)`, same reasoning
                 // as `session_hooks.repaint` above.
-                ctx_clone_smtp.request_repaint_of(egui::ViewportId::ROOT);
+                waker_smtp();
             }
         });
         smtp::SmtpActor::spawn(smtp_cmd_rx, tx_smtp);
@@ -869,6 +876,8 @@ impl EsMailApp {
             use_oauth,
             oauth_tx,
             oauth_rx,
+            waker,
+            egui_ctx,
             oauth_tasks: std::collections::HashMap::new(),
             settings: None,
         };
@@ -1465,7 +1474,7 @@ impl EsMailApp {
                     // fallback for the window having been closed meanwhile,
                     // which leaves nobody to show it to but the main window.
                     match self.compose_windows.iter().find(|w| w.id() == id) {
-                        Some(window) => window.set_error_and_wake(ctx, message),
+                        Some(window) => window.set_error_and_wake(message),
                         None => self.push_banner(message),
                     }
                 }
@@ -1477,7 +1486,13 @@ impl EsMailApp {
     /// next [`Self::show_compose_windows`].
     fn open_compose(&mut self, state: ComposeState, focus: compose_window::Focus) {
         self.next_compose_id += 1;
-        let window = ComposeWindow::new(self.next_compose_id, state, focus);
+        let id = self.next_compose_id;
+        let wake_window: Waker = {
+            let ctx = self.egui_ctx.clone();
+            let viewport_id = ComposeWindow::viewport_id_of(id);
+            Arc::new(move || ctx.request_repaint_of(viewport_id))
+        };
+        let window = ComposeWindow::new(id, state, focus, Arc::clone(&self.waker), wake_window);
         // Kept in `compose_registry` too -- see `compose_window.rs`'s module
         // docs -- for as long as this window is open.
         self.compose_registry
@@ -1525,7 +1540,9 @@ impl EsMailApp {
             }
         }
         for (id, from, compose) in requests {
-            let Some(viewport_id) = self.compose_windows.iter().find(|w| w.id() == id).map(ComposeWindow::viewport_id) else { continue };
+            if !self.compose_windows.iter().any(|w| w.id() == id) {
+                continue;
+            }
             let error = match from.as_deref().map(|from| (from, self.smtp_account_for(from))) {
                 Some((from, Some(account))) => {
                     // Remembered so `Sent` saves the copy to this account's
@@ -1554,7 +1571,9 @@ impl EsMailApp {
                     }
                 }
             }
-            ctx.request_repaint_of(viewport_id);
+            if let Some(window) = self.compose_windows.iter().find(|w| w.id() == id) {
+                window.wake();
+            }
         }
     }
 
@@ -2954,7 +2973,7 @@ impl eframe::App for EsMailApp {
                                     // replaces its session, so a retry after a
                                     // typo'd password cannot leak a second
                                     // watcher.
-                                    self.connect_clicked(ui.ctx());
+                                    self.connect_clicked();
                                 }
                                 if oauth_active
                                     && ui
@@ -2963,7 +2982,7 @@ impl eframe::App for EsMailApp {
                                         .clicked()
                                 {
                                     let account = self.account_from_form();
-                                    self.begin_google_sign_in(ui.ctx(), account);
+                                    self.begin_google_sign_in(account);
                                 }
                                 // Only offered once there is a main view to go
                                 // back to.
@@ -3184,7 +3203,7 @@ impl eframe::App for EsMailApp {
                     self.disconnect_account(&id);
                 }
                 if let Some(id) = sign_in {
-                    self.sign_in_again(ui.ctx(), &id);
+                    self.sign_in_again(&id);
                 }
                 if let Some(id) = reconnect {
                     if let Some(account) = self.config.accounts.iter().find(|a| a.id == id).cloned() {
