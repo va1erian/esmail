@@ -1,21 +1,22 @@
 //! Search query grammar (B4 of PLAN.md): parse a small DSL — bare text,
 //! `from:`, `to:`, `subject:`, `body:`, `since:`, `before:`, `is:unread`,
-//! `has:attachment` — into a [`ParsedQuery`], then turn that into an FTS5
-//! `MATCH` expression for `db.rs`'s local index.
+//! `has:attachment` — into a [`ParsedQuery`], then apply it to `db.rs`'s
+//! local index.
 //!
 //! **What's wired:** bare text (OR'd across subject/from/body, matching the
 //! plan's "bare text → `OR SUBJECT x FROM x`") and the `from:`/`to:`/
-//! `subject:`/`body:` fielded filters, via [`ParsedQuery::to_fts_match`].
+//! `subject:`/`body:` fielded filters become an FTS5 `MATCH` expression via
+//! [`ParsedQuery::to_fts_match`]; `since:`/`before:` and `is:unread` narrow
+//! the results via [`ParsedQuery::message_filters`], which `db.rs::search`
+//! checks against each hit's cached `date`/flags. A query made only of those
+//! filters (no text) still searches: `search` scans the scoped messages
+//! rather than going through FTS.
 //!
-//! **What's parsed but not applied yet:** `since:`/`before:` and `is:unread`/
-//! `has:attachment` all parse correctly (see the tests) but
-//! `to_fts_match` ignores them, because there is nowhere yet to apply them —
-//! `messages.date` is still the raw IMAP envelope date string, not a parsed
-//! timestamp, so a `since`/`before` range comparison would be unreliable
-//! string comparison; `messages` carries no flags or attachment info at all
-//! (that lands with B8). Wiring these needs schema/fetch work beyond this
-//! phase, not just query building, so they're left as a documented gap
-//! rather than silently ignored — a caller can inspect the fields directly.
+//! **What's parsed but not applied yet:** `has:attachment` parses correctly
+//! (see the tests) but is ignored, because `messages` carries no
+//! attachment-presence column yet (that lands with the search-cache
+//! attachments work). [`ParsedQuery::is_empty`] treats it as no query at all,
+//! so a `has:attachment`-only query can't silently match everything.
 //!
 //! **What's not here at all:** turning a [`ParsedQuery`] into IMAP search
 //! keys for the server-side `UID SEARCH` path PLAN.md's B4 also describes.
@@ -33,14 +34,16 @@ pub struct ParsedQuery {
     pub to: Vec<String>,
     pub subject: Vec<String>,
     pub body: Vec<String>,
-    /// From `since:`, unparsed — see the module docs on why this isn't
-    /// applied to the query yet.
+    /// From `since:`, a `YYYY-MM-DD` date — see
+    /// [`ParsedQuery::message_filters`].
     pub since: Option<String>,
-    /// From `before:`, unparsed — see the module docs.
+    /// From `before:`, a `YYYY-MM-DD` date — see
+    /// [`ParsedQuery::message_filters`].
     pub before: Option<String>,
     /// From `is:unread`.
     pub is_unread: bool,
-    /// From `has:attachment`.
+    /// From `has:attachment`; parsed but not applied yet — see the module
+    /// docs.
     pub has_attachment: bool,
 }
 
@@ -87,11 +90,20 @@ impl ParsedQuery {
             && self.body.is_empty()
     }
 
+    /// Whether the query has nothing to narrow on at all: no text and no
+    /// applied filter. `has:attachment` is parsed but not applied (see the
+    /// module docs), so a query of only `has:attachment` is empty here —
+    /// treating it as a real query would return every message unfiltered.
+    pub fn is_empty(&self) -> bool {
+        self.is_fts_empty() && self.since.is_none() && self.before.is_none() && !self.is_unread
+    }
+
     /// Build an FTS5 `MATCH` expression for `messages_fts` (see `db.rs`'s
     /// schema) covering the fielded and bare-text parts of the query.
-    /// `None` when [`ParsedQuery::is_fts_empty`] — SQLite's `MATCH` rejects
-    /// an empty string, so a caller should treat `None` as "nothing to
-    /// search for" rather than pass one through.
+    /// `None` when there is no text to match — an empty query, or one made
+    /// only of `since:`/`before:`/`is:unread`, which `db.rs::search` applies
+    /// without FTS. SQLite's `MATCH` rejects an empty string, so a caller
+    /// must not pass one through.
     pub fn to_fts_match(&self) -> Option<String> {
         if self.is_fts_empty() {
             return None;
@@ -115,6 +127,69 @@ impl ParsedQuery {
         }
         Some(clauses.join(" AND "))
     }
+
+    /// The `messages`-column filters, with `since:`/`before:` already parsed
+    /// into Unix timestamps so a caller can check many hits without
+    /// re-parsing the query dates once per row. An unparseable date is
+    /// dropped (the filter narrows nothing) rather than excluding every hit.
+    pub fn message_filters(&self) -> MessageFilters {
+        MessageFilters {
+            since: self.since.as_deref().and_then(parse_date),
+            before: self.before.as_deref().and_then(parse_date),
+            unread_only: self.is_unread,
+        }
+    }
+}
+
+/// The `messages`-column part of a [`ParsedQuery`], ready to check against a
+/// cached message's `date` and `\Seen` flag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessageFilters {
+    /// `since:` (inclusive), Unix seconds UTC; `None` when absent or the
+    /// value wasn't a `YYYY-MM-DD` date.
+    pub since: Option<i64>,
+    /// `before:` (exclusive), Unix seconds UTC; `None` when absent or the
+    /// value wasn't a `YYYY-MM-DD` date.
+    pub before: Option<i64>,
+    /// `is:unread`: keep only messages without `\Seen`.
+    pub unread_only: bool,
+}
+
+impl MessageFilters {
+    /// Whether a message as cached (`date` is the raw header date string,
+    /// `is_seen` its `\Seen` flag) passes every filter set here. A message
+    /// whose date this can't parse is excluded by a date filter -- it can't
+    /// be shown to fall inside the range.
+    pub fn matches(&self, date: &str, is_seen: bool) -> bool {
+        if self.unread_only && is_seen {
+            return false;
+        }
+        if self.since.is_some() || self.before.is_some() {
+            let Some(message_ts) = message_timestamp(date) else {
+                return false;
+            };
+            if self.since.is_some_and(|since| message_ts < since) {
+                return false;
+            }
+            if self.before.is_some_and(|before| message_ts >= before) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// `YYYY-MM-DD` as Unix seconds at 00:00 UTC, [`None`] for anything else.
+fn parse_date(s: &str) -> Option<i64> {
+    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp())
+}
+
+/// An IMAP envelope date string as Unix seconds. `None` for an empty or
+/// unparseable date. Also used by `db.rs::search` to order a filter-only
+/// result set, which has no FTS rank to sort by.
+pub(crate) fn message_timestamp(s: &str) -> Option<i64> {
+    mailparse::dateparse(s).ok().filter(|&t| t > 0)
 }
 
 /// Split `input` on whitespace, except inside `"..."`, so
@@ -239,10 +314,11 @@ mod tests {
     }
 
     #[test]
-    fn only_unwired_filters_yields_no_fts_match() {
+    fn filter_only_query_has_no_fts_match_but_is_not_empty() {
         let q = ParsedQuery::parse("is:unread since:2026-01-01");
         assert!(q.is_fts_empty());
         assert_eq!(q.to_fts_match(), None);
+        assert!(!q.is_empty());
     }
 
     #[test]
@@ -255,5 +331,52 @@ mod tests {
         let q = ParsedQuery::parse(r#"subject:"say ""hi"""#);
         assert_eq!(q.subject, vec![r#"say "hi""#]);
         assert_eq!(q.to_fts_match().unwrap(), "subject:\"say \"\"hi\"\"\"");
+    }
+
+    // ── message_filters ──────────────────────────────────────────────────────
+
+    #[test]
+    fn has_attachment_alone_is_treated_as_no_query() {
+        // Parsed but not applied yet (see the module docs): counting it as a
+        // query would return every message as if the filter had matched.
+        let q = ParsedQuery::parse("has:attachment");
+        assert!(q.has_attachment);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn message_filters_parse_since_and_before_to_utc_midnight() {
+        let q = ParsedQuery::parse("since:2026-01-01 before:2026-02-01 is:unread");
+        let f = q.message_filters();
+        // 2026-01-01 00:00 UTC and 2026-02-01 00:00 UTC.
+        assert_eq!(f.since, Some(1_767_225_600));
+        assert_eq!(f.before, Some(1_769_904_000));
+        assert!(f.unread_only);
+    }
+
+    #[test]
+    fn unparseable_date_filter_narrows_nothing_rather_than_excluding_everything() {
+        let f = ParsedQuery::parse("since:tomorrow before:whenever").message_filters();
+        assert_eq!(f, MessageFilters::default());
+        assert!(f.matches("Tue, 13 Jan 2026 10:00:00 +0000", true));
+    }
+
+    #[test]
+    fn message_filters_check_the_range_and_the_seen_flag() {
+        let f = ParsedQuery::parse("since:2026-01-01 before:2026-02-01").message_filters();
+        // Before the range.
+        assert!(!f.matches("Wed, 31 Dec 2025 23:59:59 +0000", true));
+        // First instant of the range (`since` is inclusive).
+        assert!(f.matches("Thu, 01 Jan 2026 00:00:00 +0000", true));
+        // Inside the range.
+        assert!(f.matches("Sat, 17 Jan 2026 12:00:00 +0000", true));
+        // `before` is exclusive.
+        assert!(!f.matches("Sun, 01 Feb 2026 00:00:00 +0000", true));
+        // No usable date: a date filter can't place it in the range.
+        assert!(!f.matches("", true));
+
+        let unread = ParsedQuery::parse("is:unread").message_filters();
+        assert!(unread.matches("Thu, 01 Jan 2026 00:00:00 +0000", false));
+        assert!(!unread.matches("Thu, 01 Jan 2026 00:00:00 +0000", true));
     }
 }

@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use crate::compose::{ComposeId, ComposeState};
 use crate::imap::MailHeader;
 use crate::render::Attachment;
+use crate::search_query::{message_timestamp, ParsedQuery};
 
 /// Cap on rows in `bodies` across all accounts/mailboxes; the oldest
 /// (by `cached_at`) are evicted once a write pushes past it.
@@ -50,10 +51,13 @@ pub enum DbCommand {
         headers: Vec<MailHeader>,
     },
     /// Full-text search. `account_id: None` searches every account; either
-    /// way each hit says which account and mailbox it came from.
+    /// way each hit says which account and mailbox it came from. `query` is
+    /// the parsed DSL, so `db.rs` can apply its `since:`/`before:`/
+    /// `is:unread` filters as well as its FTS `MATCH`. See
+    /// [`crate::search_query`].
     Search {
         account_id: Option<String>,
-        query: String,
+        query: ParsedQuery,
         mailbox: Option<String>,
     },
     FetchMail {
@@ -666,29 +670,21 @@ pub struct SearchHit {
 
 /// `account_id: None` searches every account's cache (the FTS index is keyed
 /// per account, so this is one query rather than one per account).
+///
+/// The `since:`/`before:`/`is:unread` part of `query` is applied in Rust on
+/// the fetched hits rather than in SQL: `messages.date` is the raw envelope
+/// date string, which SQLite can't range-compare reliably, and the cache has
+/// no normalized timestamp column (see `search_query`'s docs). That means a
+/// text query fetches every FTS hit before the date/flag filters trim it;
+/// search result sets are small enough that this is not worth a schema
+/// migration yet.
 fn search(
     conn: &Connection,
     account_id: Option<&str>,
-    query: &str,
+    query: &ParsedQuery,
     mailbox: Option<&str>,
 ) -> rusqlite::Result<Vec<SearchHit>> {
-    // `account_id` and `mailbox` are bound as parameters (not spliced into
-    // the SQL string) -- the previous version of this query built the WHERE
-    // clause with `format!("... mailbox = '{}'", mb)`, which let a mailbox
-    // name containing a `'` alter the query. IMAP mailbox names are server-
-    // controlled, so this was reachable from an untrusted source.
-    let mut stmt = conn.prepare(
-        "SELECT m.uid, m.subject, m.from_addr, m.to_addr, m.date, m.message_id, m.flags,
-                m.account_id, m.mailbox
-         FROM messages_fts f
-         JOIN messages m ON m.account_id = f.account_id
-            AND m.mailbox = f.mailbox AND m.uid = f.uid
-         WHERE (?1 IS NULL OR f.account_id = ?1)
-            AND (?2 IS NULL OR f.mailbox = ?2)
-            AND messages_fts MATCH ?3
-         ORDER BY f.rank",
-    )?;
-    let rows = stmt.query_map(params![account_id, mailbox, query], |row| {
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<SearchHit> {
         let flags_str: String = row.get(6)?;
         Ok(SearchHit {
             account_id: row.get(7)?,
@@ -703,13 +699,51 @@ fn search(
                 flags: parse_flags_column(&flags_str),
             },
         })
-    })?;
+    };
 
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row?);
+    // `account_id` and `mailbox` are bound as parameters (not spliced into
+    // the SQL string) -- the previous version of this query built the WHERE
+    // clause with `format!("... mailbox = '{}'", mb)`, which let a mailbox
+    // name containing a `'` alter the query. IMAP mailbox names are server-
+    // controlled, so this was reachable from an untrusted source.
+    let fts_match = query.to_fts_match();
+    let mut hits: Vec<SearchHit> = if let Some(fts_match) = &fts_match {
+        let mut stmt = conn.prepare(
+            "SELECT m.uid, m.subject, m.from_addr, m.to_addr, m.date, m.message_id, m.flags,
+                    m.account_id, m.mailbox
+             FROM messages_fts f
+             JOIN messages m ON m.account_id = f.account_id
+                AND m.mailbox = f.mailbox AND m.uid = f.uid
+             WHERE (?1 IS NULL OR f.account_id = ?1)
+                AND (?2 IS NULL OR f.mailbox = ?2)
+                AND messages_fts MATCH ?3
+             ORDER BY f.rank",
+        )?;
+        stmt.query_map(params![account_id, mailbox, fts_match], map_row)?.collect::<rusqlite::Result<_>>()?
+    } else if query.is_empty() {
+        return Ok(Vec::new());
+    } else {
+        // No text to match, only filters: scan the scoped messages and let
+        // `matches` below do the narrowing.
+        let mut stmt = conn.prepare(
+            "SELECT m.uid, m.subject, m.from_addr, m.to_addr, m.date, m.message_id, m.flags,
+                    m.account_id, m.mailbox
+             FROM messages m
+             WHERE (?1 IS NULL OR m.account_id = ?1)
+                AND (?2 IS NULL OR m.mailbox = ?2)",
+        )?;
+        stmt.query_map(params![account_id, mailbox], map_row)?.collect::<rusqlite::Result<_>>()?
+    };
+
+    let filters = query.message_filters();
+    hits.retain(|hit| filters.matches(&hit.header.date, hit.header.is_seen()));
+    if fts_match.is_none() {
+        // A filter-only query has no FTS rank: show newest first. The raw
+        // date strings aren't lexicographically ordered, so sort on the
+        // parsed timestamp; a date `message_timestamp` can't parse sorts last.
+        hits.sort_by_key(|hit| std::cmp::Reverse(message_timestamp(&hit.header.date)));
     }
-    Ok(results)
+    Ok(hits)
 }
 
 fn fetch_mail(
@@ -1254,7 +1288,7 @@ mod tests {
 
         remove_account(&conn, "gone").unwrap();
 
-        let hits = search(&conn, None, "needle", None).unwrap();
+        let hits = search(&conn, None, &ParsedQuery::parse("needle"), None).unwrap();
         assert_eq!(hits.len(), 1, "only the other account's mail is left to find");
         assert_eq!(hits[0].account_id, "kept");
         assert!(fetch_mail(&conn, "gone", "INBOX", 1).is_err(), "its cached body is gone too");
@@ -1282,7 +1316,7 @@ mod tests {
     fn search_finds_a_matching_subject() {
         let conn = test_conn();
         index_mail(&conn, "acc", "INBOX", &test_header(1), "irrelevant body", &[]).unwrap();
-        let results = search(&conn, Some("acc"), "\"Subject 1\"", None).unwrap();
+        let results = search(&conn, Some("acc"), &ParsedQuery::parse("subject:\"Subject 1\""), None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].header.uid, 1);
     }
@@ -1292,7 +1326,7 @@ mod tests {
         let conn = test_conn();
         index_mail(&conn, "acc1", "INBOX", &test_header(1), "body", &[]).unwrap();
         index_mail(&conn, "acc2", "INBOX", &test_header(2), "body", &[]).unwrap();
-        let results = search(&conn, Some("acc1"), "body", None).unwrap();
+        let results = search(&conn, Some("acc1"), &ParsedQuery::parse("body"), None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].header.uid, 1);
     }
@@ -1303,7 +1337,7 @@ mod tests {
         index_mail(&conn, "acc1", "INBOX", &test_header(1), "needle", &[]).unwrap();
         index_mail(&conn, "acc2", "Archive", &test_header(1), "needle", &[]).unwrap();
         index_mail(&conn, "acc3", "INBOX", &test_header(2), "haystack", &[]).unwrap();
-        let mut hits: Vec<(String, String, u32)> = search(&conn, None, "needle", None)
+        let mut hits: Vec<(String, String, u32)> = search(&conn, None, &ParsedQuery::parse("needle"), None)
             .unwrap()
             .into_iter()
             .map(|h| (h.account_id, h.mailbox, h.header.uid))
@@ -1327,8 +1361,65 @@ mod tests {
         // Must not error, and must not match anything (no mailbox has that
         // literal name), rather than the old code's behavior of the quote
         // breaking out of the string and the OR making every row match.
-        let results = search(&conn, Some("acc"), "body", Some(malicious_mailbox)).unwrap();
+        let results = search(&conn, Some("acc"), &ParsedQuery::parse("body"), Some(malicious_mailbox)).unwrap();
         assert_eq!(results.len(), 0);
+    }
+
+    // ── search filters (issue #69) ───────────────────────────────────────────
+
+    /// Seed one message with `date` as its envelope date and `flags` as its
+    /// IMAP flags, all matching the bare text `report`.
+    fn index_dated(conn: &Connection, uid: u32, date: &str, flags: &[&str]) {
+        let mut header = test_header(uid);
+        header.date = date.to_string();
+        header.flags = flags.iter().map(|f| f.to_string()).collect();
+        index_mail(conn, "acc", "INBOX", &header, "quarterly report", &[]).unwrap();
+    }
+
+    #[test]
+    fn search_since_and_before_filter_by_message_date() {
+        let conn = test_conn();
+        index_dated(&conn, 1, "Wed, 31 Dec 2025 23:59:59 +0000", &[]);
+        index_dated(&conn, 2, "Thu, 01 Jan 2026 10:00:00 +0000", &[]);
+        index_dated(&conn, 3, "Wed, 01 Apr 2026 10:00:00 +0000", &[]);
+
+        let uids = |query: &str| -> Vec<u32> {
+            let mut uids: Vec<u32> = search(&conn, Some("acc"), &ParsedQuery::parse(query), None)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.header.uid)
+                .collect();
+            uids.sort();
+            uids
+        };
+        // `since` is inclusive of its date; `before` is exclusive of its own.
+        assert_eq!(uids("since:2026-01-01"), vec![2, 3]);
+        assert_eq!(uids("before:2026-01-01"), vec![1]);
+        assert_eq!(uids("since:2026-01-01 before:2026-02-01"), vec![2]);
+    }
+
+    #[test]
+    fn search_is_unread_keeps_only_messages_without_the_seen_flag() {
+        let conn = test_conn();
+        index_dated(&conn, 1, "Thu, 01 Jan 2026 10:00:00 +0000", &["\\Seen"]);
+        index_dated(&conn, 2, "Thu, 01 Jan 2026 10:00:00 +0000", &[]);
+
+        let hits = search(&conn, Some("acc"), &ParsedQuery::parse("is:unread"), None).unwrap();
+        let uids: Vec<u32> = hits.iter().map(|hit| hit.header.uid).collect();
+        assert_eq!(uids, vec![2]);
+    }
+
+    #[test]
+    fn search_applies_a_text_match_and_a_filter_together() {
+        let conn = test_conn();
+        index_dated(&conn, 1, "Thu, 01 Jan 2025 10:00:00 +0000", &[]);
+        index_dated(&conn, 2, "Thu, 01 Jan 2026 10:00:00 +0000", &[]);
+
+        // Bare `report` matches both bodies through FTS; `since` trims to the
+        // newer one, so the filter has to survive past the MATCH.
+        let hits = search(&conn, Some("acc"), &ParsedQuery::parse("report since:2026-01-01"), None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].header.uid, 2);
     }
 
     // ── evict_lru_bodies ──────────────────────────────────────────────────────

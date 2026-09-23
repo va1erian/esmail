@@ -2419,32 +2419,32 @@ impl eframe::App for EsMailApp {
                     let scope_changed = self.accounts.len() > 1
                         && ui.checkbox(&mut self.search_all_accounts, "All accounts").changed();
                     if search_resp.changed() || scope_changed || (search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                        // `from:`/`to:`/`subject:`/`body:` and bare text all
-                        // become an FTS5 MATCH expression; `since:`/`before:`/
-                        // `is:unread`/`has:attachment` parse but aren't
-                        // applied yet (see search_query.rs) — a query made
-                        // only of those is treated the same as an empty one.
-                        match ParsedQuery::parse(&self.search_query).to_fts_match() {
+                        // `from:`/`to:`/`subject:`/`body:` and bare text
+                        // become an FTS5 MATCH expression; `since:`/`before:`
+                        // and `is:unread` are applied by `db.rs::search` to
+                        // the cached dates/flags; `has:attachment` parses but
+                        // isn't applied yet, so a query made only of it is
+                        // treated the same as an empty one (see
+                        // search_query.rs).
+                        let parsed = ParsedQuery::parse(&self.search_query);
+                        if parsed.is_empty() {
+                            self.clear_search();
+                        } else {
                             // Scoped to the active account's selected mailbox, or
                             // -- with "All accounts" -- every mailbox of every
                             // account (the FTS index is keyed per account, so this
                             // is one query).
-                            Some(fts_query) => {
-                                let (account_id, mailbox) = if self.search_all_accounts {
-                                    (None, None)
-                                } else {
-                                    (self.active_account_id(), Some(self.selected_mailbox.clone()))
-                                };
-                                if self.search_all_accounts || account_id.is_some() {
-                                    let _ = self.db_tx.try_send(DbCommand::Search {
-                                        account_id,
-                                        query: fts_query,
-                                        mailbox,
-                                    });
-                                }
-                            }
-                            None => {
-                                self.clear_search();
+                            let (account_id, mailbox) = if self.search_all_accounts {
+                                (None, None)
+                            } else {
+                                (self.active_account_id(), Some(self.selected_mailbox.clone()))
+                            };
+                            if self.search_all_accounts || account_id.is_some() {
+                                let _ = self.db_tx.try_send(DbCommand::Search {
+                                    account_id,
+                                    query: parsed,
+                                    mailbox,
+                                });
                             }
                         }
                     }
