@@ -89,14 +89,19 @@ The UI thread sends render jobs and paints the finished display lists.
 |---|---|
 | #32 | Umbrella: render-time breakdown and the path to sub-second |
 | #39 | Integrate egui_mcp for agent-driven UI prototyping and app verification |
-| #50 | Google sign-in follow-ups: token expiry in Testing mode, client secret storage, revoke on forget, other providers |
+| #50 | Google sign-in follow-ups: client secret storage, revoke on forget, other providers (7-day expiry warning landed as #71) |
 | #54 | Sign the Windows executable and installer to avoid the SmartScreen warning |
-| #60 | Sync/search: offline mode, UID paging, indexing, server-side search, unapplied query filters |
-| #61 | Reading: partial fetch, search-cache attachments, batched flag/move, live IDLE beyond INBOX |
-| #62 | Compose: rich text and recipient autocomplete |
-| #63 | Notifications: click-to-open, real AUMID, settings, verify on a real machine |
-| #64 | Polish: per-operation progress, first-run wizard, off-screen window recovery, theme toggle off the UI thread |
-| #65 | Webview: decoded-image cache never evicts |
+| #60 | Sync/search: offline mode, UID paging, indexing, server-side `UID SEARCH` (unapplied filters landed as #69) |
+| #61 | Reading: partial (`BODYSTRUCTURE`) fetch, batched flag/move; IDLE staying INBOX-only is a deliberate choice for now (search-cache attachments landed as #68) |
+| #62 | Compose: rich text and recipient autocomplete — deferred, not required for basic use |
+| #64 | Polish: per-operation progress, first-run wizard, off-screen window recovery, theme toggle off the UI thread — deferred |
+
+Landed since the table above was last trimmed: #65 (webview image-cache
+eviction), #68 (search-cache attachments), #69 (search filters), #71 (OAuth
+expiry warning). #63's toast click-to-open was already implemented (see the
+issue) and closed without new work. #62/#64 are open but deliberately not
+being pursued — they aren't required for basic real use on the target Gmail
+mailboxes.
 
 ## Risks
 
