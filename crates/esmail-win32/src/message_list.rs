@@ -15,6 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use esmail::view_model::RowModel;
 use win32ui::d2d::{D2dCanvas, RectF, TextSystem};
@@ -24,8 +25,9 @@ use win32ui::{
     Theme, Themed, Ui, WidgetCx, dip,
 };
 
-use crate::paint::{self, Fonts, RowVisual};
+use crate::paint::{self, Fonts, Phases, RowVisual};
 use crate::state::{ViewState, row_at, scroll_for_row, visible_range};
+use crate::timing::{invalidate, Timing};
 
 /// An event raised by a [`MessageList`], mapped to the app's `Msg` by the
 /// closures given at construction.
@@ -95,6 +97,16 @@ struct MessageListWidget {
     shift: Cell<bool>,
     /// How long the last `paint_d2d` took, in microseconds (diagnostic).
     paint_micros: Cell<f64>,
+    /// The layout/draw split of the last `paint_d2d` (diagnostic).
+    phases: Cell<Phases>,
+    /// Monotonic paint counter (diagnostic).
+    paint_seq: Cell<u64>,
+    /// When the last `paint_d2d` began (diagnostic).
+    paint_begin: Cell<Option<Instant>>,
+    /// Monotonic scroll counter (diagnostic).
+    scroll_seq: Cell<u64>,
+    /// When the last scroll was applied (diagnostic).
+    scroll_at: Cell<Option<Instant>>,
 }
 
 impl MessageListWidget {
@@ -125,13 +137,15 @@ impl CustomWidget for MessageListWidget {
 
     fn paint_d2d(&self, canvas: &mut D2dCanvas<'_>, bounds: RectF, theme: &Theme) {
         self.viewport.set(bounds.height());
-        let started = std::time::Instant::now();
+        let started = Instant::now();
+        self.paint_begin.set(Some(started));
         let view = self.view.borrow();
         let rows = self.rows.borrow();
         let range = visible_range(view.scroll, bounds.height(), self.fonts.row_height, view.len);
         let selection = &view.selection;
         let focused = self.focused.get();
         let hover = self.hover.get();
+        let mut phases = Phases::default();
         for index in range {
             let Some(row) = rows.get(index) else { break };
             let top = index as f32 * self.fonts.row_height;
@@ -141,11 +155,13 @@ impl CustomWidget for MessageListWidget {
                 hovered: hover == Some(index),
                 focused,
             };
-            paint::paint_row(canvas, row, rect, visual, &self.fonts, theme);
+            paint::paint_row(canvas, row, rect, visual, &self.fonts, theme, &mut phases);
         }
         drop(rows);
         drop(view);
         self.paint_micros.set(started.elapsed().as_secs_f64() * 1_000_000.0);
+        self.phases.set(phases);
+        self.paint_seq.set(self.paint_seq.get() + 1);
     }
 
     fn input(&self, input: Input, cx: &mut WidgetCx<MessageListEvent>) {
@@ -274,9 +290,15 @@ impl<M: 'static> MessageList<M> {
             ctrl: Cell::new(false),
             shift: Cell::new(false),
             paint_micros: Cell::new(0.0),
+            phases: Cell::new(Phases::default()),
+            paint_seq: Cell::new(0),
+            paint_begin: Cell::new(None),
+            scroll_seq: Cell::new(0),
+            scroll_at: Cell::new(None),
         };
         let custom = Custom::new(ui, widget)?;
         let widget_handle = custom.widget();
+        let hwnd = custom.control().hwnd();
         let custom = custom
             .on_event(move |event| {
                 let events = events_for_dispatch.borrow();
@@ -298,9 +320,16 @@ impl<M: 'static> MessageList<M> {
             })
             .with_vscroll()
             // The scroll host owns the offset; mirror it into the widget's view
-            // state so `paint_d2d` knows which rows are visible.
+            // state so `paint_d2d` knows which rows are visible, and repaint
+            // immediately (the host moves the thumb but never invalidates — see
+            // `invalidate`).
             .on_scroll(move |offset| {
-                widget_handle.borrow().view.borrow_mut().scroll = offset.value();
+                let widget = widget_handle.borrow();
+                widget.view.borrow_mut().scroll = offset.value();
+                widget.scroll_seq.set(widget.scroll_seq.get() + 1);
+                widget.scroll_at.set(Some(Instant::now()));
+                drop(widget);
+                invalidate(hwnd);
                 None
             });
         Ok(MessageList {
@@ -421,6 +450,20 @@ impl<M: 'static> MessageList<M> {
     /// How long the last paint took, in microseconds (diagnostic).
     pub fn last_paint_micros(&self) -> f64 {
         self.custom.widget().borrow().paint_micros.get()
+    }
+
+    /// A snapshot of the widget's recent paint/scroll timing (diagnostic).
+    pub fn timing(&self) -> Timing {
+        let widget = self.custom.widget();
+        let widget = widget.borrow();
+        Timing {
+            scroll_seq: widget.scroll_seq.get(),
+            scroll_at: widget.scroll_at.get(),
+            paint_seq: widget.paint_seq.get(),
+            paint_begin: widget.paint_begin.get(),
+            paint_micros: widget.paint_micros.get(),
+            phases: widget.phases.get(),
+        }
     }
 
     /// The list's rectangle in screen coordinates, for positioning a context

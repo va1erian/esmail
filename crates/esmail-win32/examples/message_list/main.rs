@@ -4,6 +4,8 @@
 
 #[cfg(windows)]
 mod app;
+#[cfg(windows)]
+mod bench;
 
 #[cfg(windows)]
 fn main() {

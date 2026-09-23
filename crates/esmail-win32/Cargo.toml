@@ -14,6 +14,14 @@ log.workspace = true
 [target.'cfg(windows)'.dependencies]
 esmail = { path = "../esmail" }
 win32ui = { git = "https://github.com/va1erian/win32ui.git", branch = "main" }
+# Only `InvalidateRect` (the scroll-invalidate workaround in message_list.rs)
+# and, in the example, the raw WM_VSCROLL/WM_MOUSEWHEEL drives for
+# --bench-scroll. Same version and feature discipline as win32ui itself.
+windows = { version = "0.62", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 env_logger.workspace = true
