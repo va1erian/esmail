@@ -62,6 +62,20 @@ pub fn saved_auth(config: &Config, account: &AccountConfig) -> Result<Auth, Stri
     }
 }
 
+/// The banner to show when `account`'s Google refresh token is close to
+/// Google's Testing-mode 7-day expiry: a nudge to sign in again before the
+/// next connect fails with [`oauth::SignInExpired`]. `now` is unix seconds
+/// ([`oauth::now_unix`]). `None` while there is nothing to warn about.
+pub fn oauth_expiry_warning(account: &AccountConfig, now: i64) -> Option<String> {
+    if account.auth != AuthKind::GoogleOAuth || !oauth::refresh_token_expiring_soon(account.oauth_token_issued_at, now) {
+        return None;
+    }
+    Some(format!(
+        "{}: Google sign-in expires soon. Sign in with Google again under Settings > Accounts to stay connected.",
+        account.display_name
+    ))
+}
+
 /// The SASL `XOAUTH2` initial client response: `user=<user>^Aauth=Bearer
 /// <token>^A^A` (`^A` is `\x01`). Google documents this format for both IMAP
 /// and SMTP.
@@ -121,5 +135,22 @@ mod tests {
         let auth = Auth::password("hunter2");
         assert!(!auth.is_oauth());
         assert_eq!(auth.secret().await.unwrap().expose_secret(), "hunter2");
+    }
+
+    #[test]
+    fn an_oauth_account_close_to_expiry_gets_a_re_sign_in_banner() {
+        const DAY: i64 = 24 * 60 * 60;
+        let mut account = AccountConfig::new("Me".into(), "imap.gmail.com".into(), 993, "me@gmail.com".into());
+        account.auth = AuthKind::GoogleOAuth;
+        assert!(oauth_expiry_warning(&account, 0).is_none(), "no recorded issue time, nothing to warn about");
+
+        let issued = 1_700_000_000;
+        account.oauth_token_issued_at = Some(issued);
+        assert!(oauth_expiry_warning(&account, issued + 2 * DAY).is_none(), "not yet");
+        assert!(oauth_expiry_warning(&account, issued + 5 * DAY).is_some(), "within the margin");
+
+        // A password account never warns, even with a leftover timestamp.
+        account.auth = AuthKind::Password;
+        assert!(oauth_expiry_warning(&account, issued + 30 * DAY).is_none());
     }
 }

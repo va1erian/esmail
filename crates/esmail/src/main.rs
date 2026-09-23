@@ -668,10 +668,14 @@ impl EsMailApp {
         let mut accounts = Vec::new();
         let mut startup_notes = Vec::new();
         if preview.is_none() {
+            let now = oauth::now_unix();
             for account in &config.accounts {
                 match accounts::saved_auth(&config, account) {
                     Ok(auth) => {
                         accounts.push(spawn_account_view(account, auth, None, &imap_events_tx, &session_hooks));
+                        if let Some(note) = auth::oauth_expiry_warning(account, now) {
+                            startup_notes.push(note);
+                        }
                     }
                     Err(reason) => {
                         log::info!("not connecting {} at startup: {reason}", account.id);
