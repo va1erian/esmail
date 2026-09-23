@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/egui-litehtml-webview", "crates/esmail", "crates/mail-mock-server"]
+members = ["crates/egui-litehtml-webview", "crates/litehtml-view-d2d", "crates/esmail", "crates/mail-mock-server"]
 resolver = "3"
 
 [workspace.package]
