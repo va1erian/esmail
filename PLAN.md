@@ -87,31 +87,16 @@ The UI thread sends render jobs and paints the finished display lists.
 
 | # | What |
 |---|---|
-| #36 | Text selection and copy: landed except "Copy link address"; see HANDOFF.md |
-| #35 | Multiple accounts in one session: landed except a unified inbox and toast click-through |
-| #34 | Compose in a dedicated native window |
 | #32 | Umbrella: render-time breakdown and the path to sub-second |
-| #31 | Optimize dependencies in the dev profile (~15x faster dev renders) |
-| #30 | litehtml-rs: paint fast paths |
-| #29 | litehtml-rs: `draw_text` bypasses the glyph cache |
-| #28 | litehtml-rs: cache text widths in `text_width` |
-
-Not ticketed:
-
-- **Sync/search:** header list always re-fetches (no offline mode); no UID
-  paging; single-opened messages are not indexed; no server-side `UID SEARCH`;
-  `since:`/`before:`/`is:unread`/`has:attachment` parse but are not applied.
-- **Reading:** whole-message `RFC822` fetches (no `BODYSTRUCTURE`/partial
-  fetch); attachments missing for messages opened from the search cache; bulk
-  flag/move use one round trip per message; IDLE is INBOX-only and the header
-  list does not update live.
-- **Compose:** no rich text or recipient autocomplete.
-- **Notifications:** no click-to-open, no real AUMID, no settings, never
-  verified on a real machine.
-- **Polish:** per-operation progress; real first-run wizard; window saved on an
-  unplugged monitor can reopen off-screen; theme toggle saves config on the UI
-  thread.
-- **Webview:** the decoded-image cache never evicts.
+| #39 | Integrate egui_mcp for agent-driven UI prototyping and app verification |
+| #50 | Google sign-in follow-ups: token expiry in Testing mode, client secret storage, revoke on forget, other providers |
+| #54 | Sign the Windows executable and installer to avoid the SmartScreen warning |
+| #60 | Sync/search: offline mode, UID paging, indexing, server-side search, unapplied query filters |
+| #61 | Reading: partial fetch, search-cache attachments, batched flag/move, live IDLE beyond INBOX |
+| #62 | Compose: rich text and recipient autocomplete |
+| #63 | Notifications: click-to-open, real AUMID, settings, verify on a real machine |
+| #64 | Polish: per-operation progress, first-run wizard, off-screen window recovery, theme toggle off the UI thread |
+| #65 | Webview: decoded-image cache never evicts |
 
 ## Risks
 
