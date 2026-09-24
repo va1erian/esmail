@@ -194,6 +194,16 @@ pub fn clamp_scroll(scroll: f32, row_height: f32, viewport: f32, len: usize) -> 
     scroll.clamp(0.0, max_scroll(row_height, viewport, len))
 }
 
+/// How close to the last row (in rows) a scroll must get to count as near the end.
+const NEAR_END_ROWS: f32 = 10.0;
+
+/// Whether a viewport `viewport` tall, scrolled `scroll` down `len` rows of
+/// `row_height` each, shows the last rows or is within [`NEAR_END_ROWS`] of them.
+/// An empty model is always at its end.
+pub fn is_near_end(scroll: f32, viewport: f32, row_height: f32, len: usize) -> bool {
+    len as f32 * row_height - scroll - viewport <= NEAR_END_ROWS * row_height
+}
+
 /// The row indices that intersect a viewport `viewport` device-independent
 /// pixels tall, scrolled `scroll` device-independent pixels down a model of
 /// `len` fixed-height (`row_height`) rows. Empty only when there is nothing to
@@ -236,6 +246,16 @@ pub fn scroll_for_row(row: usize, row_height: f32, viewport: f32, scroll: f32) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn near_end_holds_within_ten_rows_of_the_last_one() {
+        // 100 rows of 50 tall, viewport 500: the last row is at 4500..5000.
+        assert!(!super::is_near_end(0.0, 500.0, 50.0, 100));
+        assert!(!super::is_near_end(3999.0, 500.0, 50.0, 100));
+        assert!(super::is_near_end(4000.0, 500.0, 50.0, 100));
+        assert!(super::is_near_end(4500.0, 500.0, 50.0, 100));
+        assert!(super::is_near_end(0.0, 500.0, 50.0, 0));
+    }
+
     use super::*;
 
     fn selection(selected: &[usize], anchor: Option<usize>, focus: Option<usize>) -> Selection {
