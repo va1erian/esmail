@@ -34,7 +34,11 @@ fn new_mail_is_announced_with_the_account_a_click_opens() {
     work.id = "work".into();
     config.accounts.push(work);
     // SAFETY: this is the only test in the binary, so nothing else reads the environment meanwhile.
-    unsafe { std::env::set_var("ESMAIL_PASSWORD", TEST_PASSWORD) };
+    unsafe {
+        std::env::set_var("ESMAIL_PASSWORD", TEST_PASSWORD);
+        // Keep the lookup of a saved credential away from the user's real keyring entries.
+        std::env::set_var("ESMAIL_KEYRING_SERVICE", "esmail-win32-test");
+    }
 
     let toasts: Arc<Mutex<Vec<(String, String, String)>>> = Arc::default();
     let record = Arc::clone(&toasts);
