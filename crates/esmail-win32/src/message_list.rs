@@ -13,6 +13,7 @@
 //! [`crate::state::ViewState`], so the input handling is thin glue over
 //! unit-tested transitions.
 
+mod dirty;
 mod rows;
 mod widget;
 

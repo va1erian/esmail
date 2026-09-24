@@ -11,6 +11,7 @@ use win32ui::gdi::Canvas;
 use win32ui::{CustomWidget, Input, Key, KeyResult, Modifiers, MouseButton, Point, Rect, Renderer, Theme, WidgetCx};
 
 use crate::core_glue::compose::Kind;
+use super::dirty;
 use crate::events::MessageListEvent;
 use crate::paint::{self, Fonts, Phases, RowVisual};
 use crate::selection::navigate;
@@ -99,6 +100,14 @@ impl MessageListWidget {
         Some((index, on_star))
     }
 
+    /// Repaints just `rows` (those on screen; the host clips the paint).
+    fn invalidate_rows(&self, cx: &WidgetCx<MessageListEvent>, rows: impl IntoIterator<Item = usize>) {
+        let scroll = self.view.borrow().scroll;
+        for row in rows {
+            cx.invalidate_rect(dirty::row_rect(row, self.fonts.row_height, scroll, self.scale.get(), self.width.get() * self.scale.get()));
+        }
+    }
+
     fn emit_selected(&self, cx: &WidgetCx<MessageListEvent>) {
         cx.emit(MessageListEvent::Selected(self.view.borrow().selection.selected.clone()));
     }
@@ -110,6 +119,7 @@ impl MessageListWidget {
             cx.emit(MessageListEvent::ToggleFlag(index));
             return;
         }
+        let before = self.view.borrow().selection.clone();
         {
             let mut view = self.view.borrow_mut();
             let selection = &mut view.selection;
@@ -122,7 +132,7 @@ impl MessageListWidget {
             }
         }
         self.emit_selected(cx);
-        cx.invalidate();
+        self.invalidate_rows(cx, dirty::changed_rows(&before, &self.view.borrow().selection));
     }
 
     fn context_menu(&self, x: i32, y: i32, cx: &WidgetCx<MessageListEvent>) {
@@ -144,10 +154,11 @@ impl MessageListWidget {
             Some((row, star)) => (Some(row), star),
             None => (None, false),
         };
-        let row_changed = self.hover.replace(row) != row;
+        let previous = self.hover.replace(row);
+        let row_changed = previous != row;
         let star_changed = self.star_hover.replace(star) != star;
         if row_changed || star_changed {
-            cx.invalidate();
+            self.invalidate_rows(cx, previous.into_iter().chain(row));
         }
     }
 
@@ -243,6 +254,7 @@ impl CustomWidget for MessageListWidget {
     /// `MessageListEvent::Focus`).
     fn key(&self, key: Key, modifiers: Modifiers, cx: &mut WidgetCx<MessageListEvent>) -> KeyResult {
         let page = ((self.viewport.get() / self.fonts.row_height) as usize).max(1);
+        let before = self.view.borrow().selection.clone();
         let moved = {
             let mut view = self.view.borrow_mut();
             let len = view.len;
@@ -253,7 +265,7 @@ impl CustomWidget for MessageListWidget {
             self.emit_selected(cx);
         }
         cx.emit(MessageListEvent::Focus(moved.focus));
-        cx.invalidate();
+        self.invalidate_rows(cx, dirty::changed_rows(&before, &self.view.borrow().selection));
         KeyResult::Handled
     }
 

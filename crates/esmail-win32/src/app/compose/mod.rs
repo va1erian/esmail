@@ -19,7 +19,7 @@ use win32ui::prelude::*;
 
 use super::{Msg, chrome};
 use attachments::{FileRead, pick_and_read};
-use form::Form;
+use form::{Form, Panels};
 use recipients::{Suggester, Typing, accept};
 
 /// How often a changed message is autosaved as a draft.
@@ -138,6 +138,8 @@ struct ComposeApp {
     active: Option<Field>,
     /// What was last saved as a draft (or the message opened with).
     saved: Typed,
+    /// Which optional lists are open.
+    panels: Panels,
     sending: bool,
 }
 
@@ -161,6 +163,8 @@ impl ComposeApp {
         form.body.set_text(&init.state.body);
         let attachments = init.state.attachments.clone();
         form.attachments.show(&attachments);
+        let panels = Panels { suggestions: false, attachments: !attachments.is_empty() };
+        form.arrange(ui, panels);
         let mut state = init.state;
         state.attachments = Vec::new();
 
@@ -183,6 +187,7 @@ impl ComposeApp {
             active: None,
             saved: Typed { from: None, to: String::new(), cc: String::new(), bcc: String::new(), subject: String::new(), body: String::new(), attachments: 0 },
             sending: false,
+            panels,
         };
         app.saved = app.typed();
         if init.body_first {
@@ -297,23 +302,19 @@ impl ComposeApp {
         self.show_suggestions(ui, shown);
     }
 
-    fn show_suggestions(&self, ui: &Ui<ComposeMsg>, shown: Vec<String>) {
-        let visible = !shown.is_empty();
-        let changed = self.form.suggestions.is_visible() != visible;
+    fn show_suggestions(&mut self, ui: &Ui<ComposeMsg>, shown: Vec<String>) {
+        self.panels.suggestions = !shown.is_empty();
+        self.form.arrange(ui, self.panels);
         self.form.suggestions.set_model(shown);
-        self.form.suggestions.set_visible(visible);
-        if changed {
-            ui.relayout();
-        }
     }
 
     fn accept_suggestion(&mut self, ui: &Ui<ComposeMsg>, index: usize) {
         let (Some(field), Some(suggestion)) = (self.active, self.suggester.get(index)) else { return };
-        let edit = self.form.edit(field);
-        let text = edit.text();
-        let (completed, caret) = accept(&Typing { text: &text, caret: edit.selection().end }, suggestion);
+        let text = self.form.edit(field).text();
+        let (completed, caret) = accept(&Typing { text: &text, caret: self.form.edit(field).selection().end }, suggestion);
         self.suggester.clear();
         self.show_suggestions(ui, Vec::new());
+        let edit = self.form.edit(field);
         edit.set_text(&completed);
         edit.focus();
         edit.set_selection(caret..caret);
@@ -327,6 +328,8 @@ impl ComposeApp {
                 Err(problem) => problems.push(problem),
             }
         }
+        self.panels.attachments = !self.attachments.is_empty();
+        self.form.arrange(ui, self.panels);
         self.form.attachments.show(&self.attachments);
         self.show_status(ui, &problems.join("\n"));
     }
@@ -334,8 +337,9 @@ impl ComposeApp {
     fn remove_attachment(&mut self, ui: &Ui<ComposeMsg>) {
         let Some(row) = self.form.attachments.selected().filter(|row| *row < self.attachments.len()) else { return };
         self.attachments.remove(row);
+        self.panels.attachments = !self.attachments.is_empty();
+        self.form.arrange(ui, self.panels);
         self.form.attachments.show(&self.attachments);
-        ui.relayout();
     }
 
     fn timer(&mut self) {
