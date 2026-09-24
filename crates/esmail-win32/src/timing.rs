@@ -23,6 +23,9 @@ pub struct Timing {
     pub paint_micros: f64,
     /// The layout/draw split of the most recent frame, in microseconds.
     pub phases: Phases,
+    /// How many rows the most recent frame painted. Zero while `len > 0` is a
+    /// bug: the viewport went blank.
+    pub last_rows: usize,
 }
 
 /// Workaround for a win32ui gap (see the PR's "win32ui root cause"): the

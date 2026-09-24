@@ -177,16 +177,36 @@ impl Default for ViewState {
     }
 }
 
+/// The largest meaningful scroll offset for `len` fixed-height rows in a
+/// `viewport`-tall window: the content height minus the window, or zero when
+/// the content fits. Used to keep a mirrored offset in range.
+pub fn max_scroll(row_height: f32, viewport: f32, len: usize) -> f32 {
+    (len as f32 * row_height - viewport).max(0.0)
+}
+
+/// Clamps a scroll offset to `[0, max_scroll]`. A non-finite offset (NaN, or a
+/// value from a host that overscrolled past the top) becomes zero, so callers
+/// can trust the result to index the model.
+pub fn clamp_scroll(scroll: f32, row_height: f32, viewport: f32, len: usize) -> f32 {
+    if !scroll.is_finite() {
+        return 0.0;
+    }
+    scroll.clamp(0.0, max_scroll(row_height, viewport, len))
+}
+
 /// The row indices that intersect a viewport `viewport` device-independent
 /// pixels tall, scrolled `scroll` device-independent pixels down a model of
-/// `len` fixed-height (`row_height`) rows. Empty when there is nothing to show.
+/// `len` fixed-height (`row_height`) rows. Empty only when there is nothing to
+/// show; for a non-empty model the range always holds at least one row, even
+/// for an offset at, above or beyond either end.
 pub fn visible_range(scroll: f32, viewport: f32, row_height: f32, len: usize) -> Range<usize> {
-    if len == 0 || viewport <= 0.0 || row_height <= 0.0 {
+    if len == 0 || !(viewport > 0.0) || !(row_height > 0.0) {
         return 0..0;
     }
-    let first = (scroll / row_height).floor().max(0.0) as usize;
+    let scroll = clamp_scroll(scroll, row_height, viewport, len);
+    let first = (scroll / row_height).floor() as usize;
     let last = ((scroll + viewport) / row_height).ceil() as usize;
-    first.min(len)..last.min(len)
+    first..last.clamp(first + 1, len)
 }
 
 /// The row under a document y (device-independent pixels), or `None` when the
@@ -340,6 +360,64 @@ mod tests {
         assert_eq!(visible_range(50.0, 300.0, ROW, 0), 0..0);
     }
 
+    #[test]
+    fn visible_range_is_never_empty_for_a_nonempty_model() {
+        let len = 100;
+        for scroll in [
+            -1_000.0,
+            -0.5,
+            0.0,
+            12.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            len as f32 * ROW,
+            len as f32 * ROW + 500.0,
+        ] {
+            let range = visible_range(scroll, 300.0, ROW, len);
+            assert!(
+                !range.is_empty(),
+                "scroll {scroll} produced an empty range {range:?}"
+            );
+            assert!(range.start < len && range.end <= len, "{range:?}");
+        }
+    }
+
+    #[test]
+    fn visible_range_at_or_above_the_top_shows_row_zero() {
+        for scroll in [-1_000.0, -0.5, 0.0, f32::NAN, f32::NEG_INFINITY] {
+            let range = visible_range(scroll, 300.0, ROW, 100);
+            assert_eq!(range.start, 0, "scroll {scroll} hid row 0");
+            assert!(range.contains(&0));
+        }
+    }
+
+    #[test]
+    fn visible_range_beyond_the_bottom_shows_the_last_row() {
+        let len = 100;
+        for scroll in [len as f32 * ROW, len as f32 * ROW + 1_000.0, f32::MAX] {
+            let range = visible_range(scroll, 300.0, ROW, len);
+            assert!(
+                range.contains(&(len - 1)),
+                "scroll {scroll} hid the last row"
+            );
+            assert_eq!(range.end, len);
+        }
+    }
+
+    #[test]
+    fn clamp_scroll_keeps_the_offset_in_range() {
+        let len = 100;
+        let max = len as f32 * ROW - 300.0;
+        assert_eq!(clamp_scroll(-5.0, ROW, 300.0, len), 0.0);
+        assert_eq!(clamp_scroll(f32::NAN, ROW, 300.0, len), 0.0);
+        assert_eq!(clamp_scroll(120.0, ROW, 300.0, len), 120.0);
+        assert_eq!(clamp_scroll(1e9, ROW, 300.0, len), max);
+        // A model shorter than the viewport has nowhere to scroll.
+        assert_eq!(clamp_scroll(1e9, ROW, 10_000.0, 3), 0.0);
+    }
+
     // ── row_at ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -368,6 +446,12 @@ mod tests {
     fn scroll_for_row_scrolls_down_when_the_row_is_below() {
         // Row 20 occupies 960..1008; a 300-dip viewport must start at 708.
         assert_eq!(scroll_for_row(20, ROW, 300.0, 0.0), 1008.0 - 300.0);
+    }
+
+    #[test]
+    fn ensure_visible_of_the_first_row_scrolls_to_the_top() {
+        assert_eq!(scroll_for_row(0, ROW, 300.0, 5_000.0), 0.0);
+        assert_eq!(scroll_for_row(0, ROW, 300.0, 0.0), 0.0);
     }
 
     // ── rows_inserted ───────────────────────────────────────────────────────

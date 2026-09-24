@@ -26,7 +26,7 @@ use win32ui::{
 };
 
 use crate::paint::{self, Fonts, Phases, RowVisual};
-use crate::state::{ViewState, row_at, scroll_for_row, visible_range};
+use crate::state::{ViewState, clamp_scroll, row_at, scroll_for_row, visible_range};
 use crate::timing::{invalidate, Timing};
 
 /// An event raised by a [`MessageList`], mapped to the app's `Msg` by the
@@ -107,6 +107,8 @@ struct MessageListWidget {
     scroll_seq: Cell<u64>,
     /// When the last scroll was applied (diagnostic).
     scroll_at: Cell<Option<Instant>>,
+    /// How many rows the last paint drew (diagnostic).
+    last_rows: Cell<usize>,
 }
 
 impl MessageListWidget {
@@ -136,20 +138,40 @@ impl CustomWidget for MessageListWidget {
     fn paint(&self, _canvas: &Canvas, _bounds: Rect, _theme: &Theme) {}
 
     fn paint_d2d(&self, canvas: &mut D2dCanvas<'_>, bounds: RectF, theme: &Theme) {
-        self.viewport.set(bounds.height());
+        let viewport = bounds.height();
+        let row_height = self.fonts.row_height;
+        self.viewport.set(viewport);
         let started = Instant::now();
         self.paint_begin.set(Some(started));
-        let view = self.view.borrow();
+
+        let mut view = self.view.borrow_mut();
+        let scroll = clamp_scroll(view.scroll, row_height, viewport, view.len);
+        view.scroll = scroll;
+        // The scroll host only translates the canvas when its offset is non-zero,
+        // but Direct2D keeps the render target's transform between frames, so a
+        // scroll back to the top would otherwise keep the previous frame's
+        // translation and paint every row above the viewport. Set the translation
+        // from the (clamped) mirror on every frame instead.
+        canvas.set_translation(0.0, -scroll);
+        let mut range = visible_range(scroll, viewport, row_height, view.len);
+        if range.is_empty() && view.len > 0 {
+            // A non-empty model must never leave the viewport empty: fall back to
+            // the top and repaint row 0 rather than showing nothing.
+            view.scroll = 0.0;
+            canvas.set_translation(0.0, 0.0);
+            range = visible_range(0.0, viewport, row_height, view.len);
+        }
+        self.last_rows.set(range.len());
+
         let rows = self.rows.borrow();
-        let range = visible_range(view.scroll, bounds.height(), self.fonts.row_height, view.len);
         let selection = &view.selection;
         let focused = self.focused.get();
         let hover = self.hover.get();
         let mut phases = Phases::default();
         for index in range {
             let Some(row) = rows.get(index) else { break };
-            let top = index as f32 * self.fonts.row_height;
-            let rect = RectF::new(0.0, top, bounds.width(), top + self.fonts.row_height);
+            let top = index as f32 * row_height;
+            let rect = RectF::new(0.0, top, bounds.width(), top + row_height);
             let visual = RowVisual {
                 selected: selection.contains(index),
                 hovered: hover == Some(index),
@@ -295,6 +317,7 @@ impl<M: 'static> MessageList<M> {
             paint_begin: Cell::new(None),
             scroll_seq: Cell::new(0),
             scroll_at: Cell::new(None),
+            last_rows: Cell::new(0),
         };
         let custom = Custom::new(ui, widget)?;
         let widget_handle = custom.widget();
@@ -325,7 +348,14 @@ impl<M: 'static> MessageList<M> {
             // `invalidate`).
             .on_scroll(move |offset| {
                 let widget = widget_handle.borrow();
-                widget.view.borrow_mut().scroll = offset.value();
+                let row_height = widget.fonts.row_height;
+                let viewport = widget.viewport.get();
+                let mut view = widget.view.borrow_mut();
+                // The host clamps too, but an explicit clamp here keeps the
+                // mirror in `[0, max_scroll]` even if a future host hands us an
+                // overscrolled or non-finite offset.
+                view.scroll = clamp_scroll(offset.value(), row_height, viewport, view.len);
+                drop(view);
                 widget.scroll_seq.set(widget.scroll_seq.get() + 1);
                 widget.scroll_at.set(Some(Instant::now()));
                 drop(widget);
@@ -463,6 +493,7 @@ impl<M: 'static> MessageList<M> {
             paint_begin: widget.paint_begin.get(),
             paint_micros: widget.paint_micros.get(),
             phases: widget.phases.get(),
+            last_rows: widget.last_rows.get(),
         }
     }
 
