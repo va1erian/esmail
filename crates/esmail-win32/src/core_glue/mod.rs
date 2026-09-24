@@ -14,6 +14,8 @@
 //! never blocks, so nothing here runs on the UI thread except moving events
 //! out of the channel.
 
+pub mod account_form;
+pub mod account_setup;
 mod cache;
 mod deliveries;
 pub mod images;

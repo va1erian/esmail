@@ -1233,6 +1233,14 @@ pub(crate) async fn connect_session(
     Ok(session)
 }
 
+/// Logs in and out again, to tell whether the credentials work: the account
+/// form's connection test, which must not start a session.
+pub async fn check_login(host: &str, port: u16, username: &str, auth: &Auth) -> anyhow::Result<()> {
+    let mut session = connect_session(host, port, username, auth).await?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
 /// Commands [`ImapActor`] hands off to [`spawn_body_worker`]'s dedicated
 /// connection rather than handling on its own `session`.
 enum WorkerCommand {

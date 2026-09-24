@@ -10,7 +10,10 @@ license.workspace = true
 # The mail core only: no egui, eframe, winit or webview (`cargo tree -p
 # esmail-win32 | grep egui` must stay empty, CI checks it).
 esmail = { path = "../esmail", default-features = false }
+anyhow.workspace = true
 log.workspace = true
+# Opens the Google sign-in page in the default browser.
+opener.workspace = true
 serde.workspace = true
 tokio.workspace = true
 toml.workspace = true
@@ -21,9 +24,8 @@ ureq.workspace = true
 [target.'cfg(windows)'.dependencies]
 litehtml-view-d2d = { path = "../litehtml-view-d2d" }
 win32ui = { git = "https://github.com/va1erian/win32ui.git", branch = "main" }
-# Attachment save-as/add dialogs, and opening links and files in the default app.
+# Attachment save-as/add dialogs.
 rfd.workspace = true
-opener.workspace = true
 # Only `InvalidateRect` (the scroll-invalidate workaround in message_list.rs)
 # and, in the example, the raw WM_VSCROLL/WM_MOUSEWHEEL drives for
 # --bench-scroll. Same version and feature discipline as win32ui itself.

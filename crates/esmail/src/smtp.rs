@@ -119,6 +119,16 @@ async fn build_transport(account: &SmtpAccount) -> anyhow::Result<AsyncSmtpTrans
     Ok(builder.build())
 }
 
+/// Connects and authenticates without sending anything, to tell whether the
+/// account can send: the account form's connection test.
+pub async fn check_login(account: &SmtpAccount) -> anyhow::Result<()> {
+    if build_transport(account).await?.test_connection().await? {
+        Ok(())
+    } else {
+        anyhow::bail!("the SMTP server closed the connection")
+    }
+}
+
 /// Builds the message `compose` describes, or says why it cannot be sent (an
 /// address that does not parse, say). Public so a frontend can check a message
 /// before it is sent, with the very code that will send it.
