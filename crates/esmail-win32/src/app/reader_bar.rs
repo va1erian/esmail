@@ -20,10 +20,13 @@ use super::toolbar::ActionState;
 pub enum RemoteState {
     /// No message is open: the banner is hidden.
     Absent,
-    /// Blocked; the sender names who "Always load from..." would trust.
-    Blocked { sender: Option<String> },
-    /// Loading for this message.
+    /// Blocked; `sender` names who "Always load from..." would trust, unless
+    /// the message has no address to trust.
+    Blocked { sender: String, trustable: bool },
+    /// Loading because View > Load remote images is on.
     Allowed,
+    /// Loading because the sender is on the always-load list.
+    Trusted,
 }
 
 /// Everything the reading pane's bar shows: the action state the buttons derive
@@ -74,10 +77,8 @@ impl ReaderBar {
 
         let banner = Label::new(ui, Rect::new(0, 0, 0, 0), "")?;
         let load = Button::new(ui, "Load remote images")?.on_click(|| Some(Msg::RemoteImages(true)));
-        let always = Button::new(ui, "Always load from...")?;
-        always.set_enabled(false);
-        always.set_tooltip("Trusting a sender is not wired up in the win32 build yet; use View > Load remote images per message");
-        let stop = Button::new(ui, "Stop")?.on_click(|| Some(Msg::RemoteImages(false)));
+        let always = Button::new(ui, "Always load from...")?.on_click(|| Some(Msg::TrustSender(true)));
+        let stop = Button::new(ui, "Stop")?.on_click(|| Some(Msg::StopRemoteImages));
 
         Ok(ReaderBar { reply, reply_all, forward, star, unread, archive, delete, export, banner, load, always, stop, last: RefCell::new(None) })
     }
@@ -102,14 +103,15 @@ impl ReaderBar {
                 self.always.set_visible(false);
                 self.stop.set_visible(false);
             }
-            RemoteState::Blocked { sender } => {
+            RemoteState::Blocked { sender, trustable } => {
                 self.banner.set_visible(true);
                 self.banner.set_text("Remote images are blocked.");
                 self.load.set_visible(true);
                 self.always.set_visible(true);
                 self.stop.set_visible(false);
-                let who = sender.as_deref().unwrap_or("this sender");
-                self.always.set_text(&format!("Always load from {who}"));
+                self.always.set_enabled(*trustable);
+                self.always.set_tooltip(if *trustable { "Load images from this sender's messages without asking" } else { "This message has no sender address to trust" });
+                self.always.set_text(&format!("Always load from {sender}"));
             }
             RemoteState::Allowed => {
                 self.banner.set_visible(true);
@@ -117,6 +119,17 @@ impl ReaderBar {
                 self.load.set_visible(false);
                 self.always.set_visible(false);
                 self.stop.set_visible(true);
+                self.stop.set_text("Stop");
+                self.stop.set_tooltip("Turn off View > Load remote images");
+            }
+            RemoteState::Trusted => {
+                self.banner.set_visible(true);
+                self.banner.set_text("Remote images load: you trust this sender.");
+                self.load.set_visible(false);
+                self.always.set_visible(false);
+                self.stop.set_visible(true);
+                self.stop.set_text("Untrust");
+                self.stop.set_tooltip("Stop loading this sender's images automatically");
             }
         }
         if remote_changed {
@@ -134,7 +147,7 @@ impl ReaderBar {
             .item(self.banner.fill(1))
             .item(self.load.width(dip(130.0)))
             .item(self.always.width(dip(190.0)))
-            .item(self.stop.width(dip(60.0)))
+            .item(self.stop.width(dip(72.0)))
             .height(dip(40.0))
     }
 

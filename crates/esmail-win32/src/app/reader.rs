@@ -26,6 +26,8 @@ pub struct Reader {
     view: HtmlView<Msg>,
     appearance: Appearance,
     content: Content,
+    /// Whether remote images are being fetched.
+    remote_images: bool,
 }
 
 impl Reader {
@@ -39,7 +41,7 @@ impl Reader {
                 HtmlViewEvent::LinkClicked(href) => Some(Msg::Link(href)),
             },
         )?;
-        let reader = Reader { view, appearance, content: Content::Notice(String::new(), None) };
+        let reader = Reader { view, appearance, content: Content::Notice(String::new(), None), remote_images: false };
         reader.render();
         Ok(reader)
     }
@@ -62,7 +64,11 @@ impl Reader {
 
     /// View > Load remote images: fetch the images of the message on screen (and of
     /// the next ones) from the web, or leave them blank.
-    pub fn set_remote_images(&self, allow: bool) {
+    pub fn set_remote_images(&mut self, allow: bool) {
+        if self.remote_images == allow {
+            return;
+        }
+        self.remote_images = allow;
         self.view.set_image_fetcher(allow.then(|| Arc::new(images::fetch) as ImageFetcher));
         self.render();
     }

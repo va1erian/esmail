@@ -51,7 +51,7 @@ use esmail_win32::core_glue::mailbox::OpenFolder;
 use esmail_win32::core_glue::reading::Palette;
 use esmail::compose::ComposeId;
 use esmail_win32::core_glue::compose::Kind;
-use esmail_win32::core_glue::{BodyLoads, Core, FolderRef, Latest, WindowState};
+use esmail_win32::core_glue::{BodyLoads, ConfigSaver, Core, FolderRef, Latest, WindowState};
 use accounts::{Accounts, FormRequest, ManageRequest, Outcome};
 use setup::waker;
 
@@ -89,6 +89,10 @@ enum Msg {
     SetTheme(ThemeChoice),
     /// View > Original colours.
     OriginalColours(bool),
+    /// "Always load from <sender>", and taking it back.
+    TrustSender(bool),
+    /// The banner's Stop button: turns off loading for the message on screen.
+    StopRemoteImages,
     /// Ctrl+N, Ctrl+R, Ctrl+Shift+R, Ctrl+L or the list's R, Shift+R, F.
     Compose(Kind),
     /// A compose window asks for something.
@@ -148,6 +152,8 @@ struct App {
     core: Core,
     /// The accounts as saved: what the core was started with.
     config: esmail::config::Config,
+    /// Writes `config.toml` when the trusted senders change.
+    config_saver: ConfigSaver,
     accounts: Accounts,
     /// Accounts can be added and removed (not while `--profile` reads a copy).
     editable: bool,
@@ -258,6 +264,8 @@ impl win32ui::App for App {
                 self.reader.set_original_colours(original);
                 self.refresh_menu(ui);
             }
+            Msg::TrustSender(trusted) => self.trust_sender(trusted),
+            Msg::StopRemoteImages => self.stop_remote_images(ui),
             Msg::Compose(kind) => self.open_compose(ui, kind),
             Msg::ComposeRequest(id, request) => self.compose_request(id, request),
             Msg::RemoteImages(allow) => self.set_remote_images(ui, allow),
