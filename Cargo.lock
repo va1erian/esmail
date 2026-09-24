@@ -1316,6 +1316,7 @@ dependencies = [
 name = "esmail-win32"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "embed-resource",
  "env_logger",
  "esmail",

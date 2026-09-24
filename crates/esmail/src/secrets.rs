@@ -7,9 +7,12 @@
 use secrecy::{ExposeSecret, SecretString};
 
 const SERVICE: &str = "esmail";
+/// Names another keyring service, so a test run never touches the real entries.
+const SERVICE_VAR: &str = "ESMAIL_KEYRING_SERVICE";
 
 fn entry(account_id: &str, kind: &str) -> keyring::Result<keyring::Entry> {
-    keyring::Entry::new(SERVICE, &format!("{account_id}:{kind}"))
+    let service = std::env::var(SERVICE_VAR).unwrap_or_else(|_| SERVICE.to_string());
+    keyring::Entry::new(&service, &format!("{account_id}:{kind}"))
 }
 
 /// Store `password` for `account_id`'s `kind` connection (`"imap"`/`"smtp"`).
