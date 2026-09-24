@@ -22,13 +22,21 @@ impl App {
         self.seen.cancel(ui);
         self.search.reset(ui);
         self.search_edit.set_text("");
-        ui.set_title(&format!("{} - esMail", folder.mailbox));
+        ui.set_title(&self.window_title(&folder));
         self.set_status(&format!("Loading {}...", folder.mailbox));
         self.list.set_rows(Arc::from([]));
         self.reader.show_notice("Select a message to read it.");
         self.core.cache().load_folder(folder.account, folder.mailbox.clone(), CACHED_ROWS);
         self.open = Some(OpenFolder::new(folder));
         self.request_page();
+    }
+
+    /// "INBOX - esMail", with the account named when there are several.
+    fn window_title(&self, folder: &FolderRef) -> String {
+        match self.core.accounts() {
+            [_] | [] => format!("{} - esMail", folder.mailbox),
+            accounts => format!("{} - {} - esMail", folder.mailbox, accounts[folder.account].display_name),
+        }
     }
 
     /// The cache answered with a folder's newest messages: show them, unless the
