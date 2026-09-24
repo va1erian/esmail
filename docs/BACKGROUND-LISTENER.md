@@ -113,3 +113,19 @@ plus an in-memory transport for tests.
   watcher (IDLE, then fetch on the same connection).
 - **Foreground focus**: a GUI launched from a toast click should get foreground
   rights; needs testing.
+
+## esmail-win32
+
+`esmail-win32` does not use the listener process. It keeps everything in one
+process, like the egui app's fallback mode: the account sessions the window
+already runs do the IDLE watching (their new-mail hook is the toast), the tray
+icon lives on the window's own message loop, and "Close to tray" (View menu,
+saved in `win32-settings.toml`) hides the window instead of ending the process.
+It takes the same `esmail.lock` as the egui frontend, so the two cannot run over
+one cache at once; a second `esmail-win32` (optionally with `--compose`) hands
+over through a named event, so a window in the tray has no timers to service it.
+Toasts use the per-user AppUserModelID `esmail::shell` already registers for the
+egui app (skipped when `ESMAIL_DATA_DIR` is relocated, so a test profile never
+rewrites it); a click opens that account's inbox. A running listener is not
+detected: if `esmail --background` is also running, its toasts and tray icon are
+separate from esmail-win32's.
