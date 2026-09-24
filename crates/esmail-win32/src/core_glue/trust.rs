@@ -10,6 +10,18 @@ pub fn sender_trusted(config: &Config, header: &MailHeader) -> bool {
     header.sender_address().is_some_and(|address| config.is_image_trusted(&address))
 }
 
+/// The longest sender name the "Always load from ..." button shows.
+const MAX_BUTTON_NAME: usize = 24;
+
+/// `name` shortened to fit a button, with an ellipsis where it was cut.
+pub fn button_name(name: &str) -> String {
+    if name.chars().count() <= MAX_BUTTON_NAME {
+        return name.to_string();
+    }
+    let kept: String = name.chars().take(MAX_BUTTON_NAME - 1).collect();
+    format!("{kept}\u{2026}")
+}
+
 /// Trusts (or stops trusting) `header`'s sender. Returns whether the config
 /// changed, i.e. whether it needs saving.
 pub fn set_sender_trusted(config: &mut Config, header: &MailHeader, trusted: bool) -> bool {
@@ -51,6 +63,14 @@ mod tests {
         assert!(set_sender_trusted(&mut config, &news, false));
         assert!(!set_sender_trusted(&mut config, &news, false));
         assert!(!sender_trusted(&config, &news));
+    }
+
+    #[test]
+    fn a_long_sender_name_is_cut_to_fit_the_button() {
+        assert_eq!(button_name("alice@example.com"), "alice@example.com");
+        let cut = button_name("someone.with.a.very.long.address@subdomain.example.com");
+        assert_eq!(cut.chars().count(), MAX_BUTTON_NAME);
+        assert!(cut.ends_with('\u{2026}'));
     }
 
     #[test]

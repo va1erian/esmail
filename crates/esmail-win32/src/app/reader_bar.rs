@@ -10,6 +10,7 @@ use std::cell::RefCell;
 
 use win32ui::prelude::*;
 
+use esmail_win32::core_glue::Notice;
 use esmail_win32::core_glue::compose::Kind;
 
 use super::Msg;
@@ -35,6 +36,8 @@ pub enum RemoteState {
 pub struct ReaderState {
     pub actions: ActionState,
     pub remote: RemoteState,
+    /// An account that needs signing in again: shown in the banner's place.
+    pub notice: Option<Notice>,
 }
 
 /// The reading pane's action bar and remote-images banner.
@@ -77,8 +80,12 @@ impl ReaderBar {
 
         let banner = Label::new(ui, Rect::new(0, 0, 0, 0), "")?;
         let load = Button::new(ui, "Load remote images")?.on_click(|| Some(Msg::RemoteImages(true)));
-        let always = Button::new(ui, "Always load from...")?.on_click(|| Some(Msg::TrustSender(true)));
+        let always = Button::new(ui, "Always load from...")?.on_click(|| Some(Msg::BannerAction));
         let stop = Button::new(ui, "Stop")?.on_click(|| Some(Msg::StopRemoteImages));
+
+        for button in [&load, &always, &stop] {
+            button.set_visible(false);
+        }
 
         Ok(ReaderBar { reply, reply_all, forward, star, unread, archive, delete, export, banner, load, always, stop, last: RefCell::new(None) })
     }
@@ -90,12 +97,27 @@ impl ReaderBar {
         if previous.as_ref() == Some(&state) {
             return;
         }
-        let remote_changed = previous.as_ref().is_none_or(|old| old.remote != state.remote);
+        let remote_changed = previous.as_ref().is_none_or(|old| old.remote != state.remote || old.notice != state.notice);
         let on = state.actions.message_enabled();
         for button in [&self.reply, &self.reply_all, &self.forward, &self.star, &self.unread, &self.archive, &self.delete, &self.export] {
             button.set_enabled(on);
         }
         self.star.set_text(state.actions.star_label());
+        if let Some(notice) = &state.notice {
+            let more = if notice.others > 0 { format!(" (and {} more account(s))", notice.others) } else { String::new() };
+            self.banner.set_visible(true);
+            self.banner.set_text(&format!("{}{more}", notice.text));
+            self.always.set_visible(true);
+            self.always.set_enabled(true);
+            self.always.set_text(notice.action);
+            self.always.set_tooltip("Open the account's sign-in form");
+            self.load.set_visible(false);
+            self.stop.set_visible(false);
+            if remote_changed {
+                ui.relayout();
+            }
+            return;
+        }
         match &state.remote {
             RemoteState::Absent => {
                 self.banner.set_visible(false);
@@ -146,9 +168,9 @@ impl ReaderBar {
             .spacing(dip(4.0))
             .item(self.banner.fill(1))
             .item(self.load.width(dip(130.0)))
-            .item(self.always.width(dip(190.0)))
-            .item(self.stop.width(dip(72.0)))
-            .height(dip(40.0))
+            .item(self.always.width(dip(210.0)))
+            .item(self.stop.width(dip(68.0)))
+            .height(dip(48.0))
     }
 
     /// The action-buttons row.

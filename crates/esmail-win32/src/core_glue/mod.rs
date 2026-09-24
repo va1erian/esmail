@@ -57,7 +57,7 @@ pub use queues::{QueueRow, draft_rows, outbox_rows};
 pub use results::SearchResults;
 pub use sending::Sender;
 pub use settings::{Settings, ThemeChoice};
-pub use trust::{sender_trusted, set_sender_trusted};
+pub use trust::{button_name, sender_trusted, set_sender_trusted};
 pub use window_state::WindowState;
 
 /// Set to give an account a password when the OS keyring has none (used to

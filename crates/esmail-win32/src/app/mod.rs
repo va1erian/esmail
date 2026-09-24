@@ -26,7 +26,6 @@ mod folder;
 mod instance;
 mod links;
 mod message;
-mod notice_bar;
 mod notifications;
 mod placement;
 mod preferences;
@@ -61,7 +60,6 @@ pub(crate) use setup::main;
 use esmail_win32::core_glue::{Settings, ThemeChoice};
 use instance::Launch;
 use queue::{QueueKind, Queues};
-use notice_bar::NoticeBar;
 use tray::Tray;
 use message::SeenTimer;
 use reader::Reader;
@@ -93,10 +91,9 @@ enum Msg {
     SetTheme(ThemeChoice),
     /// View > Original colours.
     OriginalColours(bool),
-    /// "Always load from <sender>", and taking it back.
-    TrustSender(bool),
-    /// The sign-in notice's button.
-    NoticeAction,
+    /// The banner's main button: signs in again when an account needs it, else
+    /// trusts the sender ("Always load from ...").
+    BannerAction,
     /// The banner's Stop button: turns off loading for the message on screen.
     StopRemoteImages,
     /// Ctrl+N, Ctrl+R, Ctrl+Shift+R, Ctrl+L or the list's R, Shift+R, F.
@@ -175,7 +172,6 @@ struct App {
     reader: Reader,
     toolbar: MainBar,
     reader_bar: ReaderBar,
-    notice_bar: NoticeBar,
     status: StatusBar<Msg>,
     theme: ThemeChoice,
     original_colours: bool,
@@ -281,13 +277,11 @@ impl win32ui::App for App {
                 self.reader.set_original_colours(original);
                 self.refresh_menu(ui);
             }
-            Msg::TrustSender(trusted) => self.trust_sender(trusted),
             Msg::StopRemoteImages => self.stop_remote_images(ui),
-            Msg::NoticeAction => {
-                if let Some(account) = self.notice_bar.account() {
-                    self.reconnect_account(ui, account);
-                }
-            }
+            Msg::BannerAction => match self.attention() {
+                Some(notice) => self.reconnect_account(ui, notice.account),
+                None => self.trust_sender(true),
+            },
             Msg::Compose(kind) => self.open_compose(ui, kind),
             Msg::ComposeRequest(id, request) => self.compose_request(id, request),
             Msg::RemoteImages(allow) => self.set_remote_images(ui, allow),
@@ -322,7 +316,6 @@ impl win32ui::App for App {
         }
         if sync_bars {
             self.sync_bars(ui);
-            self.sync_notice(ui);
         }
     }
 }
@@ -344,11 +337,10 @@ impl App {
             .on_moved(|width| Some(Msg::FoldersMoved(width.value())));
         // An extended (acrylic) title strip is not part of the frame: start below it.
         let below_strip = Insets::new(dip(0.0), ui.title_bar_height(), dip(0.0), dip(0.0));
-        let mut main = Layout::column().item(self.toolbar.bar_layout(ui.dpi()));
-        if let Some(notice) = self.notice_bar.layout() {
-            main = main.item(notice);
-        }
-        let main = main.item(panes).item(&self.status);
+        let main = Layout::column()
+            .item(self.toolbar.bar_layout(ui.dpi()))
+            .item(panes)
+            .item(&self.status);
         ui.set_layout(main.margins(below_strip));
     }
 

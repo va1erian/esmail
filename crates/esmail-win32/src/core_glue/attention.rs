@@ -19,6 +19,17 @@ pub struct Notice {
     pub others: usize,
 }
 
+/// The longest reason the banner shows; the rest would not fit its two lines.
+const MAX_REASON: usize = 60;
+
+fn shorten(reason: &str) -> String {
+    if reason.chars().count() <= MAX_REASON {
+        return reason.to_string();
+    }
+    let kept: String = reason.chars().take(MAX_REASON - 1).collect();
+    format!("{kept}\u{2026}")
+}
+
 /// The first account that needs attention, if any. `failures` holds, for each
 /// account, why it cannot sign in (`None` while it is fine); a failure outranks
 /// a token that is merely about to expire. `now` is unix seconds.
@@ -28,7 +39,7 @@ pub fn notice(accounts: &[AccountConfig], failures: &[Option<String>], now: i64)
         let google = account.auth == AuthKind::GoogleOAuth;
         let failure = failures.get(index).and_then(Option::as_deref);
         if let Some(error) = failure {
-            let first_line = error.lines().next().unwrap_or_default();
+            let first_line = shorten(error.lines().next().unwrap_or_default());
             found.push((index, format!("{}: could not sign in: {first_line}", account.display_name), if google { "Sign in again..." } else { "Reconnect..." }));
         } else if google && refresh_token_expiring_soon(account.oauth_token_issued_at, now) {
             found.push((index, format!("{}: Google sign-in expires soon.", account.display_name), "Sign in again..."));
@@ -75,6 +86,14 @@ mod tests {
         let accounts = [account("Work", false, None)];
         let flagged = notice(&accounts, &[Some("LOGIN failed\nmore".into())], 0).unwrap();
         assert_eq!((flagged.text.as_str(), flagged.action), ("Work: could not sign in: LOGIN failed", "Reconnect..."));
+    }
+
+    #[test]
+    fn a_long_reason_is_cut_to_fit_the_banner() {
+        let accounts = [account("Work", false, None)];
+        let flagged = notice(&accounts, &[Some("x".repeat(200))], 0).unwrap();
+        assert!(flagged.text.ends_with('\u{2026}'));
+        assert!(flagged.text.chars().count() < 100);
     }
 
     #[test]
