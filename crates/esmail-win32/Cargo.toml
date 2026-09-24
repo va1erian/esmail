@@ -27,10 +27,14 @@ litehtml-view-d2d = { path = "../litehtml-view-d2d" }
 win32ui = { git = "https://github.com/va1erian/win32ui.git", branch = "main" }
 # Attachment save-as/add dialogs.
 rfd.workspace = true
+# The tray icon and its menu.
+tray-icon.workspace = true
 # Only `InvalidateRect` (the scroll-invalidate workaround in message_list.rs)
 # and, in the example, the raw WM_VSCROLL/WM_MOUSEWHEEL drives for
 # --bench-scroll. Same version and feature discipline as win32ui itself.
 windows = { version = "0.62", default-features = false, features = [
+    "Win32_Security",
+    "Win32_System_Threading",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_UI_Controls",

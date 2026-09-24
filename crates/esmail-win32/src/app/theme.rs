@@ -8,7 +8,7 @@
 
 use win32ui::prelude::*;
 
-use super::args::ThemeChoice;
+use esmail_win32::core_glue::ThemeChoice;
 use super::{App, Msg, chrome};
 
 /// How often the followed system theme is compared with the reading pane.
@@ -18,21 +18,38 @@ impl App {
     /// View > Theme, and the start-up theme.
     pub(super) fn choose_theme(&mut self, ui: &mut Ui<Msg>, choice: ThemeChoice) {
         self.theme = choice;
+        self.settings.theme = choice;
+        self.save_settings();
         self.toolbar.set_theme_label(choice);
         let following = choice == ThemeChoice::System;
         ui.follow_system_theme(following);
         ui.set_theme(chrome::theme(choice));
         self.reader.set_palette(super::palette_for(&ui.theme()));
-        ui.set_menu_bar(chrome::menu_bar(self.theme, self.original_colours, self.remote_images));
+        self.refresh_menu(ui);
         self.composes.set_theme(ui.theme(), following);
         self.accounts.set_theme(ui.theme(), following);
-        match (following, self.theme_poll) {
-            (true, None) => self.theme_poll = ui.set_timer(POLL_MILLIS).ok(),
-            (false, Some(timer)) => {
-                ui.kill_timer(timer);
-                self.theme_poll = None;
-            }
-            _ => {}
+        if following {
+            self.resume_theme_poll(ui);
+        } else {
+            self.pause_theme_poll(ui);
+        }
+    }
+
+    /// Starts watching the followed system theme, unless the window is in the tray.
+    pub(super) fn resume_theme_poll(&mut self, ui: &mut Ui<Msg>) {
+        if self.theme != ThemeChoice::System || self.hidden {
+            return;
+        }
+        if self.theme_poll.is_none() {
+            self.theme_poll = ui.set_timer(POLL_MILLIS).ok();
+        }
+        self.sync_reader_theme(ui);
+    }
+
+    /// Stops the timer (a window in the tray must wake nothing).
+    pub(super) fn pause_theme_poll(&mut self, ui: &Ui<Msg>) {
+        if let Some(timer) = self.theme_poll.take() {
+            ui.kill_timer(timer);
         }
     }
 

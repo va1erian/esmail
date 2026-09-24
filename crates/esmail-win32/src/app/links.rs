@@ -9,7 +9,7 @@ use esmail_win32::core_glue::files;
 use esmail_win32::core_glue::links::{LinkAction, classify};
 use win32ui::Ui;
 
-use super::{App, Msg, chrome};
+use super::{App, Msg};
 
 impl App {
     pub(super) fn link_clicked(&mut self, ui: &Ui<Msg>, href: String) {
@@ -78,8 +78,10 @@ impl App {
     /// View > Load remote images.
     pub(super) fn set_remote_images(&mut self, ui: &Ui<Msg>, allow: bool) {
         self.remote_images = allow;
+        self.settings.remote_images = allow;
+        self.save_settings();
         self.reader.set_remote_images(allow);
-        ui.set_menu_bar(chrome::menu_bar(self.theme, self.original_colours, allow));
+        self.refresh_menu(ui);
     }
 
     pub(super) fn attachment_done(&mut self, result: std::result::Result<String, String>) {

@@ -102,7 +102,7 @@ impl App {
         if self.accounts.form_window().is_some() {
             return self.set_status("The account window is already open.");
         }
-        let init = window::Init { mode, form, host: ui.proxy(), can_sign_in_again, follow_system_theme: self.theme == super::args::ThemeChoice::System, acrylic: self.acrylic };
+        let init = window::Init { mode, form, host: ui.proxy(), can_sign_in_again, follow_system_theme: self.theme == esmail_win32::core_glue::ThemeChoice::System, acrylic: self.acrylic };
         match window::open(ui, init) {
             Ok(handle) => self.accounts.form = Some(handle),
             Err(error) => self.banner(&format!("Could not open the account window: {error}")),
@@ -117,7 +117,7 @@ impl App {
         let init = manage::Init {
             rows: status::rows(&self.config.accounts, &self.accounts.status),
             host: ui.proxy(),
-            follow_system_theme: self.theme == super::args::ThemeChoice::System,
+            follow_system_theme: self.theme == esmail_win32::core_glue::ThemeChoice::System,
             acrylic: self.acrylic,
         };
         match manage::open(ui, init) {
@@ -204,7 +204,7 @@ impl App {
     fn reload_accounts(&mut self, ui: &Ui<Msg>, config: Config) {
         self.config = config;
         let waker = super::waker(ui);
-        let (core, issues) = match Core::start(&self.config, waker) {
+        let (core, issues) = match Core::start(&self.config, waker, self.notify.clone()) {
             Ok(started) => started,
             Err(error) => return self.banner(&format!("Could not restart the mail core: {error}")),
         };

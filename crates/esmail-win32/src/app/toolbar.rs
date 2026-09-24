@@ -16,7 +16,7 @@ use win32ui::prelude::*;
 use esmail_win32::core_glue::compose::Kind;
 
 use super::Msg;
-use super::args::ThemeChoice;
+use esmail_win32::core_glue::ThemeChoice;
 
 /// The selection/action state the main toolbar's buttons derive their
 /// availability from. Pure, so it is unit-tested without a window.

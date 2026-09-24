@@ -104,7 +104,7 @@ impl App {
             contacts: Rc::new(self.contacts()),
             host: ui.proxy(),
             body_first,
-            follow_system_theme: self.theme == super::args::ThemeChoice::System,
+            follow_system_theme: self.theme == esmail_win32::core_glue::ThemeChoice::System,
             acrylic: self.acrylic,
         };
         match compose::open(ui, init) {
@@ -262,7 +262,7 @@ impl App {
 impl App {
     /// The main window's close box. Compose windows belong to it, so it waits
     /// for them: each asks about its own unsaved changes when closed.
-    pub(super) fn close(&mut self, ui: &mut Ui<Msg>) {
+    pub(super) fn close_and_quit(&mut self, ui: &mut Ui<Msg>) {
         if self.composes.any_open() {
             let _ = TaskDialog::new("Close the message windows first")
                 .content("Each unfinished message asks whether to keep it as a draft.")
@@ -271,6 +271,11 @@ impl App {
                 .show(ui);
             return;
         }
+        self.quit(ui);
+    }
+
+    /// Ends the program now, leaving any compose window to its autosaved draft.
+    pub(super) fn quit(&mut self, ui: &mut Ui<Msg>) {
         self.save_window_state(ui);
         ui.quit();
     }

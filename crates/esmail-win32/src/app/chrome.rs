@@ -5,7 +5,7 @@ use win32ui::prelude::*;
 use super::Msg;
 use esmail_win32::core_glue::compose::Kind;
 
-use super::args::ThemeChoice;
+use esmail_win32::core_glue::ThemeChoice;
 
 /// The theme for `choice`. "System" is the Windows app mode and accent colour
 /// as of now; a window following the system re-reads it when it changes.
@@ -33,9 +33,19 @@ pub fn message_menu() -> Menu<Msg> {
         .item("&Delete", None, || Msg::Delete)
 }
 
-/// File, Message and View menus; `current` marks the active theme, and the
-/// flags the state of View > Original colours and View > Load remote images.
-pub fn menu_bar(current: ThemeChoice, original_colours: bool, remote_images: bool) -> Menu<Msg> {
+/// What the View menu's checks and radio buttons show.
+#[derive(Clone, Copy)]
+pub struct ViewState {
+    pub theme: ThemeChoice,
+    pub original_colours: bool,
+    pub remote_images: bool,
+    /// `None` without a tray icon: the item would do nothing.
+    pub close_to_tray: Option<bool>,
+}
+
+/// File, Message and View menus in the state `view` describes.
+pub fn menu_bar(view: ViewState) -> Menu<Msg> {
+    let ViewState { theme: current, original_colours, remote_images, close_to_tray } = view;
     let file = Menu::new()
         .item("&New message", Shortcut::ctrl(Key::N), || Msg::Compose(Kind::New))
         .item("&Add account...", None, || Msg::AddAccount)
@@ -48,10 +58,13 @@ pub fn menu_bar(current: ThemeChoice, original_colours: bool, remote_images: boo
         .radio_item("&System (follow Windows)", None, current == ThemeChoice::System, || Msg::SetTheme(ThemeChoice::System))
         .radio_item("&Light", None, current == ThemeChoice::Light, || Msg::SetTheme(ThemeChoice::Light))
         .radio_item("&Dark", None, current == ThemeChoice::Dark, || Msg::SetTheme(ThemeChoice::Dark));
-    let view = Menu::new()
+    let mut view = Menu::new()
         .submenu("&Theme", theme)
         .checked_item("&Original colours", None, original_colours, move || Msg::OriginalColours(!original_colours))
         .checked_item("Load remote &images", None, remote_images, move || Msg::RemoteImages(!remote_images));
+    if let Some(hide) = close_to_tray {
+        view = view.separator().checked_item("&Close to tray", None, hide, move || Msg::CloseToTray(!hide));
+    }
     Menu::new().submenu("&File", file).submenu("&Message", message_menu()).submenu("&View", view)
 }
 

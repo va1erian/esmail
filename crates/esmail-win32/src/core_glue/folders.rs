@@ -139,6 +139,17 @@ impl FolderTree {
         self.accounts.get(account).map_or_else(|| default.to_string(), |a| find_special_use_mailbox(&a.rows, want, default))
     }
 
+    /// The unread messages in every account's inbox, which is what the tray
+    /// icon's tooltip counts (the other folders are not new mail).
+    pub fn inbox_unread(&self) -> u32 {
+        self.accounts
+            .iter()
+            .flat_map(|account| &account.unread)
+            .filter(|(name, _)| name.eq_ignore_ascii_case("INBOX"))
+            .map(|(_, count)| count)
+            .sum()
+    }
+
     /// The unread count for a folder, if `STATUS` reported one.
     pub fn unread(&self, folder: &FolderRef) -> Option<u32> {
         self.accounts.get(folder.account)?.unread.get(&folder.mailbox).copied()
@@ -283,6 +294,15 @@ mod tests {
         );
         assert_eq!(projects(&tree), before);
         assert_eq!(tree.selection(before), Some(FolderRef { account: 0, mailbox: "Projects".into() }));
+    }
+
+    #[test]
+    fn the_inbox_total_sums_every_accounts_inbox_and_nothing_else() {
+        let mut tree = FolderTree::new(["A".to_string(), "B".to_string()]);
+        tree.set_unread(0, HashMap::from([("INBOX".to_string(), 3), ("Projects".to_string(), 9)]));
+        tree.set_unread(1, HashMap::from([("Inbox".to_string(), 2)]));
+        assert_eq!(tree.inbox_unread(), 5);
+        assert_eq!(FolderTree::default().inbox_unread(), 0);
     }
 
     #[test]
