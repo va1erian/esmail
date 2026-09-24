@@ -95,6 +95,7 @@ impl App {
                 match outcome {
                     Ok((html, attachments)) => {
                         self.core.cache().index_mail(account, &mailbox, header.clone(), html.clone(), attachments.clone());
+                        self.allow_images_for(&header);
                         self.reader.show_message(header, html, attachments);
                         self.set_status("Ready");
                     }

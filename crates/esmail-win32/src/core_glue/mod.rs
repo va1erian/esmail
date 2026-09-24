@@ -17,6 +17,7 @@
 pub mod account_form;
 pub mod account_setup;
 mod cache;
+mod config_saver;
 mod deliveries;
 pub mod images;
 pub mod links;
@@ -31,6 +32,7 @@ pub mod resident;
 mod results;
 mod sending;
 mod settings;
+mod trust;
 mod window_state;
 
 use esmail::auth;
@@ -44,12 +46,14 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 pub use cache::{Cache, CacheEvent};
+pub use config_saver::ConfigSaver;
 pub use deliveries::{Deliveries, Delivered, Failure, Retry};
 pub use folders::{FolderRef, FolderTree, Node, NodeId};
 pub use loads::{BodyLoads, Finished, Latest};
 pub use results::SearchResults;
 pub use sending::Sender;
 pub use settings::{Settings, ThemeChoice};
+pub use trust::{sender_trusted, set_sender_trusted};
 pub use window_state::WindowState;
 
 /// Set to give an account a password when the OS keyring has none (used to

@@ -80,7 +80,7 @@ impl App {
         self.remote_images = allow;
         self.settings.remote_images = allow;
         self.save_settings();
-        self.reader.set_remote_images(allow);
+        self.reader.set_remote_images(allow || self.current_sender_trusted());
         self.refresh_menu(ui);
     }
 

@@ -28,10 +28,12 @@ impl App {
     /// there is no message at all.
     pub(super) fn remote_state(&self) -> RemoteState {
         let Some((header, _)) = self.reader.current_message() else { return RemoteState::Absent };
-        if self.remote_images {
+        if self.current_sender_trusted() {
+            RemoteState::Trusted
+        } else if self.remote_images {
             RemoteState::Allowed
         } else {
-            RemoteState::Blocked { sender: Some(header.sender_name()) }
+            RemoteState::Blocked { sender: header.sender_name(), trustable: header.sender_address().is_some() }
         }
     }
 

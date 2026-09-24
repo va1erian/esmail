@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use esmail_win32::MessageList;
-use esmail_win32::core_glue::{BodyLoads, Core, FolderTree, Latest, Settings, ThemeChoice, WindowState, load_config};
+use esmail_win32::core_glue::{BodyLoads, ConfigSaver, Core, FolderTree, Latest, Settings, ThemeChoice, WindowState, load_config};
 use win32ui::prelude::*;
 
 use super::accounts::Accounts;
@@ -135,6 +135,7 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
     let mut app = App {
         core,
         config: config.clone(),
+        config_saver: ConfigSaver::start(),
         accounts: Accounts::default(),
         editable: args.profile.is_none(),
         folders,
