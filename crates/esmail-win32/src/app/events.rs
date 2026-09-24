@@ -17,7 +17,19 @@ impl App {
         }
         self.smtp_events();
         if tree_changed {
-            self.tree.refresh();
+            self.sync_tree();
+        }
+    }
+
+    /// Brings the tree in line with the folder model, and opens an account's node
+    /// the first time its folders are known (after that it is the user's to fold).
+    fn sync_tree(&mut self) {
+        self.tree.refresh();
+        let folders = self.folders.borrow();
+        for (account, node) in folders.children(None).into_iter().enumerate() {
+            if folders.has_folders(account) && self.opened_accounts.insert(account) {
+                self.tree.expand(&node.id, true);
+            }
         }
     }
 

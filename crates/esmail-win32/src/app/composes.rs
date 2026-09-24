@@ -53,6 +53,11 @@ impl Composes {
         self.entries.values().any(|entry| entry.window.as_ref().is_some_and(WindowHandle::is_alive))
     }
 
+    /// Some open window, for a screenshot.
+    pub fn any_window(&self) -> Option<&WindowHandle<ComposeMsg>> {
+        self.entries.values().find_map(|entry| entry.window.as_ref())
+    }
+
     /// Tells every open window which theme to wear.
     pub fn set_theme(&self, theme: Theme, follow_system: bool) {
         for window in self.entries.values().filter_map(|entry| entry.window.as_ref()) {

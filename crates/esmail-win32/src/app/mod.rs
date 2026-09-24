@@ -153,6 +153,10 @@ struct App {
     theme_poll: Option<TimerId>,
     /// Asks the outbox for messages due another send attempt.
     outbox_poll: Option<TimerId>,
+    /// Accounts whose tree node was opened once their folders arrived.
+    opened_accounts: std::collections::HashSet<usize>,
+    /// `--compose`: the window to open once the folder (and the selected message) is up.
+    start_compose: Option<Kind>,
 }
 
 pub(crate) fn main() {
@@ -258,6 +262,8 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         remote_images: false,
         theme_poll: None,
         outbox_poll: ui.set_timer(composes::OUTBOX_POLL_MILLIS).ok(),
+        opened_accounts: Default::default(),
+        start_compose: args.compose,
     };
     app.layout(ui);
     ui.follow_system_theme(args.theme == ThemeChoice::System);
@@ -284,7 +290,10 @@ impl win32ui::App for App {
 
     fn update(&mut self, msg: Msg, ui: &mut Ui<Msg>) {
         match msg {
-            Msg::Wake => self.drain(),
+            Msg::Wake => {
+                self.drain();
+                self.open_requested_compose(ui);
+            }
             Msg::Frame => self.reader.invalidate(),
             Msg::Folder(id) => {
                 let folder = self.folders.borrow().selection(id);
@@ -402,13 +411,26 @@ impl App {
         }
     }
 
+    /// `--compose`: opens that window as soon as its message is on screen.
+    fn open_requested_compose(&mut self, ui: &Ui<Msg>) {
+        let loaded = self.open.as_ref().is_some_and(|o| o.loaded() > 0);
+        let expects_message = self.select_after_load.is_some() || self.selected.is_some();
+        if let Some(kind) = self.start_compose.filter(|_| loaded && (!expects_message || self.message_shown)) {
+            self.start_compose = None;
+            self.open_compose(ui, kind);
+        }
+    }
+
     /// Screenshot mode: check whether the window is ready to capture.
     fn tick(&mut self, ui: &mut Ui<Msg>) {
         let message_ready = self.message_shown && self.reader.is_ready();
         let loaded = self.open.as_ref().is_some_and(|o| o.loaded() > 0);
         let expects_message = self.select_after_load.is_some() || self.selected.is_some();
+        let ready = loaded && (!expects_message || message_ready);
+        let composed = self.start_compose.is_none();
+        let compose_window = self.composes.any_window().cloned();
         let Some((_, capture)) = self.capture.as_mut() else { return };
-        match capture.step(ui, loaded && (!expects_message || message_ready)) {
+        match capture.step(ui, ready && composed) {
             Step::Wait => {}
             Step::Repaint => {
                 self.list.invalidate();
@@ -416,7 +438,7 @@ impl App {
             }
             Step::Capture => {
                 eprintln!("esmail-win32: {}", self.startup.report(self.list.first_content_paint()));
-                capture.finish(ui);
+                capture.finish(ui, compose_window.as_ref());
             }
         }
     }
