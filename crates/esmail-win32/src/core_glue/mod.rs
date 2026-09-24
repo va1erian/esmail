@@ -27,15 +27,17 @@ pub mod mailbox;
 pub mod reading;
 mod outbox;
 pub mod compose;
+pub mod resident;
 mod results;
 mod sending;
+mod settings;
 mod window_state;
 
 use esmail::auth;
 use esmail::compose::{ComposeId, ComposeState};
 use esmail::config::{AccountConfig, Config};
 use esmail::imap::{ImapCommand, ImapEvent};
-use esmail::session::{AccountEvent, AccountSession, DEFAULT_WATCH_MAILBOX, Hooks, SessionParams};
+use esmail::session::{AccountEvent, AccountSession, DEFAULT_WATCH_MAILBOX, Hooks, NotifyFn, SessionParams};
 use esmail::smtp::SmtpEvent;
 use esmail::waker::Waker;
 use tokio::runtime::Runtime;
@@ -47,6 +49,7 @@ pub use folders::{FolderRef, FolderTree, Node, NodeId};
 pub use loads::{BodyLoads, Finished, Latest};
 pub use results::SearchResults;
 pub use sending::Sender;
+pub use settings::{Settings, ThemeChoice};
 pub use window_state::WindowState;
 
 /// Set to give an account a password when the OS keyring has none (used to
@@ -83,8 +86,9 @@ pub struct Core {
 
 impl Core {
     /// Starts a session for every account in `config` that has credentials.
-    /// Accounts that cannot start are reported, not fatal.
-    pub fn start(config: &Config, waker: Waker) -> std::io::Result<(Core, Vec<StartupIssue>)> {
+    /// Accounts that cannot start are reported, not fatal. `notify` is called (on
+    /// the runtime's threads) with each account's new-mail toast text.
+    pub fn start(config: &Config, waker: Waker, notify: NotifyFn) -> std::io::Result<(Core, Vec<StartupIssue>)> {
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("esmail-core").enable_all().build()?;
         let (event_tx, events) = mpsc::channel(256);
         let mut issues = Vec::new();
@@ -105,7 +109,7 @@ impl Core {
                             auth,
                             watch_mailbox: account.watch_mailbox.clone().unwrap_or_else(|| DEFAULT_WATCH_MAILBOX.to_string()),
                         };
-                        let hooks = Hooks { notify: std::sync::Arc::new(|_, _, _| {}), repaint: waker.clone() };
+                        let hooks = Hooks { notify: notify.clone(), repaint: waker.clone() };
                         sessions.push(Some(AccountSession::spawn(runtime.handle(), params, event_tx.clone(), hooks)));
                     }
                     Err(message) => {

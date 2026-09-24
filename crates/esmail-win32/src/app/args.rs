@@ -2,44 +2,17 @@
 
 use std::path::PathBuf;
 
+use esmail_win32::core_glue::ThemeChoice;
 use esmail_win32::core_glue::compose::Kind;
 
 const USAGE: &str = "usage: esmail-win32 [--theme light|dark|system] [--profile NAME] \
 [--screenshot OUT.png] [--select ROW] [--folder NAME] \n[--compose new|reply|reply-all|forward] [--acrylic] [--account N] [--remote-images] [--accounts]";
 
-/// How the window is themed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ThemeChoice {
-    Light,
-    Dark,
-    /// Follow the Windows app mode and accent colour, live (the default).
-    System,
-}
-
-impl ThemeChoice {
-    /// The name shown on the theme button.
-    pub fn label(self) -> &'static str {
-        match self {
-            ThemeChoice::Light => "Light",
-            ThemeChoice::Dark => "Dark",
-            ThemeChoice::System => "System",
-        }
-    }
-
-    /// The next choice in the cycle the theme button walks.
-    pub fn next(self) -> ThemeChoice {
-        match self {
-            ThemeChoice::Light => ThemeChoice::Dark,
-            ThemeChoice::Dark => ThemeChoice::System,
-            ThemeChoice::System => ThemeChoice::Light,
-        }
-    }
-}
-
 /// What the flags asked for.
 #[derive(Debug)]
 pub struct Args {
-    pub theme: ThemeChoice,
+    /// `--theme`: overrides the saved choice for this run.
+    pub theme: Option<ThemeChoice>,
     /// Read `profiles/NAME/config.toml` instead of the normal config.
     pub profile: Option<String>,
     /// Capture the window to this PNG once the first message is on screen, then exit.
@@ -69,17 +42,17 @@ impl Args {
     }
 
     fn parse_from(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
-        let mut parsed = Args { theme: ThemeChoice::System, profile: None, screenshot: None, folder: None, account: 0, select: None, compose: None, acrylic: false, remote_images: false, accounts: false };
+        let mut parsed = Args { theme: None, profile: None, screenshot: None, folder: None, account: 0, select: None, compose: None, acrylic: false, remote_images: false, accounts: false };
         while let Some(flag) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
             match flag.as_str() {
                 "--theme" => {
-                    parsed.theme = match value()?.as_str() {
+                    parsed.theme = Some(match value()?.as_str() {
                         "light" => ThemeChoice::Light,
                         "dark" => ThemeChoice::Dark,
                         "system" => ThemeChoice::System,
                         other => return Err(format!("unknown theme {other:?}\n{USAGE}")),
-                    }
+                    })
                 }
                 "--profile" => parsed.profile = Some(value()?),
                 "--screenshot" => parsed.screenshot = Some(PathBuf::from(value()?)),
@@ -116,16 +89,16 @@ mod tests {
     }
 
     #[test]
-    fn no_flags_means_the_system_theme_on_the_real_profile() {
+    fn no_flags_means_the_saved_theme_on_the_real_profile() {
         let args = parse(&[]).unwrap();
-        assert_eq!(args.theme, ThemeChoice::System);
+        assert_eq!(args.theme, None);
         assert!(args.profile.is_none() && args.screenshot.is_none());
     }
 
     #[test]
     fn every_flag_is_read() {
         let args = parse(&["--theme", "light", "--profile", "mock", "--screenshot", "a.png", "--folder", "INBOX", "--select", "2"]).unwrap();
-        assert_eq!(args.theme, ThemeChoice::Light);
+        assert_eq!(args.theme, Some(ThemeChoice::Light));
         assert_eq!(args.profile.as_deref(), Some("mock"));
         assert_eq!(args.screenshot, Some(PathBuf::from("a.png")));
         assert_eq!((args.folder.as_deref(), args.select), (Some("INBOX"), Some(2)));

@@ -23,23 +23,24 @@ mod compose;
 mod composes;
 mod events;
 mod folder;
+mod instance;
 mod links;
 mod message;
+mod notifications;
 mod placement;
+mod preferences;
 mod reader;
 mod reader_bar;
 mod screenshot;
 mod search;
+mod setup;
 mod startup;
 mod theme;
 mod toolbar;
+mod tray;
 mod tree;
 
-use std::cell::RefCell;
 use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::time::Instant;
 
 use esmail::imap::MailHeader;
 use win32ui::prelude::*;
@@ -50,9 +51,14 @@ use esmail_win32::core_glue::mailbox::OpenFolder;
 use esmail_win32::core_glue::reading::Palette;
 use esmail::compose::ComposeId;
 use esmail_win32::core_glue::compose::Kind;
-use esmail_win32::core_glue::{BodyLoads, Core, FolderRef, FolderTree, Latest, WindowState, load_config};
+use esmail_win32::core_glue::{BodyLoads, Core, FolderRef, Latest, WindowState};
 use accounts::{Accounts, FormRequest, ManageRequest, Outcome};
-use args::{Args, ThemeChoice};
+use setup::waker;
+
+pub(crate) use setup::main;
+use esmail_win32::core_glue::{Settings, ThemeChoice};
+use instance::Launch;
+use tray::Tray;
 use message::SeenTimer;
 use reader::Reader;
 use reader_bar::ReaderBar;
@@ -130,6 +136,10 @@ enum Msg {
     AccountOutcome(Outcome),
     /// The window is closing.
     Close,
+    /// The tray, a toast click or a second launch asks for something.
+    Launch(Launch),
+    /// View > Close to tray.
+    CloseToTray(bool),
     Quit,
     Timer(TimerId),
 }
@@ -192,146 +202,24 @@ struct App {
     opened_accounts: std::collections::HashSet<usize>,
     /// `--compose`: the window to open once the folder (and the selected message) is up.
     start_compose: Option<Kind>,
-}
-
-pub(crate) fn main() {
-    let began = Instant::now();
-    let args = match Args::parse() {
-        Ok(args) => args,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
-    let config = match load_config(args.profile.as_deref()) {
-        Ok(config) => config,
-        Err(message) => {
-            eprintln!("esmail-win32: {message}");
-            std::process::exit(1);
-        }
-    };
-
-    let theme = chrome::theme(args.theme);
-    let spec = chrome::acrylic(WindowSpec::new("esMail").size(dip(1200.0), dip(760.0)).theme(theme), args.acrylic);
-    let result = win32ui::run_app(spec, |ui| {
-        build(ui, &args, &config, began)
-    });
-    if let Err(error) = result {
-        eprintln!("esmail-win32 failed: {error}");
-        std::process::exit(1);
-    }
+    /// The saved View choices, and the file that keeps them (none for
+    /// `--screenshot` runs, which must not change it).
+    settings: Settings,
+    settings_path: Option<PathBuf>,
+    /// The tray icon; none in `--screenshot` and `--profile` runs, or when the
+    /// shell has no notification area.
+    tray: Option<Tray>,
+    /// The window is hidden in the tray.
+    hidden: bool,
+    /// The unread total last put in the window title.
+    title_unread: u32,
+    /// Called with each batch of new mail; what the account sessions are started with.
+    notify: esmail::session::NotifyFn,
 }
 
 /// The reading pane's palette for a window theme.
 fn palette_for(theme: &Theme) -> Palette {
     if theme.is_dark { Palette::DARK } else { Palette::LIGHT }
-}
-
-fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: Instant) -> App {
-    let (core, issues) = Core::start(config, waker(ui)).expect("start the async runtime");
-
-    let folders: SharedFolders = Rc::new(RefCell::new(FolderTree::new(config.accounts.iter().map(|a| a.display_name.clone()))));
-    let tree = tree::build(ui, &folders).expect("folder tree");
-    let list = MessageList::new(ui)
-        .expect("message list")
-        .on_select(|rows| Some(Msg::Selected(rows.to_vec())))
-        .on_open(|row| Some(Msg::Open(row)))
-        .on_toggle_flag(|row| Some(Msg::ToggleFlagAt(row)))
-        .on_delete(|_| Some(Msg::Delete))
-        .on_context(|_, _| Some(Msg::Context))
-        .on_near_end(|| Some(Msg::NearEnd))
-        .on_compose(|kind| Some(Msg::Compose(kind)));
-    let search_edit = Edit::single_line(ui)
-        .expect("search box")
-        .cue("Search mail (Ctrl+F)")
-        .on_change(|text| Some(Msg::SearchChanged(text.to_string())))
-        .on_focus(|focused| Some(Msg::SearchFocused(focused)));
-    let reader = Reader::new(ui, palette_for(&ui.theme())).expect("reading pane");
-    let toolbar = MainBar::new(ui, args.theme).expect("main toolbar");
-    let reader_bar = ReaderBar::new(ui).expect("reader action bar");
-    let status = StatusBar::new(ui).expect("status bar");
-    status.set_parts(&[-1]);
-
-    ui.set_menu_bar(chrome::menu_bar(args.theme, false, args.remote_images));
-    ui.accelerator(Shortcut::ctrl(Key::F), || Some(Msg::SearchFocus));
-    ui.accelerator(Shortcut::key(Key::ESCAPE), || Some(Msg::SearchClear));
-    ui.accelerator(Shortcut::key(Key::RETURN), || Some(Msg::Enter));
-    ui.on_close(|| Some(Msg::Close));
-    ui.on_timer(|id| Some(Msg::Timer(id)));
-    let capture = args.screenshot.clone().map(|path| (ui.set_timer(50).expect("screenshot timer"), Capture::new(path)));
-    let window_path = if args.screenshot.is_some() { None } else { WindowState::path() };
-    let window = window_path.as_deref().map(WindowState::load).unwrap_or_default();
-
-    let mut app = App {
-        core,
-        config: config.clone(),
-        accounts: Accounts::default(),
-        editable: args.profile.is_none(),
-        folders,
-        list,
-        search_edit,
-        search: SearchState::default(),
-        tree,
-        reader,
-        toolbar,
-        reader_bar,
-        status,
-        theme: args.theme,
-        original_colours: false,
-        open: None,
-        wanted_folder: args.folder.clone(),
-        wanted_account: args.account,
-        bodies: BodyLoads::default(),
-        selected: None,
-        selected_in: None,
-        seen: SeenTimer::default(),
-        action_ids: Latest::default(),
-        pending_actions: 0,
-        message_shown: false,
-        select_after_load: args.select,
-        capture,
-        window,
-        window_path,
-        startup: Startup::new(began),
-        composes: Composes::default(),
-        remote_images: args.remote_images,
-        theme_poll: None,
-        outbox_poll: ui.set_timer(composes::OUTBOX_POLL_MILLIS).ok(),
-        acrylic: args.acrylic,
-        opened_accounts: Default::default(),
-        start_compose: args.compose,
-    };
-    app.layout(ui);
-    app.reader.set_remote_images(args.remote_images);
-    ui.follow_system_theme(args.theme == ThemeChoice::System);
-    if args.theme == ThemeChoice::System {
-        app.theme_poll = ui.set_timer(theme::POLL_MILLIS).ok();
-    }
-    if let Some(bounds) = app.window.bounds {
-        placement::restore(ui.hwnd(), bounds, app.window.maximized);
-    }
-    app.accounts.reset_status(app.core.accounts().len());
-    if app.core.accounts().is_empty() {
-        app.reader.show_notice("No accounts are set up. Use File > Add account... to add one.");
-        ui.emit(Msg::AddAccount);
-    }
-    if args.accounts {
-        ui.emit(Msg::ManageAccounts);
-    }
-    for issue in issues {
-        app.account_failed(issue.account, issue.message);
-    }
-    app.open_from_cache(ui);
-    app.core.cache().due_outbox();
-    app
-}
-
-/// What makes the window drain the core: called from any thread.
-fn waker(ui: &Ui<Msg>) -> esmail::waker::Waker {
-    let proxy = ui.proxy();
-    Arc::new(move || {
-        let _ = proxy.send(Msg::Wake);
-    })
 }
 
 impl win32ui::App for App {
@@ -342,6 +230,7 @@ impl win32ui::App for App {
         match msg {
             Msg::Wake => {
                 self.drain();
+                self.sync_unread(ui);
                 self.open_requested_compose(ui);
             }
             Msg::Frame => self.reader.invalidate(),
@@ -367,7 +256,7 @@ impl win32ui::App for App {
             Msg::OriginalColours(original) => {
                 self.original_colours = original;
                 self.reader.set_original_colours(original);
-                ui.set_menu_bar(chrome::menu_bar(self.theme, original, self.remote_images));
+                self.refresh_menu(ui);
             }
             Msg::Compose(kind) => self.open_compose(ui, kind),
             Msg::ComposeRequest(id, request) => self.compose_request(id, request),
@@ -394,7 +283,9 @@ impl win32ui::App for App {
             Msg::ManageRequest(request) => self.manage_request(ui, request),
             Msg::AccountOutcome(outcome) => self.account_outcome(ui, outcome),
             Msg::Close => self.close(ui),
-            Msg::Quit => ui.quit(),
+            Msg::Quit => self.quit(ui),
+            Msg::Launch(launch) => self.launch(ui, launch),
+            Msg::CloseToTray(on) => self.set_close_to_tray(ui, on),
             Msg::Timer(id) => self.timer(ui, id),
         }
         if sync_bars {
