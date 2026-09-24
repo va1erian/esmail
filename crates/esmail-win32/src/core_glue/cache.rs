@@ -143,6 +143,12 @@ impl Cache {
         });
     }
 
+    /// Forgets everything cached for the account with this id: its mail must not
+    /// keep turning up in search once the account is gone.
+    pub fn remove_account(&self, account_id: &str) {
+        self.command(DbCommand::RemoveAccount { account_id: account_id.to_string() });
+    }
+
     /// Caches headers the server listed, so they are shown at the next start
     /// and found by search.
     pub fn index_headers(&self, account: usize, mailbox: &str, headers: &[MailHeader]) {

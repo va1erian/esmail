@@ -24,6 +24,7 @@ impl App {
         self.reader.set_palette(super::palette_for(&ui.theme()));
         ui.set_menu_bar(chrome::menu_bar(self.theme, self.original_colours, self.remote_images));
         self.composes.set_theme(ui.theme(), following);
+        self.accounts.set_theme(ui.theme(), following);
         match (following, self.theme_poll) {
             (true, None) => self.theme_poll = ui.set_timer(POLL_MILLIS).ok(),
             (false, Some(timer)) => {

@@ -22,6 +22,7 @@ impl App {
             LinkAction::SaveAttachment(n) => self.save_attachment(ui, n),
             LinkAction::OpenAttachment(n) => self.open_attachment(ui, n),
             LinkAction::SaveAllAttachments => self.save_all_attachments(ui),
+            LinkAction::Reconnect(account) => self.reconnect_account(ui, account),
             LinkAction::Refuse(reason) => self.set_status(&reason),
         }
     }

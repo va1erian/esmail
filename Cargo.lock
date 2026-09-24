@@ -1326,6 +1326,7 @@ dependencies = [
  "opener",
  "png 0.17.16",
  "rfd",
+ "secrecy",
  "serde",
  "tokio",
  "toml 0.8.23",

@@ -52,6 +52,7 @@ impl App {
 
     /// Applies one event. Returns whether the folder tree needs syncing.
     fn handle(&mut self, account: usize, event: ImapEvent) -> bool {
+        self.track_status(account, &event);
         match event {
             ImapEvent::Connected => {
                 self.set_status("Connected");

@@ -38,6 +38,8 @@ pub fn message_menu() -> Menu<Msg> {
 pub fn menu_bar(current: ThemeChoice, original_colours: bool, remote_images: bool) -> Menu<Msg> {
     let file = Menu::new()
         .item("&New message", Shortcut::ctrl(Key::N), || Msg::Compose(Kind::New))
+        .item("&Add account...", None, || Msg::AddAccount)
+        .item("A&ccounts...", None, || Msg::ManageAccounts)
         .separator()
         .item("&Refresh folder", Shortcut::key(Key::F5), || Msg::Refresh)
         .separator()

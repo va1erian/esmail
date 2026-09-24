@@ -10,49 +10,73 @@ pub const GMAIL_IMAP_HOST: &str = "imap.gmail.com";
 /// The form's fields, as typed. Ports stay text until [`AccountForm::to_account`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountForm {
+    /// The name shown for the account; the address when left empty.
     pub display_name: String,
+    /// The address, which is also the login name.
     pub email: String,
+    /// How to sign in.
     pub auth: AuthKind,
+    /// The password; unused for Google sign-in.
     pub password: String,
+    /// The IMAP server (always implicit TLS: the mail core has no other mode).
     pub imap_host: String,
+    /// The IMAP port, as typed.
     pub imap_port: String,
+    /// The SMTP server.
     pub smtp_host: String,
+    /// The SMTP port, as typed.
     pub smtp_port: String,
+    /// How the SMTP connection is secured.
     pub smtp_tls: TlsMode,
 }
 
 /// A field a [`FormError`] points at, so the window can focus it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
+    /// The email address.
     Email,
+    /// The password.
     Password,
+    /// The IMAP host.
     ImapHost,
+    /// The IMAP port.
     ImapPort,
+    /// The SMTP host.
     SmtpHost,
+    /// The SMTP port.
     SmtpPort,
 }
 
 /// Why the form cannot become an account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormError {
+    /// The field to fix.
     pub field: Field,
+    /// What is wrong with it.
     pub message: &'static str,
 }
 
 /// Server settings guessed from an email address.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Preset {
+    /// The IMAP host.
     pub imap_host: String,
+    /// The IMAP port.
     pub imap_port: u16,
+    /// The SMTP host.
     pub smtp_host: String,
+    /// The SMTP port.
     pub smtp_port: u16,
+    /// The SMTP security.
     pub smtp_tls: TlsMode,
+    /// The sign-in method to start with.
     pub auth: AuthKind,
 }
 
 /// A [`Preset`] and how far to trust it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Detection {
+    /// The settings.
     pub preset: Preset,
     /// The domain is a provider esMail knows. Otherwise the hosts are the
     /// `imap.` / `smtp.` convention applied to the domain, and the user should
