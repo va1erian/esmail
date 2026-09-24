@@ -20,6 +20,14 @@ pub enum Status {
 }
 
 impl Status {
+    /// Why the account cannot sign in, while it cannot.
+    pub fn failure(&self) -> Option<&str> {
+        match self {
+            Status::Failed(error) => Some(error),
+            _ => None,
+        }
+    }
+
     /// The status after `event`, if the event changes it. An error only counts
     /// while the account has not signed in: later ones belong to single
     /// requests (a folder that cannot be opened) and say nothing about the
@@ -28,7 +36,10 @@ impl Status {
         match event {
             ImapEvent::Connected => Some(Status::Connected),
             ImapEvent::Disconnected => Some(Status::Reconnecting),
-            ImapEvent::Error(error) if !matches!(self, Status::Connected | Status::Reconnecting) => Some(Status::Failed(error.clone())),
+            // A command sent while the session is still signing in is refused with
+            // this; it says nothing about the credentials.
+            ImapEvent::Error(error) if error.starts_with("not connected") => None,
+            ImapEvent::Error(error) if !matches!(self, Status::Connected | Status::Reconnecting) || (matches!(self, Status::Reconnecting) && is_sign_in_error(error)) => Some(Status::Failed(error.clone())),
             _ => None,
         }
     }
@@ -41,6 +52,17 @@ impl Status {
             Status::Failed(error) => format!("Not signed in: {}", error.lines().next().unwrap_or_default()),
         }
     }
+}
+
+/// Whether `error` says the server or the token endpoint no longer accepts the
+/// account's credentials, as opposed to a network failure. A session that was
+/// signed in and then finds its credentials refused (a password changed, a
+/// Google token that expired) must not sit at "reconnecting" for ever.
+fn is_sign_in_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    ["authenticationfailed", "authentication failed", "invalid credentials", "login failed", "sign in with google again", "no longer accepts the saved sign-in"]
+        .iter()
+        .any(|marker| error.contains(marker))
 }
 
 /// The Accounts window's rows for `accounts` and their `statuses`.
@@ -78,9 +100,24 @@ mod tests {
     }
 
     #[test]
+    fn a_command_sent_before_the_session_is_up_does_not_fail_the_account() {
+        assert_eq!(Status::Connecting.after(&ImapEvent::Error("not connected yet".into())), None);
+    }
+
+    #[test]
     fn an_error_of_one_request_leaves_a_connected_account_alone() {
         assert_eq!(Status::Connected.after(&ImapEvent::Error("no such folder".into())), None);
         assert_eq!(Status::Reconnecting.after(&ImapEvent::Error("timeout".into())), None);
+    }
+
+    #[test]
+    fn a_refused_login_after_signing_in_fails_the_account_but_a_timeout_does_not() {
+        let refused = ImapEvent::Error("No Response: [AUTHENTICATIONFAILED] Invalid credentials".into());
+        assert_eq!(Status::Reconnecting.after(&refused), Some(Status::Failed("No Response: [AUTHENTICATIONFAILED] Invalid credentials".into())));
+        let expired = ImapEvent::Error("Google no longer accepts the saved sign-in. Sign in with Google again.".into());
+        assert!(matches!(Status::Reconnecting.after(&expired), Some(Status::Failed(_))));
+        assert_eq!(Status::Reconnecting.after(&ImapEvent::Error("connection timed out".into())), None);
+        assert_eq!(Status::Connected.after(&refused), None, "a connected account's request errors are not sign-in failures");
     }
 
     #[test]

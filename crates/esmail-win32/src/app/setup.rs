@@ -15,6 +15,7 @@ use super::args::Args;
 use super::composes::{self, Composes};
 use super::instance::{self, Claim, Waiting};
 use super::message::SeenTimer;
+use super::notice_bar::NoticeBar;
 use super::reader::Reader;
 use super::reader_bar::ReaderBar;
 use super::screenshot::Capture;
@@ -121,6 +122,7 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
     let reader = Reader::new(ui, palette_for(&ui.theme())).expect("reading pane");
     let toolbar = MainBar::new(ui, settings.theme).expect("main toolbar");
     let reader_bar = ReaderBar::new(ui).expect("reader action bar");
+    let notice_bar = NoticeBar::new(ui).expect("sign-in notice");
     let status = StatusBar::new(ui).expect("status bar");
     status.set_parts(&[-1]);
 
@@ -147,6 +149,7 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         reader,
         toolbar,
         reader_bar,
+        notice_bar,
         status,
         theme: settings.theme,
         original_colours: false,

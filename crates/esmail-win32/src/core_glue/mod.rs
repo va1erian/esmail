@@ -16,6 +16,7 @@
 
 pub mod account_form;
 pub mod account_setup;
+mod attention;
 mod cache;
 mod config_saver;
 mod deliveries;
@@ -46,6 +47,7 @@ use esmail::waker::Waker;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
+pub use attention::{Notice, notice as account_notice};
 pub use cache::{Cache, CacheEvent};
 pub use config_saver::ConfigSaver;
 pub use deliveries::{Deliveries, Delivered, Failure, Retry};
