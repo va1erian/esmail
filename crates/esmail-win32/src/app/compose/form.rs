@@ -11,6 +11,15 @@ const CAPTION_WIDTH: f32 = 70.0;
 /// Height of one field row, in dips.
 const ROW_HEIGHT: f32 = 28.0;
 
+/// Which optional lists are open.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct Panels {
+    /// The address suggestions.
+    pub suggestions: bool,
+    /// The attachments.
+    pub attachments: bool,
+}
+
 /// Every widget of the window.
 pub struct Form {
     pub from: ComboBox<usize, ComposeMsg>,
@@ -58,7 +67,6 @@ impl Form {
         let suggestions = ListView::new(ui)?
             .column("Suggestions (Ctrl+Space takes the first)", Fill, |address: &String| address.as_str())
             .on_select(|rows| rows.first().map(|row| ComposeMsg::Suggestion(*row)));
-        suggestions.set_visible(false);
         let form = Form {
             from,
             to: recipient(ui, Field::To)?,
@@ -77,11 +85,15 @@ impl Form {
             _captions: ["From", "To", "Cc", "Bcc", "Subject", ""].into_iter().map(|text| Label::new(ui, Rect::default(), text)).collect::<win32ui::Result<_>>()?,
         };
         form.status.set_visible(false);
-        form.layout(ui);
+        form.arrange(ui, Panels::default());
         Ok(form)
     }
 
-    fn layout(&self, ui: &Ui<ComposeMsg>) {
+    /// Lays the form out with the optional lists open or closed. A closed list is
+    /// zero-high rather than hidden: a native list that starts hidden does not paint
+    /// its rows once shown.
+    pub fn arrange(&self, ui: &Ui<ComposeMsg>, panels: Panels) {
+        let open = |open: bool, height: f32| dip(if open { height } else { 0.0 });
         let caption = |index: usize| self._captions[index].width(dip(CAPTION_WIDTH));
         let field = |index: usize, edit: &Edit<ComposeMsg>| row![caption(index), edit.fill(1)].height(dip(ROW_HEIGHT));
         ui.set_layout(
@@ -90,10 +102,10 @@ impl Form {
                 field(1, &self.to),
                 field(2, &self.cc),
                 field(3, &self.bcc),
-                self.suggestions.height(dip(120.0)),
+                self.suggestions.height(open(panels.suggestions, 136.0)),
                 field(4, &self.subject),
                 self.body.fill(1),
-                self.attachments.list.height(dip(84.0)),
+                self.attachments.list.height(open(panels.attachments, 84.0)),
                 self.status.height(dip(52.0)),
                 row![self.add.width(dip(120.0)), self.remove.width(dip(90.0)), self._captions[5].fill(1), self.save.width(dip(110.0)), self.discard.width(dip(90.0)), self.send.width(dip(150.0))]
                     .spacing(dip(8.0))

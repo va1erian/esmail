@@ -27,8 +27,8 @@ impl AttachmentList {
         let list = ListView::new(ui)?
             .column("Attachment", Fill, |row: &Row| row.name.as_str())
             .column_right("Size", dip(90.0), |row: &Row| row.size.as_str())
+            .zebra(true)
             .on_key(|key, _| (key == Key::DELETE).then_some(ComposeMsg::RemoveAttachment));
-        list.set_visible(false);
         Ok(AttachmentList { list })
     }
 
@@ -36,7 +36,6 @@ impl AttachmentList {
     /// exists.
     pub fn show(&self, attachments: &[(String, Vec<u8>)]) {
         let rows: Vec<Row> = attachments.iter().map(|(name, data)| Row { name: name.clone(), size: format_size(data.len()) }).collect();
-        self.list.set_visible(!rows.is_empty());
         self.list.set_model(rows);
     }
 

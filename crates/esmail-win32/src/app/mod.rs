@@ -227,10 +227,6 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
     ui.accelerator(Shortcut::key(Key::ESCAPE), || Some(Msg::SearchClear));
     ui.accelerator(Shortcut::key(Key::RETURN), || Some(Msg::Enter));
     ui.accelerator(Shortcut::ctrl(Key::Q), || Some(Msg::Quit));
-    ui.accelerator(Shortcut::ctrl(Key::N), || Some(Msg::Compose(Kind::New)));
-    ui.accelerator(Shortcut::ctrl(Key::R), || Some(Msg::Compose(Kind::Reply)));
-    ui.accelerator(Shortcut::ctrl(Key::R).with_shift(), || Some(Msg::Compose(Kind::ReplyAll)));
-    ui.accelerator(Shortcut::ctrl(Key::L), || Some(Msg::Compose(Kind::Forward)));
     ui.on_close(|| Some(Msg::Close));
     ui.on_timer(|id| Some(Msg::Timer(id)));
     let capture = args.screenshot.clone().map(|path| (ui.set_timer(50).expect("screenshot timer"), Capture::new(path)));
