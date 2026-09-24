@@ -25,56 +25,12 @@ use win32ui::{
     Theme, Themed, Ui, WidgetCx, dip,
 };
 
+use crate::events::MessageListEvents;
 use crate::paint::{self, Fonts, Phases, RowVisual};
-use crate::state::{ViewState, clamp_scroll, row_at, scroll_for_row, visible_range};
+use crate::state::{ViewState, clamp_scroll, is_near_end, row_at, scroll_for_row, visible_range};
 use crate::timing::{invalidate, Timing};
 
-/// An event raised by a [`MessageList`], mapped to the app's `Msg` by the
-/// closures given at construction.
-#[derive(Clone, Debug)]
-pub enum MessageListEvent {
-    /// The selection changed. Carries every selected row, ascending.
-    Selected(Vec<usize>),
-    /// A row was opened (Enter or double-click).
-    Open(usize),
-    /// The selected rows were deleted.
-    Delete(Vec<usize>),
-    /// The flag of the focused row should toggle (Space).
-    ToggleFlag(usize),
-    /// A context menu was requested for `row` at the pointer position `at`
-    /// (client coordinates, device pixels).
-    Context {
-        /// The row the pointer is over.
-        row: usize,
-        /// The pointer position in client coordinates (device pixels).
-        at: Point,
-    },
-}
-
-type SelectMapper<M> = Box<dyn Fn(&[usize]) -> Option<M>>;
-type RowMapper<M> = Box<dyn Fn(usize) -> Option<M>>;
-type ContextMapper<M> = Box<dyn Fn(usize, Point) -> Option<M>>;
-
-/// The app-side event mappings a [`MessageList`] is built with.
-struct MessageListEvents<M> {
-    on_select: Option<SelectMapper<M>>,
-    on_open: Option<RowMapper<M>>,
-    on_delete: Option<Box<dyn Fn(&[usize]) -> Option<M>>>,
-    on_flag: Option<RowMapper<M>>,
-    on_context: Option<ContextMapper<M>>,
-}
-
-impl<M> MessageListEvents<M> {
-    fn new() -> MessageListEvents<M> {
-        MessageListEvents {
-            on_select: None,
-            on_open: None,
-            on_delete: None,
-            on_flag: None,
-            on_context: None,
-        }
-    }
-}
+pub use crate::events::MessageListEvent;
 
 /// The owner-drawn widget behind a [`MessageList`]. All mutable state lives in
 /// `Cell`/`RefCell` fields because the `CustomWidget` trait hands the widget
@@ -301,6 +257,7 @@ impl<M: 'static> MessageList<M> {
         let scale = ui.dpi() as f32 / 96.0;
         let events = Rc::new(RefCell::new(MessageListEvents::new()));
         let events_for_dispatch = events.clone();
+        let events_for_scroll = events.clone();
         let widget = MessageListWidget {
             fonts,
             rows: RefCell::new(Arc::from([])),
@@ -358,9 +315,13 @@ impl<M: 'static> MessageList<M> {
                 drop(view);
                 widget.scroll_seq.set(widget.scroll_seq.get() + 1);
                 widget.scroll_at.set(Some(Instant::now()));
+                let near_end = {
+                    let view = widget.view.borrow();
+                    is_near_end(view.scroll, widget.viewport.get(), widget.fonts.row_height, view.len)
+                };
                 drop(widget);
                 invalidate(hwnd);
-                None
+                if near_end { events_for_scroll.borrow().on_near_end.as_ref().and_then(|f| f()) } else { None }
             });
         Ok(MessageList {
             custom,
@@ -397,6 +358,21 @@ impl<M: 'static> MessageList<M> {
     pub fn on_context(self, f: impl Fn(usize, Point) -> Option<M> + 'static) -> MessageList<M> {
         self.events.borrow_mut().on_context = Some(Box::new(f));
         self
+    }
+
+    /// Maps "the view scrolled to within a few rows of the last one" to a
+    /// message. Raised on every scroll while that holds, so the app dedups
+    /// (it is how an app loads the next page of a long mailbox).
+    pub fn on_near_end(self, f: impl Fn() -> Option<M> + 'static) -> MessageList<M> {
+        self.events.borrow_mut().on_near_end = Some(Box::new(f));
+        self
+    }
+
+    /// Replaces the model with a longer one that starts with the same rows (an
+    /// older page appended), keeping the scroll position and the selection.
+    pub fn extend_rows(&self, rows: Arc<[RowModel]>) {
+        *self.custom.widget().borrow().rows.borrow_mut() = rows;
+        self.rows_inserted(0..0);
     }
 
     /// Replaces the model. This is a new mailbox: the selection is dropped and

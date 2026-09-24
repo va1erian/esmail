@@ -46,6 +46,14 @@ jobs:
       - name: Run unit tests
         run: cargo test --workspace
 
+      # esmail-win32 is the egui-free frontend; a dependency that drags egui
+      # (or winit, which only the egui frontend needs) back in defeats it.
+      - name: esmail-win32 stays egui-free
+        run: |
+          if cargo tree -p esmail-win32 -e normal --prefix none | grep -E '^(egui|eframe|egui_glow|egui-litehtml-webview|winit|epaint) '; then
+            echo "esmail-win32 must not depend on egui"; exit 1
+          fi
+
       # mail-mock-server's TLS identity is a committed, throwaway test
       # certificate (crates/mail-mock-server/certs/) -- trusting its CA as
       # an extra system root lets esmail's real (unmodified) TLS code in
@@ -95,3 +103,9 @@ jobs:
             Write-Error "the esmail library still depends on egui with egui-frontend off:`n$($matches -join "`n")"
             exit 1
           }
+      - name: esmail-win32 stays egui-free
+        shell: bash
+        run: |
+          if cargo tree -p esmail-win32 -e normal --prefix none | grep -E '^(egui|eframe|egui_glow|egui-litehtml-webview|winit|epaint) '; then
+            echo "esmail-win32 must not depend on egui"; exit 1
+          fi

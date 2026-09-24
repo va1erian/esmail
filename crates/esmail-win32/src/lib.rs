@@ -36,17 +36,28 @@
 //!
 //! # On other targets
 //!
-//! This crate compiles to an empty crate on non-Windows so the workspace's
-//! Linux CI stays green.
+//! Only the widgets are Windows-only. [`core_glue`], the frontend-independent
+//! layer that drives esMail's IMAP actors, builds everywhere so its logic is
+//! unit-tested on Linux CI too; the `esmail-win32` binary is an empty `main`
+//! there.
 
-#![cfg(windows)]
 #![warn(missing_docs)]
 
+pub mod core_glue;
+#[cfg(windows)]
+mod events;
+#[cfg(windows)]
 mod message_list;
+#[cfg(windows)]
 mod paint;
+#[cfg(windows)]
 mod state;
+#[cfg(windows)]
 mod timing;
 
+#[cfg(windows)]
 pub use message_list::{MessageList, MessageListEvent};
+#[cfg(windows)]
 pub use paint::Phases;
+#[cfg(windows)]
 pub use timing::Timing;

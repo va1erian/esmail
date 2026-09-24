@@ -1,19 +1,25 @@
 [package]
 name = "esmail-win32"
-description = "The esMail message list rebuilt as a reusable win32ui component (Direct2D + DirectWrite, virtualized). Internal to this workspace."
+description = "esMail on win32ui: a native, egui-free Windows frontend (read-only 3-pane prototype) plus the reusable message list widget. Internal to this workspace."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
 
 [dependencies]
+# The mail core only: no egui, eframe, winit or webview (`cargo tree -p
+# esmail-win32 | grep egui` must stay empty, CI checks it).
+esmail = { path = "../esmail", default-features = false }
 log.workspace = true
+tokio.workspace = true
+toml.workspace = true
 
 # Windows-only: the Direct2D/DirectWrite backend, the widget host, and the
-# `esmail` library half (for `view_model::RowModel`).
+# HTML reading pane.
 [target.'cfg(windows)'.dependencies]
-esmail = { path = "../esmail" }
+litehtml-view-d2d = { path = "../litehtml-view-d2d" }
 win32ui = { git = "https://github.com/va1erian/win32ui.git", branch = "main" }
+windows-registry.workspace = true
 # Only `InvalidateRect` (the scroll-invalidate workaround in message_list.rs)
 # and, in the example, the raw WM_VSCROLL/WM_MOUSEWHEEL drives for
 # --bench-scroll. Same version and feature discipline as win32ui itself.
@@ -22,16 +28,20 @@ windows = { version = "0.62", default-features = false, features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# `--screenshot` writes a PNG.
+png = "0.17"
 
 [dev-dependencies]
 env_logger.workspace = true
-# Only the example writes a PNG (screenshots); the library itself stays free of it.
-png = "0.17"
 
-# `build.rs` only embeds the example's Common Controls v6 manifest on Windows;
-# the crate itself is plain Rust and builds everywhere.
+# `build.rs` only embeds the Common Controls v6 manifest on Windows; the crate
+# itself is plain Rust and builds everywhere.
 [build-dependencies]
 embed-resource = "3"
+
+[[bin]]
+name = "esmail-win32"
+path = "src/main.rs"
 
 [[example]]
 name = "message_list"
