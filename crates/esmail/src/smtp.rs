@@ -119,7 +119,10 @@ async fn build_transport(account: &SmtpAccount) -> anyhow::Result<AsyncSmtpTrans
     Ok(builder.build())
 }
 
-fn build_message(account: &SmtpAccount, compose: &ComposeState) -> anyhow::Result<Message> {
+/// Builds the message `compose` describes, or says why it cannot be sent (an
+/// address that does not parse, say). Public so a frontend can check a message
+/// before it is sent, with the very code that will send it.
+pub fn build_message(account: &SmtpAccount, compose: &ComposeState) -> anyhow::Result<Message> {
     let mut builder = Message::builder()
         .from(account.from_address.parse()?)
         .subject(compose.subject.clone());

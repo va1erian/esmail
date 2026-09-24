@@ -10,7 +10,8 @@
 
 use std::sync::mpsc as std_mpsc;
 
-use esmail::db::{CacheReader, DbActor, DbCommand, DbEvent, SearchHit};
+use esmail::compose::ComposeId;
+use esmail::db::{CacheReader, DbActor, DbCommand, DbEvent, OutboxItem, SearchHit};
 use esmail::imap::MailHeader;
 use esmail::render::Attachment;
 use esmail::search_query::ParsedQuery;
@@ -44,6 +45,23 @@ pub enum CacheEvent {
     /// The answer to a [`Cache::search`]. Searches are answered in the order
     /// they were sent, but a reply does not say which query it is for.
     Search(Vec<SearchHit>),
+    /// A draft was written: the row it lives in, and the compose window it
+    /// belongs to.
+    DraftSaved {
+        /// The `drafts` row.
+        id: i64,
+        /// The window that asked.
+        compose_id: ComposeId,
+    },
+    /// A message that failed to send was recorded in the outbox.
+    OutboxEnqueued {
+        /// The `outbox` row.
+        id: i64,
+        /// The window (or retry) the message came from.
+        compose_id: ComposeId,
+    },
+    /// The answer to [`Cache::due_outbox`]: messages to send again.
+    OutboxDue(Vec<OutboxItem>),
     /// A cache read or write failed. The cache only speeds things up, so the
     /// app reports this without stopping.
     Failed(String),
@@ -74,6 +92,9 @@ impl Cache {
             while let Some(event) = db_events.recv().await {
                 let event = match event {
                     DbEvent::SearchResult { hits } => CacheEvent::Search(hits),
+                    DbEvent::DraftSaved { id, compose_id } => CacheEvent::DraftSaved { id, compose_id },
+                    DbEvent::OutboxEnqueued { id, compose_id } => CacheEvent::OutboxEnqueued { id, compose_id },
+                    DbEvent::OutboxDue { items } => CacheEvent::OutboxDue(items),
                     DbEvent::Error(message) => CacheEvent::Failed(message),
                     _ => continue,
                 };
@@ -159,7 +180,7 @@ impl Cache {
 
     /// Queues a command. A full queue means the cache is far behind; dropping
     /// a write only costs a stale cache, so it is not an error.
-    fn command(&self, command: DbCommand) {
+    pub(super) fn command(&self, command: DbCommand) {
         let _ = self.commands.try_send(command);
     }
 }
