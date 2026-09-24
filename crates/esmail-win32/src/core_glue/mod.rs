@@ -15,25 +15,33 @@
 //! out of the channel.
 
 mod cache;
+mod deliveries;
 mod folders;
 mod loads;
 pub mod mailbox;
 pub mod reading;
+mod outbox;
+pub mod compose;
 mod results;
+mod sending;
 mod window_state;
 
 use esmail::auth;
+use esmail::compose::{ComposeId, ComposeState};
 use esmail::config::{AccountConfig, Config};
 use esmail::imap::{ImapCommand, ImapEvent};
 use esmail::session::{AccountEvent, AccountSession, DEFAULT_WATCH_MAILBOX, Hooks, SessionParams};
+use esmail::smtp::SmtpEvent;
 use esmail::waker::Waker;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 pub use cache::{Cache, CacheEvent};
+pub use deliveries::{Deliveries, Delivered, Failure, Retry};
 pub use folders::{FolderRef, FolderTree, Node, NodeId};
 pub use loads::{BodyLoads, Finished, Latest};
 pub use results::SearchResults;
+pub use sending::Sender;
 pub use window_state::WindowState;
 
 /// Set to give an account a password when the OS keyring has none (used to
@@ -56,6 +64,10 @@ pub struct StartupIssue {
 /// The runtime and the account sessions.
 pub struct Core {
     sessions: Vec<Option<AccountSession>>,
+    /// Each account's IMAP credentials, for the SMTP side to reuse (a Google
+    /// account sends with the token source its session reads mail with).
+    auths: Vec<Option<auth::Auth>>,
+    sender: Sender,
     accounts: Vec<AccountConfig>,
     events: mpsc::Receiver<AccountEvent>,
     cache: Cache,
@@ -72,11 +84,13 @@ impl Core {
         let (event_tx, events) = mpsc::channel(256);
         let mut issues = Vec::new();
         let mut sessions = Vec::new();
+        let mut auths = Vec::new();
         {
             let _enter = runtime.enter();
             for (index, account) in config.accounts.iter().enumerate() {
                 match credentials(config, account) {
                     Ok(auth) => {
+                        auths.push(Some(auth.clone()));
                         let params = SessionParams {
                             id: account.id.clone(),
                             label: account.display_name.clone(),
@@ -91,13 +105,15 @@ impl Core {
                     }
                     Err(message) => {
                         issues.push(StartupIssue { account: index, message });
+                        auths.push(None);
                         sessions.push(None);
                     }
                 }
             }
         }
         let cache = Cache::start(runtime.handle(), config.accounts.iter().map(|a| a.id.clone()).collect(), waker.clone());
-        let core = Core { sessions, accounts: config.accounts.clone(), events, cache, _runtime: runtime, waker };
+        let sender = Sender::start(runtime.handle(), waker.clone());
+        let core = Core { sessions, auths, sender, accounts: config.accounts.clone(), events, cache, _runtime: runtime, waker };
         Ok((core, issues))
     }
 
@@ -110,6 +126,22 @@ impl Core {
     /// what the network reports, and searched.
     pub fn cache(&self) -> &Cache {
         &self.cache
+    }
+
+    /// Queues `state` to be sent from `account` (an index into
+    /// [`accounts`](Self::accounts)); the outcome arrives through
+    /// [`pump_sent`](Self::pump_sent) under `id`.
+    pub fn send_mail(&self, id: ComposeId, account: usize, state: ComposeState) -> Result<(), String> {
+        let config = self.accounts.get(account).ok_or("Choose an account to send from.")?;
+        let smtp = sending::smtp_account(config, self.auths.get(account).and_then(Option::as_ref))?;
+        sending::check_sendable(&smtp, &state)?;
+        self.sender.send(id, smtp, state)
+    }
+
+    /// Moves the send outcomes that arrived since the last call out of the
+    /// channel. Never blocks.
+    pub fn pump_sent(&self) -> Vec<SmtpEvent> {
+        self.sender.pump()
     }
 
     /// Queues `command` for `account`'s IMAP actor. Returns `false` when the
