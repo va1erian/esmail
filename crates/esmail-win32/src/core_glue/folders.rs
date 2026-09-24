@@ -6,11 +6,14 @@
 
 use std::collections::HashMap;
 
-use esmail::imap::{MailboxInfo, MailboxRow, flatten_tree, mailbox_tree};
+use esmail::imap::{MailboxInfo, MailboxRow, SpecialUse, flatten_tree, mailbox_tree};
+use esmail::view_model::find_special_use_mailbox;
 
 /// Identifies a tree node across the widget boundary: the account's index in
-/// the high half, and the folder's row + 1 in the low half (0 for the account
-/// node itself).
+/// the high half, and a hash of the folder's path in the low half (0 for the
+/// account node itself). Hashing the path rather than numbering the rows keeps
+/// a folder's id when another folder appears before it, so the native tree can
+/// be updated in place.
 pub type NodeId = i64;
 
 const FOLDER_BITS: u32 = 32;
@@ -63,10 +66,12 @@ impl FolderTree {
         }
     }
 
-    /// Replaces `account`'s unread counts with a fresh `STATUS` batch.
+    /// Records the counts of a `STATUS` batch. Folders the batch does not
+    /// mention keep their count, so asking about one folder after a change
+    /// leaves the others alone.
     pub fn set_unread(&mut self, account: usize, unread: HashMap<String, u32>) {
         if let Some(entry) = self.accounts.get_mut(account) {
-            entry.unread = unread;
+            entry.unread.extend(unread);
         }
     }
 
@@ -80,34 +85,38 @@ impl FolderTree {
         let Some(parent) = parent else {
             return (0..self.accounts.len()).map(|account| self.account_node(account)).collect();
         };
-        let (account, slot) = split_id(parent);
+        let (account, folder) = split_id(parent);
         let Some(entry) = self.accounts.get(account) else { return Vec::new() };
-        let (start, depth) = match slot {
+        let (start, depth) = match folder {
             0 => (0, 0),
-            slot => match entry.rows.get(slot - 1) {
-                Some(row) => (slot, row.depth + 1),
+            folder => match entry.rows.iter().position(|row| folder_hash(&row.key) == folder) {
+                Some(index) => (index + 1, entry.rows[index].depth + 1),
                 None => return Vec::new(),
             },
         };
         entry.rows[start..]
             .iter()
-            .enumerate()
-            .take_while(|(_, row)| row.depth >= depth)
-            .filter(|(_, row)| row.depth == depth)
-            .map(|(offset, row)| Node {
-                text: entry.folder_text(row),
-                id: make_id(account, start + offset + 1),
-                has_children: row.has_children,
-            })
+            .take_while(|row| row.depth >= depth)
+            .filter(|row| row.depth == depth)
+            .map(|row| Node { text: entry.folder_text(row), id: make_id(account, folder_hash(&row.key)), has_children: row.has_children })
             .collect()
     }
 
     /// The folder a node stands for, or `None` for an account node or a
     /// container folder that cannot be opened.
     pub fn selection(&self, id: NodeId) -> Option<FolderRef> {
-        let (account, slot) = split_id(id);
-        let row = self.accounts.get(account)?.rows.get(slot.checked_sub(1)?)?;
+        let (account, folder) = split_id(id);
+        if folder == 0 {
+            return None;
+        }
+        let row = self.accounts.get(account)?.rows.iter().find(|row| folder_hash(&row.key) == folder)?;
         Some(FolderRef { account, mailbox: row.full_name.clone()? })
+    }
+
+    /// The name of `account`'s folder of kind `want` (Trash, Archive), or
+    /// `default` when the server names none.
+    pub fn special_folder(&self, account: usize, want: SpecialUse, default: &str) -> String {
+        self.accounts.get(account).map_or_else(|| default.to_string(), |a| find_special_use_mailbox(&a.rows, want, default))
     }
 
     /// The unread count for a folder, if `STATUS` reported one.
@@ -134,12 +143,17 @@ impl AccountFolders {
     }
 }
 
-fn make_id(account: usize, slot: usize) -> NodeId {
-    ((account as i64) << FOLDER_BITS) | slot as i64
+fn make_id(account: usize, folder: u32) -> NodeId {
+    ((account as i64) << FOLDER_BITS) | i64::from(folder)
 }
 
-fn split_id(id: NodeId) -> (usize, usize) {
-    ((id >> FOLDER_BITS) as usize, (id & ((1 << FOLDER_BITS) - 1)) as usize)
+fn split_id(id: NodeId) -> (usize, u32) {
+    ((id >> FOLDER_BITS) as usize, (id & ((1 << FOLDER_BITS) - 1)) as u32)
+}
+
+/// FNV-1a of a folder's path key, never 0 (which names the account node).
+fn folder_hash(key: &str) -> u32 {
+    key.bytes().fold(0x811c_9dc5_u32, |hash, byte| (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)).max(1)
 }
 
 #[cfg(test)]
@@ -224,6 +238,36 @@ mod tests {
         assert_eq!(texts(&tree.children(Some(account))), ["INBOX (3)", "[Gmail]", "Projects"]);
         let inbox = FolderRef { account: 0, mailbox: "INBOX".into() };
         assert_eq!(tree.unread(&inbox), Some(3));
+    }
+
+    #[test]
+    fn a_folder_keeps_its_id_when_another_folder_appears_before_it() {
+        let mut tree = tree();
+        let account = tree.children(None)[0].id;
+        let projects = |tree: &FolderTree| tree.children(Some(account)).into_iter().find(|n| n.text == "Projects").unwrap().id;
+        let before = projects(&tree);
+        tree.set_mailboxes(
+            0,
+            &[mailbox("INBOX", false), mailbox("Archive", false), mailbox("Projects", false), mailbox("Projects/Alpha", false), mailbox("[Gmail]", true)],
+        );
+        assert_eq!(projects(&tree), before);
+        assert_eq!(tree.selection(before), Some(FolderRef { account: 0, mailbox: "Projects".into() }));
+    }
+
+    #[test]
+    fn a_later_unread_batch_keeps_the_counts_it_does_not_mention() {
+        let mut tree = tree();
+        tree.set_unread(0, HashMap::from([("INBOX".to_string(), 3), ("Projects".to_string(), 1)]));
+        tree.set_unread(0, HashMap::from([("INBOX".to_string(), 2)]));
+        let account = tree.children(None)[0].id;
+        assert_eq!(texts(&tree.children(Some(account))), ["INBOX (2)", "[Gmail]", "Projects (1)"]);
+    }
+
+    #[test]
+    fn the_trash_folder_is_found_by_special_use_or_defaults() {
+        let tree = tree();
+        assert_eq!(tree.special_folder(0, SpecialUse::Trash, "Trash"), "Trash");
+        assert_eq!(tree.special_folder(5, SpecialUse::Archive, "Archive"), "Archive");
     }
 
     #[test]

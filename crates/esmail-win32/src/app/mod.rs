@@ -6,24 +6,40 @@
 //! drains the events (`Core::pump`) and updates the widgets. Message bodies are
 //! fetched by the actor's body worker and rendered by the HTML view's own
 //! thread, so a selection change never waits for either.
+//!
+//! The IMAP channel is drained through this crate's `Core` rather than
+//! `esmail::app::AppCore`: `AppCore` keeps one page of headers and replaces it
+//! per page, while this list accumulates pages as the user scrolls and merges
+//! refreshes into them, and `AppCore` also needs the egui app's cache task.
 
+mod actions;
 mod args;
 mod chrome;
+mod events;
+mod folder;
+mod message;
+mod native_tree;
+mod reader;
 mod screenshot;
 mod tree;
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use esmail::imap::{ImapCommand, ImapEvent, MailHeader};
-use litehtml_view_d2d::{HtmlView, HtmlViewEvent};
+use esmail::imap::MailHeader;
 use win32ui::prelude::*;
 use win32ui::{column, split_row};
 
 use esmail_win32::MessageList;
 use esmail_win32::core_glue::mailbox::OpenFolder;
-use esmail_win32::core_glue::{BodyLoads, Core, FolderRef, FolderTree, load_config, reading};
+use esmail_win32::core_glue::reading::Palette;
+use esmail_win32::core_glue::{BodyLoads, Core, FolderTree, Latest, load_config};
 use args::{Args, ThemeChoice};
+use message::SeenTimer;
+use reader::Reader;
 use screenshot::{Capture, Step};
+use tree::SharedFolders;
 
 /// Messages the window's widgets and the core raise.
 enum Msg {
@@ -33,36 +49,48 @@ enum Msg {
     Frame,
     Folder(i64),
     Selected(Vec<usize>),
+    /// Enter or a double-click on a row.
+    Open(usize),
     NearEnd,
     Link(String),
     SetTheme(ThemeChoice),
+    /// View > Original colours.
+    OriginalColours(bool),
     Refresh,
+    ToggleFlag,
+    SetSeen(bool),
+    Archive,
+    Delete,
+    /// A right-click on a message row.
+    Context,
     Quit,
-    /// Screenshot mode only: check whether the window is ready to capture.
-    Tick,
+    Timer(TimerId),
 }
-
-/// `(account, mailbox, uid)`: which message a body fetch is for.
-type BodyKey = (usize, String, u32);
 
 struct App {
     core: Core,
-    folders: FolderTree,
+    folders: SharedFolders,
     list: MessageList<Msg>,
     tree: TreeView<Msg>,
-    reader: HtmlView<Msg>,
+    reader: Reader,
     status: StatusBar<Msg>,
+    theme: ThemeChoice,
+    original_colours: bool,
     /// The folder shown in the list, once one has been opened.
     open: Option<OpenFolder>,
     /// Which folder to open when an account's folder list first arrives.
     wanted_folder: Option<String>,
-    bodies: BodyLoads<BodyKey>,
+    bodies: BodyLoads<message::BodyKey>,
     /// The message whose body is (being) shown.
     selected: Option<MailHeader>,
+    /// Marks the selected message read once it has been open a moment.
+    seen: SeenTimer,
+    /// Ids for flag and move commands (the actor echoes them back).
+    action_ids: Latest,
     /// The selected message's body is on screen (screenshots wait for this).
     message_shown: bool,
     select_after_load: Option<usize>,
-    capture: Option<Capture>,
+    capture: Option<(TimerId, Capture)>,
 }
 
 pub(crate) fn main() {
@@ -91,6 +119,11 @@ pub(crate) fn main() {
     }
 }
 
+/// The reading pane's palette for a window theme.
+fn palette_for(theme: &Theme) -> Palette {
+    if theme.is_dark { Palette::DARK } else { Palette::LIGHT }
+}
+
 fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config) -> App {
     let proxy = ui.proxy();
     let waker: esmail::waker::Waker = Arc::new(move || {
@@ -98,46 +131,44 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config) -> App 
     });
     let (core, issues) = Core::start(config, waker).expect("start the async runtime");
 
-    let folders = FolderTree::new(config.accounts.iter().map(|a| a.display_name.clone()));
+    let folders: SharedFolders = Rc::new(RefCell::new(FolderTree::new(config.accounts.iter().map(|a| a.display_name.clone()))));
     let tree = tree::build(ui, &folders).expect("folder tree");
     let list = MessageList::new(ui)
         .expect("message list")
         .on_select(|rows| Some(Msg::Selected(rows.to_vec())))
+        .on_open(|row| Some(Msg::Open(row)))
+        .on_flag(|_| Some(Msg::ToggleFlag))
+        .on_delete(|_| Some(Msg::Delete))
+        .on_context(|_, _| Some(Msg::Context))
         .on_near_end(|| Some(Msg::NearEnd));
-    let reader = HtmlView::new(
-        ui,
-        reading::notice(""),
-        || Msg::Frame,
-        |event| match event {
-            HtmlViewEvent::LinkClicked(href) => Some(Msg::Link(href)),
-        },
-    )
-    .expect("reading pane");
+    let reader = Reader::new(ui, palette_for(&ui.theme())).expect("reading pane");
     let status = StatusBar::new(ui).expect("status bar");
     status.set_parts(&[-1]);
 
-    ui.set_menu_bar(chrome::menu_bar(args.theme));
+    ui.set_menu_bar(chrome::menu_bar(args.theme, false));
     ui.accelerator(Shortcut::key(Key::F5), || Some(Msg::Refresh));
     ui.accelerator(Shortcut::ctrl(Key::Q), || Some(Msg::Quit));
-    if args.screenshot.is_some() {
-        let timer = ui.set_timer(50).expect("screenshot timer");
-        ui.on_timer(move |id| (id == timer).then_some(Msg::Tick));
-    }
+    ui.on_timer(|id| Some(Msg::Timer(id)));
+    let capture = args.screenshot.clone().map(|path| (ui.set_timer(50).expect("screenshot timer"), Capture::new(path)));
 
-    let app = App {
+    let mut app = App {
         core,
         folders,
         list,
         tree,
         reader,
         status,
+        theme: args.theme,
+        original_colours: false,
         open: None,
         wanted_folder: args.folder.clone(),
         bodies: BodyLoads::default(),
         selected: None,
+        seen: SeenTimer::default(),
+        action_ids: Latest::default(),
         message_shown: false,
         select_after_load: args.select,
-        capture: args.screenshot.clone().map(Capture::new),
+        capture,
     };
     app.layout(ui);
     if app.core.accounts().is_empty() {
@@ -158,24 +189,38 @@ impl win32ui::App for App {
             Msg::Wake => self.drain(ui),
             Msg::Frame => self.reader.invalidate(),
             Msg::Folder(id) => {
-                if let Some(folder) = self.folders.selection(id) {
+                let folder = self.folders.borrow().selection(id);
+                if let Some(folder) = folder {
                     self.open_folder(ui, folder);
                 }
             }
-            Msg::Selected(rows) => self.select(&rows),
+            Msg::Selected(rows) => self.select(ui, &rows),
+            Msg::Open(row) => {
+                self.select(ui, &[row]);
+                self.reader.focus();
+            }
             Msg::NearEnd => self.request_page(),
             Msg::Link(href) => self.set_status(&format!("Links are not opened in this prototype: {href}")),
             Msg::SetTheme(choice) => {
-                ui.set_theme(chrome::palette(choice));
-                ui.set_menu_bar(chrome::menu_bar(choice));
+                self.theme = choice;
+                let theme = chrome::palette(choice);
+                self.reader.set_palette(palette_for(&theme));
+                ui.set_theme(theme);
+                ui.set_menu_bar(chrome::menu_bar(choice, self.original_colours));
             }
-            Msg::Refresh => {
-                if let Some(folder) = self.open.as_ref().map(|open| open.folder().clone()) {
-                    self.open_folder(ui, folder);
-                }
+            Msg::OriginalColours(original) => {
+                self.original_colours = original;
+                self.reader.set_original_colours(original);
+                ui.set_menu_bar(chrome::menu_bar(self.theme, original));
             }
+            Msg::Refresh => self.refresh(ui),
+            Msg::ToggleFlag => self.toggle_flag(),
+            Msg::SetSeen(seen) => self.set_seen(seen),
+            Msg::Archive => self.archive(),
+            Msg::Delete => self.delete(),
+            Msg::Context => ui.popup(&chrome::message_menu(), ui.cursor_position()),
             Msg::Quit => ui.quit(),
-            Msg::Tick => self.tick(ui),
+            Msg::Timer(id) => self.timer(ui, id),
         }
     }
 }
@@ -196,163 +241,27 @@ impl App {
 
     /// An error the user must see: in the status bar, and in the reading pane
     /// when there is no message there to cover.
-    fn banner(&self, text: &str) {
+    fn banner(&mut self, text: &str) {
         self.set_status(&format!("Error: {text}"));
         if self.selected.is_none() {
-            self.reader.load(reading::notice(text));
+            self.reader.show_notice(text);
         }
     }
 
-    fn drain(&mut self, ui: &mut Ui<Msg>) {
-        let mut tree_changed = false;
-        for (account, event) in self.core.pump() {
-            tree_changed |= self.handle(ui, account, event);
-        }
-        if tree_changed {
-            match tree::build(ui, &self.folders) {
-                Ok(tree) => {
-                    self.tree = tree;
-                    self.layout(ui);
-                }
-                Err(error) => self.banner(&format!("could not rebuild the folder tree: {error}")),
-            }
+    fn timer(&mut self, ui: &mut Ui<Msg>, id: TimerId) {
+        if self.seen.owns(id) {
+            self.mark_seen_when_due(ui);
+        } else if self.capture.as_ref().is_some_and(|(timer, _)| *timer == id) {
+            self.tick(ui);
         }
     }
 
-    /// Applies one event. Returns whether the folder tree needs rebuilding.
-    fn handle(&mut self, ui: &mut Ui<Msg>, account: usize, event: ImapEvent) -> bool {
-        match event {
-            ImapEvent::Connected => {
-                self.set_status("Connected");
-                self.core.send(account, ImapCommand::FetchMailboxes);
-            }
-            ImapEvent::Disconnected => self.set_status("Disconnected, reconnecting..."),
-            ImapEvent::Error(error) => {
-                if let Some(open) = self.open.as_mut() {
-                    open.page_failed();
-                }
-                self.banner(&error);
-            }
-            ImapEvent::Mailboxes(mailboxes) => {
-                self.folders.set_mailboxes(account, &mailboxes);
-                self.core.send(account, ImapCommand::FetchUnreadCounts { mailboxes: self.folders.mailbox_names(account) });
-                self.open_first_folder(ui, account);
-                return true;
-            }
-            ImapEvent::UnreadCounts(counts) => {
-                self.folders.set_unread(account, counts);
-                return true;
-            }
-            ImapEvent::Headers { mailbox, headers, page, total_pages, req_id, .. } => {
-                self.apply_headers(account, &mailbox, req_id, page, total_pages, headers);
-            }
-            ImapEvent::Body { uid, html, attachments, req_id } => {
-                self.body_arrived(account, uid, req_id, |header| reading::document(header, &html, &attachments));
-            }
-            ImapEvent::BodyFailed { uid, req_id, error } => {
-                self.body_arrived(account, uid, req_id, |_| reading::notice(&format!("Could not load this message: {error}")));
-            }
-            _ => {}
-        }
-        false
-    }
-
-    fn open_first_folder(&mut self, ui: &mut Ui<Msg>, account: usize) {
-        if self.open.is_some() {
-            return;
-        }
-        let wanted = self.wanted_folder.clone().unwrap_or_else(|| "INBOX".to_string());
-        let mailbox = self.folders.mailbox_names(account).into_iter().find(|name| name.eq_ignore_ascii_case(&wanted));
-        if let Some(mailbox) = mailbox {
-            self.open_folder(ui, FolderRef { account, mailbox });
-        }
-    }
-
-    fn open_folder(&mut self, ui: &Ui<Msg>, folder: FolderRef) {
-        self.bodies.cancel();
-        self.selected = None;
-        ui.set_title(&format!("{} - esMail", folder.mailbox));
-        self.set_status(&format!("Loading {}...", folder.mailbox));
-        self.list.set_rows(Arc::from([]));
-        self.reader.load(reading::notice("Select a message to read it."));
-        self.open = Some(OpenFolder::new(folder));
-        self.request_page();
-    }
-
-    fn request_page(&mut self) {
-        let Some(open) = self.open.as_mut() else { return };
-        let Some(request) = open.next_request() else { return };
-        let folder = open.folder().clone();
-        let sent = self.core.send(folder.account, ImapCommand::FetchHeaders { mailbox: folder.mailbox, page: request.page, req_id: request.id });
-        if !sent {
-            open.page_failed();
-            self.banner("this account is not connected");
-        }
-    }
-
-    fn apply_headers(&mut self, account: usize, mailbox: &str, req_id: u64, page: u32, total_pages: u32, headers: Vec<MailHeader>) {
-        let Some(open) = self.open.as_mut().filter(|o| o.folder().account == account && o.folder().mailbox == mailbox) else { return };
-        let Some(added) = open.apply_page(req_id, page, total_pages, headers) else { return };
-        if page == 1 {
-            self.list.set_rows(open.rows());
-        } else {
-            self.list.extend_rows(open.rows());
-        }
-        let loaded = open.loaded();
-        let more = if open.is_complete() { "" } else { " (scroll for older)" };
-        self.set_status(&format!("{mailbox}: {loaded} messages{more}"));
-        if page == 1 && added > 0 {
-            if let Some(row) = self.select_after_load.take() {
-                self.list.set_selection(&[row]);
-                self.list.focus();
-                self.select(&[row]);
-            }
-        }
-    }
-
-    fn select(&mut self, rows: &[usize]) {
-        let [row] = rows else {
-            self.bodies.cancel();
-            return;
-        };
-        let Some((folder, header)) = self.open.as_ref().and_then(|o| Some((o.folder().clone(), o.header(*row)?.clone()))) else { return };
-        let key = (folder.account, folder.mailbox, header.uid);
-        self.set_status("Loading message...");
-        self.selected = Some(header);
-        self.message_shown = false;
-        if let Some((key, id)) = self.bodies.want(key) {
-            self.fetch_body(key, id);
-        }
-    }
-
-    fn fetch_body(&mut self, (account, mailbox, uid): BodyKey, req_id: u64) {
-        if !self.core.send(account, ImapCommand::FetchBody { mailbox, uid, req_id }) {
-            self.banner("this account is not connected");
-        }
-    }
-
-    /// A body (or its failure) came back: show it if it is still the message
-    /// the user wants, and start the next wanted fetch.
-    fn body_arrived(&mut self, account: usize, uid: u32, req_id: u64, document: impl FnOnce(&MailHeader) -> String) {
-        let Some(mailbox) = self.open.as_ref().map(|o| o.folder().mailbox.clone()) else { return };
-        let finished = self.bodies.finished(&(account, mailbox, uid), req_id);
-        if finished.show {
-            if let Some(header) = self.selected.as_ref() {
-                self.reader.load(document(header));
-                self.message_shown = true;
-                self.set_status("Ready");
-            }
-        }
-        if let Some((key, id)) = finished.next {
-            self.fetch_body(key, id);
-        }
-    }
-
+    /// Screenshot mode: check whether the window is ready to capture.
     fn tick(&mut self, ui: &mut Ui<Msg>) {
-        let Some(capture) = self.capture.as_mut() else { return };
         let message_ready = self.message_shown && self.reader.is_ready();
         let loaded = self.open.as_ref().is_some_and(|o| o.loaded() > 0);
         let expects_message = self.select_after_load.is_some() || self.selected.is_some();
+        let Some((_, capture)) = self.capture.as_mut() else { return };
         match capture.step(ui, loaded && (!expects_message || message_ready)) {
             Step::Wait => {}
             Step::Repaint => {

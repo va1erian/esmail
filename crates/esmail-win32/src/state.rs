@@ -1,4 +1,4 @@
-//! Pure selection, geometry and view-state logic for the message list.
+//! Pure geometry and view-state logic for the message list.
 //!
 //! Everything here is a plain function of numbers or of [`Selection`], kept
 //! free of win32ui and `RowModel` types so it can be unit-tested without a
@@ -8,129 +8,7 @@
 
 use std::ops::Range;
 
-/// The rows that are selected, plus the anchor and focus that range selection
-/// and keyboard movement need.
-///
-/// `selected` is always ascending and deduplicated. `anchor` is the fixed end
-/// of a Shift range (set by a plain click or Ctrl+click); `focus` is the row
-/// the keyboard moves and the one Enter/Space act on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Selection {
-    /// Selected row indices, ascending.
-    pub selected: Vec<usize>,
-    /// The anchor of the last plain/Ctrl+click, for Shift ranges.
-    pub anchor: Option<usize>,
-    /// The focused row.
-    pub focus: Option<usize>,
-}
-
-impl Default for Selection {
-    fn default() -> Selection {
-        Selection::new()
-    }
-}
-
-impl Selection {
-    /// An empty selection.
-    pub fn new() -> Selection {
-        Selection {
-            selected: Vec::new(),
-            anchor: None,
-            focus: None,
-        }
-    }
-
-    /// A plain click on `index`: select only it.
-    pub fn click(&mut self, index: usize) {
-        self.selected = vec![index];
-        self.anchor = Some(index);
-        self.focus = Some(index);
-    }
-
-    /// A Ctrl+click on `index`: toggle it, and move anchor/focus to it.
-    pub fn ctrl_click(&mut self, index: usize) {
-        match self.selected.binary_search(&index) {
-            Ok(pos) => {
-                self.selected.remove(pos);
-            }
-            Err(pos) => self.selected.insert(pos, index),
-        }
-        self.anchor = Some(index);
-        self.focus = Some(index);
-    }
-
-    /// A Shift+click on `index`: extend the inclusive range from the anchor
-    /// (or the focus, or `index` itself when there is nothing to extend from).
-    /// The anchor is left unchanged, so a further Shift+click keeps extending
-    /// from the same place.
-    pub fn shift_click(&mut self, index: usize) {
-        let anchor = self.anchor.or(self.focus).unwrap_or(index);
-        self.selected = range(anchor, index);
-        self.focus = Some(index);
-    }
-
-    /// A keyboard move to `index` (already clamped to the model).
-    ///
-    /// * plain: select only `index`;
-    /// * Ctrl: move the focus without changing the selection;
-    /// * Shift: extend the range from the anchor to `index`.
-    ///
-    /// Not yet reached from the widget: win32ui's `Custom::with_vscroll` scroll
-    /// host consumes Up/Down/PageUp/PageDown/Home/End for scrolling before the
-    /// widget sees them, so there is no key event left to move the focus with.
-    /// Wired once that gap (reported in the PR) is fixed.
-    #[allow(dead_code)]
-    pub fn move_focus(&mut self, index: usize, ctrl: bool, shift: bool) {
-        if ctrl {
-            self.focus = Some(index);
-        } else if shift {
-            let anchor = self.anchor.or(self.focus).unwrap_or(index);
-            self.selected = range(anchor, index);
-            self.focus = Some(index);
-        } else {
-            self.click(index);
-        }
-    }
-
-    /// Select every row of a `len`-row model.
-    pub fn select_all(&mut self, len: usize) {
-        self.selected = if len == 0 { Vec::new() } else { (0..len).collect() };
-        self.anchor = Some(0);
-        self.focus = Some(0);
-    }
-
-    /// Replace the selection from the app (`set_selection`), keeping only rows
-    /// in bounds, ascending and deduplicated.
-    pub fn replace(&mut self, rows: &[usize], len: usize) {
-        let mut next: Vec<usize> = rows.iter().copied().filter(|&row| row < len).collect();
-        next.sort_unstable();
-        next.dedup();
-        self.selected = next;
-        self.anchor = self.selected.first().copied();
-        self.focus = self.selected.first().copied();
-    }
-
-    /// Drop the selection and the focus.
-    pub fn clear(&mut self) {
-        self.selected.clear();
-        self.anchor = None;
-        self.focus = None;
-    }
-
-    /// Whether `index` is selected.
-    pub fn contains(&self, index: usize) -> bool {
-        self.selected.binary_search(&index).is_ok()
-    }
-}
-
-/// The inclusive span between `a` and `b`, ascending. This is the index-space
-/// equivalent of `esmail::view_model::select_range`, which does the same for
-/// UIDs over a `MailHeader` list — the message list selects by index, so the
-/// anchor/target are indices rather than UIDs.
-fn range(a: usize, b: usize) -> Vec<usize> {
-    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-    (lo..=hi).collect()
-}
+use crate::selection::Selection;
 
 /// The parts of a [`MessageList`](crate::MessageList)'s view that change
 /// without any win32ui call: the row count, the scroll offset (in
@@ -163,11 +41,33 @@ impl ViewState {
         self.selection.clear();
     }
 
-    /// A recount after rows were inserted (`rows_inserted`): only the row
+    /// A recount after older rows were appended (`extend_rows`): only the row
     /// count changes; the scroll offset and the selection stay exactly as they
     /// were.
     pub fn recount(&mut self, new_len: usize) {
         self.len = new_len;
+    }
+
+    /// `count` rows were inserted at `at` (new mail, above what is shown). The
+    /// selection follows its messages; a view scrolled away from the top also
+    /// keeps showing the same messages, while one at the top shows the new rows.
+    pub fn insert(&mut self, at: usize, count: usize, row_height: f32) {
+        self.len += count;
+        self.selection.insert(at, count);
+        if self.scroll > 0.0 && at as f32 * row_height <= self.scroll {
+            self.scroll += count as f32 * row_height;
+        }
+    }
+
+    /// `count` rows were removed at `at` (moved or deleted). Rows that were
+    /// scrolled off the top take their height off the offset so the messages
+    /// in view stay put.
+    pub fn remove(&mut self, at: usize, count: usize, row_height: f32) {
+        let first_visible = (self.scroll / row_height) as usize;
+        let above = (at + count).min(first_visible).saturating_sub(at);
+        self.len = self.len.saturating_sub(count);
+        self.selection.remove(at, count);
+        self.scroll = (self.scroll - above as f32 * row_height).max(0.0);
     }
 }
 
@@ -264,90 +164,6 @@ mod tests {
             anchor,
             focus,
         }
-    }
-
-    // ── Selection state machine ─────────────────────────────────────────────
-
-    #[test]
-    fn a_plain_click_selects_only_that_row() {
-        let mut sel = selection(&[3, 5], Some(3), Some(5));
-        sel.click(1);
-        assert_eq!(sel.selected, vec![1]);
-        assert_eq!(sel.anchor, Some(1));
-        assert_eq!(sel.focus, Some(1));
-    }
-
-    #[test]
-    fn ctrl_click_toggles_a_row_and_moves_the_focus() {
-        let mut sel = selection(&[3, 5], Some(3), Some(5));
-        sel.ctrl_click(7);
-        assert_eq!(sel.selected, vec![3, 5, 7]);
-        assert_eq!(sel.focus, Some(7));
-
-        sel.ctrl_click(5);
-        assert_eq!(sel.selected, vec![3, 7]);
-        assert_eq!(sel.focus, Some(5));
-    }
-
-    #[test]
-    fn shift_click_selects_the_span_from_the_anchor() {
-        let mut sel = selection(&[3], Some(3), Some(3));
-        sel.shift_click(7);
-        assert_eq!(sel.selected, vec![3, 4, 5, 6, 7]);
-        // The anchor is unchanged so a further Shift+click keeps extending.
-        assert_eq!(sel.anchor, Some(3));
-        sel.shift_click(5);
-        assert_eq!(sel.selected, vec![3, 4, 5]);
-        assert_eq!(sel.focus, Some(5));
-    }
-
-    #[test]
-    fn shift_click_works_with_the_anchor_after_the_target() {
-        let mut sel = selection(&[7], Some(7), Some(7));
-        sel.shift_click(4);
-        assert_eq!(sel.selected, vec![4, 5, 6, 7]);
-    }
-
-    #[test]
-    fn shift_click_without_an_anchor_falls_back_to_the_focus() {
-        let mut sel = selection(&[2, 9], None, Some(9));
-        sel.shift_click(5);
-        assert_eq!(sel.selected, vec![5, 6, 7, 8, 9]);
-    }
-
-    #[test]
-    fn keyboard_move_selects_moves_or_extends() {
-        let mut sel = selection(&[3], Some(3), Some(3));
-        // Plain: select only.
-        sel.move_focus(6, false, false);
-        assert_eq!(sel.selected, vec![6]);
-        assert_eq!(sel.focus, Some(6));
-        // Ctrl: move focus, keep selection.
-        sel.move_focus(9, true, false);
-        assert_eq!(sel.selected, vec![6]);
-        assert_eq!(sel.focus, Some(9));
-        // Shift: extend from the anchor (still 6).
-        sel.move_focus(4, false, true);
-        assert_eq!(sel.selected, vec![4, 5, 6]);
-        assert_eq!(sel.focus, Some(4));
-    }
-
-    #[test]
-    fn select_all_keeps_an_empty_model_empty() {
-        let mut sel = selection(&[1], Some(1), Some(1));
-        sel.select_all(5);
-        assert_eq!(sel.selected, vec![0, 1, 2, 3, 4]);
-
-        sel.select_all(0);
-        assert!(sel.selected.is_empty());
-    }
-
-    #[test]
-    fn replace_drops_out_of_range_and_duplicate_rows() {
-        let mut sel = Selection::new();
-        sel.replace(&[9, 2, 2, 4], 5);
-        assert_eq!(sel.selected, vec![2, 4]);
-        assert_eq!(sel.focus, Some(2));
     }
 
     // ── visible-range computation ───────────────────────────────────────────
@@ -489,6 +305,40 @@ mod tests {
         assert_eq!(view.selection.selected, vec![3, 7]);
         assert_eq!(view.selection.anchor, Some(3));
         assert_eq!(view.selection.focus, Some(7));
+    }
+
+    #[test]
+    fn inserting_above_moves_the_selection_and_keeps_the_messages_in_view() {
+        let mut view = ViewState { len: 100, scroll: 350.0, selection: selection(&[3, 7], Some(3), Some(7)) };
+        view.insert(0, 2, 50.0);
+        assert_eq!(view.len, 102);
+        assert_eq!(view.scroll, 450.0);
+        assert_eq!(view.selection, selection(&[5, 9], Some(5), Some(9)));
+    }
+
+    #[test]
+    fn inserting_while_at_the_top_shows_the_new_rows() {
+        let mut view = ViewState { len: 10, scroll: 0.0, selection: selection(&[0], Some(0), Some(0)) };
+        view.insert(0, 3, 50.0);
+        assert_eq!(view.scroll, 0.0);
+        assert_eq!(view.selection.selected, vec![3]);
+    }
+
+    #[test]
+    fn removing_rows_shifts_the_rest_and_drops_removed_selection() {
+        let mut view = ViewState { len: 10, scroll: 0.0, selection: selection(&[2, 3, 6], Some(2), Some(6)) };
+        view.remove(2, 2, 50.0);
+        assert_eq!(view.len, 8);
+        assert_eq!(view.selection, selection(&[4], None, Some(4)));
+    }
+
+    #[test]
+    fn removing_rows_above_the_view_keeps_the_messages_in_view() {
+        let mut view = ViewState { len: 100, scroll: 500.0, selection: Selection::new() };
+        view.remove(0, 4, 50.0);
+        assert_eq!(view.scroll, 300.0);
+        view.remove(50, 4, 50.0);
+        assert_eq!(view.scroll, 300.0);
     }
 
     #[test]
