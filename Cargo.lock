@@ -1322,6 +1322,7 @@ dependencies = [
  "litehtml-view-d2d",
  "log",
  "png 0.17.16",
+ "serde",
  "tokio",
  "toml 0.8.23",
  "win32ui",
@@ -5075,7 +5076,7 @@ checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 [[package]]
 name = "win32ui"
 version = "0.1.0"
-source = "git+https://github.com/va1erian/win32ui.git?branch=main#10058e58e183e20df28d77387e88d9e5caa54e74"
+source = "git+https://github.com/va1erian/win32ui.git?branch=main#d0e90a6e687eb9d57cad60b5346a57c2c9cd2d46"
 dependencies = [
  "embed-resource",
  "thiserror 2.0.18",

@@ -2,8 +2,12 @@
 //! delete. Each is a command to the account's IMAP actor; the list and the
 //! folder counts change when the server confirms it, and a failure lands in the
 //! status bar.
+//!
+//! The selected rows may be the open folder's or a search's, so every action
+//! works from `(folder, header)` pairs and sends to each message's own folder.
 
 use esmail::imap::{FLAG_FLAGGED, FLAG_SEEN, ImapCommand, MailHeader, SpecialUse};
+use esmail_win32::core_glue::FolderRef;
 
 use super::App;
 
@@ -12,36 +16,51 @@ const TRASH_MAILBOX: &str = "Trash";
 /// Where Archive moves a message when the account names no Archive folder.
 const ARCHIVE_MAILBOX: &str = "Archive";
 
+/// A message and the folder it lives in.
+type Target = (FolderRef, MailHeader);
+
 impl App {
-    /// The selected messages' headers.
-    fn targets(&self) -> Vec<MailHeader> {
-        let Some(open) = self.open.as_ref() else { return Vec::new() };
-        self.list.selection().into_iter().filter_map(|row| open.header(row).cloned()).collect()
+    /// The selected messages.
+    fn targets(&self) -> Vec<Target> {
+        self.list.selection().into_iter().filter_map(|row| self.message_at(row)).collect()
     }
 
     /// Flags every selected message, or unflags them when all are flagged.
     pub(super) fn toggle_flag(&mut self) {
         let targets = self.targets();
-        let flag = !targets.iter().all(MailHeader::is_flagged);
-        for header in targets.iter().filter(|header| header.is_flagged() != flag) {
-            self.set_flag(header.uid, FLAG_FLAGGED, flag);
+        self.toggle_flag_of(&targets);
+    }
+
+    /// Toggles the flag of a row (its star was clicked, or Space was pressed on
+    /// it): of the whole selection when the row is part of it, else of the row.
+    pub(super) fn toggle_flag_at(&mut self, row: usize) {
+        if self.list.selection().contains(&row) {
+            return self.toggle_flag();
+        }
+        let target: Vec<Target> = self.message_at(row).into_iter().collect();
+        self.toggle_flag_of(&target);
+    }
+
+    fn toggle_flag_of(&mut self, targets: &[Target]) {
+        let flag = !targets.iter().all(|(_, header)| header.is_flagged());
+        for (folder, header) in targets.iter().filter(|(_, header)| header.is_flagged() != flag) {
+            self.set_flag(folder, header.uid, FLAG_FLAGGED, flag);
         }
     }
 
     /// Marks every selected message read or unread.
     pub(super) fn set_seen(&mut self, seen: bool) {
-        for header in self.targets().iter().filter(|header| header.is_seen() != seen) {
-            self.set_flag(header.uid, FLAG_SEEN, seen);
+        for (folder, header) in self.targets().iter().filter(|(_, header)| header.is_seen() != seen) {
+            self.set_flag(folder, header.uid, FLAG_SEEN, seen);
         }
     }
 
-    fn set_flag(&mut self, uid: u32, flag: &str, on: bool) {
+    fn set_flag(&mut self, folder: &FolderRef, uid: u32, flag: &str, on: bool) {
         let flags = vec![flag.to_string()];
-        if on { self.store_flags(uid, flags, Vec::new()) } else { self.store_flags(uid, Vec::new(), flags) }
+        if on { self.store_flags(folder.clone(), uid, flags, Vec::new()) } else { self.store_flags(folder.clone(), uid, Vec::new(), flags) }
     }
 
-    pub(super) fn store_flags(&mut self, uid: u32, add: Vec<String>, remove: Vec<String>) {
-        let Some(folder) = self.open.as_ref().map(|open| open.folder().clone()) else { return };
+    pub(super) fn store_flags(&mut self, folder: FolderRef, uid: u32, add: Vec<String>, remove: Vec<String>) {
         let req_id = self.action_ids.begin();
         if !self.core.send(folder.account, ImapCommand::StoreFlags { mailbox: folder.mailbox, uid, add, remove, req_id }) {
             self.banner("this account is not connected");
@@ -57,53 +76,90 @@ impl App {
     }
 
     fn move_selected(&mut self, kind: SpecialUse, default: &str) {
-        let Some(folder) = self.open.as_ref().map(|open| open.folder().clone()) else { return };
-        let dest = self.folders.borrow().special_folder(folder.account, kind, default);
-        if dest == folder.mailbox {
-            self.set_status(&format!("These messages are already in {dest}"));
-            return;
-        }
-        for header in self.targets() {
+        let mut already_there = None;
+        for (folder, header) in self.targets() {
+            let dest = self.folders.borrow().special_folder(folder.account, kind, default);
+            if dest == folder.mailbox {
+                already_there = Some(dest);
+                continue;
+            }
             let req_id = self.action_ids.begin();
-            let command = ImapCommand::MoveMessage { mailbox: folder.mailbox.clone(), uid: header.uid, dest: dest.clone(), req_id };
+            let command = ImapCommand::MoveMessage { mailbox: folder.mailbox, uid: header.uid, dest, req_id };
             if !self.core.send(folder.account, command) {
                 self.banner("this account is not connected");
                 return;
             }
+        }
+        if let Some(dest) = already_there {
+            self.set_status(&format!("Some of these messages are already in {dest}"));
         }
     }
 
     /// The server confirmed new flags: show them, and refresh the folder's
     /// unread count if the message changed between read and unread.
     pub(super) fn flags_updated(&mut self, account: usize, mailbox: &str, uid: u32, flags: Vec<String>) {
-        let Some(open) = self.open.as_mut().filter(|o| o.folder().account == account && o.folder().mailbox == mailbox) else { return };
-        let Some(was_seen) = open.row_of(uid).and_then(|row| open.header(row)).map(MailHeader::is_seen) else { return };
-        let Some(row) = open.set_flags(uid, flags) else { return };
-        let updated = open.header(row).cloned();
-        self.list.update_rows(open.rows());
-        let now_seen = updated.as_ref().is_some_and(MailHeader::is_seen);
-        if let (Some(selected), Some(updated)) = (self.selected.as_mut().filter(|header| header.uid == uid), updated) {
-            selected.flags = updated.flags;
-        }
+        self.core.cache().update_flags(account, mailbox, uid, flags.clone());
+        let was_seen = self.set_flags_everywhere(account, mailbox, uid, flags);
+        let Some((was_seen, now_seen)) = was_seen else { return };
         if was_seen != now_seen {
             self.request_unread_counts(account, Some(&[mailbox]));
         }
     }
 
-    /// The server moved a message out of the open folder: drop its row, and
-    /// when it was the open message, move on to its neighbour.
+    /// Records `flags` in the open folder, in the search results and in the open
+    /// message, repainting whichever the list shows. Returns whether the message
+    /// was read before and after, or `None` when none of them holds it.
+    fn set_flags_everywhere(&mut self, account: usize, mailbox: &str, uid: u32, flags: Vec<String>) -> Option<(bool, bool)> {
+        let searching = self.search.active();
+        let mut seen = None;
+        if let Some(open) = self.open.as_mut().filter(|o| o.folder().account == account && o.folder().mailbox == mailbox) {
+            let was_seen = open.row_of(uid).and_then(|row| open.header(row)).map(MailHeader::is_seen);
+            if let (Some(was_seen), Some(row)) = (was_seen, open.set_flags(uid, flags.clone())) {
+                seen = Some((was_seen, open.header(row).is_some_and(MailHeader::is_seen)));
+                if !searching {
+                    self.list.update_rows(open.rows());
+                }
+            }
+        }
+        if let Some(results) = self.search.results_mut() {
+            let was_seen = results.seen(account, mailbox, uid);
+            if results.set_flags(account, mailbox, uid, flags.clone()) {
+                seen = seen.or(was_seen.map(|was| (was, flags.iter().any(|flag| flag == FLAG_SEEN))));
+                self.list.update_rows(results.rows());
+            }
+        }
+        if self.selected_is(account, mailbox, uid) {
+            if let Some(selected) = self.selected.as_mut() {
+                selected.flags = flags;
+            }
+        }
+        seen
+    }
+
+    /// The server moved a message out of its folder: drop its row, and when it
+    /// was the open message, move on to its neighbour.
     pub(super) fn moved(&mut self, account: usize, mailbox: &str, uid: u32, dest: &str) {
         self.set_status(&format!("Moved to {dest}"));
         self.request_unread_counts(account, Some(&[mailbox, dest]));
-        let Some(open) = self.open.as_mut().filter(|o| o.folder().account == account && o.folder().mailbox == mailbox) else { return };
-        let Some(row) = open.remove(uid) else { return };
-        self.list.remove_rows(open.rows(), row, 1);
-        if self.selected.as_ref().is_none_or(|header| header.uid != uid) {
+        self.core.cache().remove_message(account, mailbox, uid);
+        let was_selected = self.selected_is(account, mailbox, uid);
+        let folder_row = self.open.as_mut().filter(|o| o.folder().account == account && o.folder().mailbox == mailbox).and_then(|open| open.remove(uid));
+        let result_row = self.search.results_mut().and_then(|results| results.remove(account, mailbox, uid));
+        let (row, rows, len) = match (self.search.results(), folder_row, result_row) {
+            (Some(results), _, Some(row)) => (row, results.rows(), results.len()),
+            (None, Some(row), _) => match self.open.as_ref() {
+                Some(open) => (row, open.rows(), open.loaded()),
+                None => return,
+            },
+            _ => return,
+        };
+        self.list.remove_rows(rows, row, 1);
+        if !was_selected {
             return;
         }
         self.selected = None;
         self.bodies.cancel();
-        match open.loaded() {
+        match len {
             0 => self.reader.show_notice("Select a message to read it."),
             len => self.list.set_selection(&[row.min(len - 1)]),
         }

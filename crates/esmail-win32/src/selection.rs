@@ -70,9 +70,6 @@ impl Selection {
     /// * plain: select only `index`;
     /// * Ctrl: move the focus without changing the selection;
     /// * Shift: extend the range from the anchor to `index`.
-    ///
-    /// Reached only once win32ui lets a scroll-hosted widget see the navigation
-    /// keys before the host scrolls with them (win32ui #82).
     pub fn move_focus(&mut self, index: usize, ctrl: bool, shift: bool) {
         if ctrl {
             self.focus = Some(index);
@@ -152,6 +149,25 @@ pub fn nav_target(key: Key, focus: Option<usize>, len: usize, page: usize) -> Op
     Some(target.min(last))
 }
 
+/// What a navigation key did, from [`navigate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Moved {
+    /// The row the focus moved to (it may be where it already was, at an end).
+    pub focus: usize,
+    /// Whether the selection may have changed, so the app should hear of it.
+    /// False for Ctrl+key, which only moves the focus.
+    pub selection_changed: bool,
+}
+
+/// Applies a navigation key to `selection` in a `len`-row list showing `page`
+/// rows at a time: Up/Down/PageUp/PageDown/Home/End move the focus, Shift
+/// extends the range from the anchor, Ctrl moves the focus alone. Returns
+/// `None` (and changes nothing) for any other key or an empty list.
+pub fn navigate(selection: &mut Selection, key: Key, ctrl: bool, shift: bool, len: usize, page: usize) -> Option<Moved> {
+    let focus = nav_target(key, selection.focus, len, page)?;
+    selection.move_focus(focus, ctrl, shift);
+    Some(Moved { focus, selection_changed: !ctrl })
+}
 /// The inclusive span between `a` and `b`, ascending. This is the index-space
 /// equivalent of `esmail::view_model::select_range`, which does the same for
 /// UIDs over a `MailHeader` list — the message list selects by index, so the
@@ -270,5 +286,68 @@ mod tests {
         assert_eq!(nav_target(Key::UP, None, 10, 5), Some(9));
         assert_eq!(nav_target(Key::DOWN, None, 0, 5), None);
         assert_eq!(nav_target(Key::A, Some(1), 10, 5), None);
+    }
+
+    fn navigated(sel: &mut Selection, key: Key, ctrl: bool, shift: bool) -> Option<Moved> {
+        navigate(sel, key, ctrl, shift, 20, 5)
+    }
+
+    #[test]
+    fn a_plain_navigation_key_selects_only_the_row_it_lands_on() {
+        let mut sel = selection(&[3, 4], Some(3), Some(4));
+        let moved = navigated(&mut sel, Key::DOWN, false, false);
+        assert_eq!(moved, Some(Moved { focus: 5, selection_changed: true }));
+        assert_eq!(sel, selection(&[5], Some(5), Some(5)));
+    }
+
+    #[test]
+    fn shift_navigation_extends_the_range_and_can_shrink_it_again() {
+        let mut sel = selection(&[6], Some(6), Some(6));
+        navigated(&mut sel, Key::DOWN, false, true);
+        navigated(&mut sel, Key::PAGE_DOWN, false, true);
+        assert_eq!(sel.selected, (6..=12).collect::<Vec<_>>());
+        assert_eq!(sel.anchor, Some(6));
+        navigated(&mut sel, Key::UP, false, true);
+        assert_eq!(sel.selected, (6..=11).collect::<Vec<_>>());
+        navigated(&mut sel, Key::HOME, false, true);
+        assert_eq!(sel.selected, (0..=6).collect::<Vec<_>>());
+        assert_eq!(sel.focus, Some(0));
+    }
+
+    #[test]
+    fn ctrl_navigation_moves_the_focus_and_leaves_the_selection() {
+        let mut sel = selection(&[6], Some(6), Some(6));
+        let moved = navigated(&mut sel, Key::END, true, false);
+        assert_eq!(moved, Some(Moved { focus: 19, selection_changed: false }));
+        assert_eq!(sel, selection(&[6], Some(6), Some(19)));
+        navigated(&mut sel, Key::UP, true, false);
+        assert_eq!(sel, selection(&[6], Some(6), Some(18)));
+    }
+
+    #[test]
+    fn navigation_stops_at_both_ends() {
+        let mut sel = selection(&[19], Some(19), Some(19));
+        assert_eq!(navigated(&mut sel, Key::DOWN, false, false).map(|m| m.focus), Some(19));
+        navigated(&mut sel, Key::HOME, false, false);
+        assert_eq!(navigated(&mut sel, Key::PAGE_UP, false, false).map(|m| m.focus), Some(0));
+        assert_eq!(sel, selection(&[0], Some(0), Some(0)));
+    }
+
+    #[test]
+    fn other_keys_and_an_empty_list_leave_the_selection_alone() {
+        let mut sel = selection(&[2], Some(2), Some(2));
+        assert_eq!(navigated(&mut sel, Key::A, false, false), None);
+        assert_eq!(navigate(&mut sel, Key::DOWN, false, false, 0, 5), None);
+        assert_eq!(sel, selection(&[2], Some(2), Some(2)));
+    }
+
+    #[test]
+    fn navigation_with_nothing_focused_starts_at_the_top_or_bottom() {
+        let mut sel = Selection::new();
+        navigated(&mut sel, Key::DOWN, false, false);
+        assert_eq!(sel, selection(&[0], Some(0), Some(0)));
+        let mut sel = Selection::new();
+        navigated(&mut sel, Key::UP, false, true);
+        assert_eq!((sel.selected, sel.focus), (vec![19], Some(19)));
     }
 }

@@ -1,26 +1,41 @@
 //! What the accounts' IMAP sessions report, applied to the window.
 
 use esmail::imap::{ImapCommand, ImapEvent};
-use esmail_win32::core_glue::FolderRef;
+use esmail_win32::core_glue::CacheEvent;
 
-use win32ui::Ui;
-
-use super::{App, Msg, native_tree};
+use super::{App, native_tree};
 
 impl App {
-    /// Applies everything the core has queued. Never blocks.
-    pub(super) fn drain(&mut self, ui: &Ui<Msg>) {
+    /// Applies everything the core and the cache have queued. Never blocks.
+    pub(super) fn drain(&mut self) {
         let mut tree_changed = false;
+        for event in self.core.cache().pump() {
+            tree_changed |= self.handle_cache(event);
+        }
         for (account, event) in self.core.pump() {
-            tree_changed |= self.handle(ui, account, event);
+            tree_changed |= self.handle(account, event);
         }
         if tree_changed {
             native_tree::sync(&self.tree, &self.folders.borrow());
         }
     }
 
+    /// Applies one cache event. Returns whether the folder tree needs syncing.
+    fn handle_cache(&mut self, event: CacheEvent) -> bool {
+        match event {
+            CacheEvent::Folders { account, mailboxes } => {
+                self.folders.borrow_mut().set_cached_mailboxes(account, &mailboxes);
+                return true;
+            }
+            CacheEvent::Headers { account, mailbox, headers } => self.seed_from_cache(account, &mailbox, headers),
+            CacheEvent::Search(hits) => self.search_arrived(hits),
+            CacheEvent::Failed(message) => self.banner(&format!("Cache: {message}")),
+        }
+        false
+    }
+
     /// Applies one event. Returns whether the folder tree needs syncing.
-    fn handle(&mut self, ui: &Ui<Msg>, account: usize, event: ImapEvent) -> bool {
+    fn handle(&mut self, account: usize, event: ImapEvent) -> bool {
         match event {
             ImapEvent::Connected => {
                 self.set_status("Connected");
@@ -39,7 +54,6 @@ impl App {
             ImapEvent::Mailboxes(mailboxes) => {
                 self.folders.borrow_mut().set_mailboxes(account, &mailboxes);
                 self.request_unread_counts(account, None);
-                self.open_first_folder(ui, account);
                 return true;
             }
             ImapEvent::UnreadCounts(counts) => {
@@ -75,17 +89,6 @@ impl App {
         };
         if !mailboxes.is_empty() {
             self.core.send(account, ImapCommand::FetchUnreadCounts { mailboxes });
-        }
-    }
-
-    fn open_first_folder(&mut self, ui: &Ui<Msg>, account: usize) {
-        if self.open.is_some() {
-            return;
-        }
-        let wanted = self.wanted_folder.clone().unwrap_or_else(|| "INBOX".to_string());
-        let mailbox = self.folders.borrow().mailbox_names(account).into_iter().find(|name| name.eq_ignore_ascii_case(&wanted));
-        if let Some(mailbox) = mailbox {
-            self.open_folder(ui, FolderRef { account, mailbox });
         }
     }
 }

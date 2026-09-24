@@ -9,12 +9,16 @@ use win32ui::Point;
 pub enum MessageListEvent {
     /// The selection changed. Carries every selected row, ascending.
     Selected(Vec<usize>),
-    /// A row was opened (Enter or double-click).
+    /// A row was opened (double-click, or `open_focused`).
     Open(usize),
     /// The selected rows were deleted.
     Delete(Vec<usize>),
-    /// The flag of the focused row should toggle (Space).
+    /// The flag of a row should toggle: its star was clicked, or Space was pressed
+    /// on the focused row.
     ToggleFlag(usize),
+    /// The keyboard focus moved to a row. The list handles this itself by
+    /// scrolling the row into view; it never reaches the app.
+    Focus(usize),
     /// A context menu was requested for `row` at the pointer position `at`
     /// (client coordinates, device pixels).
     Context {
@@ -34,7 +38,7 @@ pub(crate) struct MessageListEvents<M> {
     pub(crate) on_select: Option<SelectMapper<M>>,
     pub(crate) on_open: Option<RowMapper<M>>,
     pub(crate) on_delete: Option<Box<dyn Fn(&[usize]) -> Option<M>>>,
-    pub(crate) on_flag: Option<RowMapper<M>>,
+    pub(crate) on_toggle_flag: Option<RowMapper<M>>,
     pub(crate) on_context: Option<ContextMapper<M>>,
     pub(crate) on_near_end: Option<Box<dyn Fn() -> Option<M>>>,
 }
@@ -45,7 +49,7 @@ impl<M> MessageListEvents<M> {
             on_select: None,
             on_open: None,
             on_delete: None,
-            on_flag: None,
+            on_toggle_flag: None,
             on_context: None,
             on_near_end: None,
         }

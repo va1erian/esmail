@@ -55,8 +55,9 @@ impl App {
             self.seen.cancel(ui);
             return;
         };
-        let Some((folder, header)) = self.open.as_ref().and_then(|o| Some((o.folder().clone(), o.header(*row)?.clone()))) else { return };
-        let key = (folder.account, folder.mailbox, header.uid);
+        let Some((folder, header)) = self.message_at(*row) else { return };
+        let key = (folder.account, folder.mailbox.clone(), header.uid);
+        self.selected_in = Some(folder);
         self.set_status("Loading message...");
         self.seen.cancel(ui);
         if !header.is_seen() {
@@ -72,6 +73,12 @@ impl App {
         }
     }
 
+    /// Whether the message `(account, mailbox, uid)` is the one on screen.
+    pub(super) fn selected_is(&self, account: usize, mailbox: &str, uid: u32) -> bool {
+        self.selected.as_ref().is_some_and(|header| header.uid == uid)
+            && self.selected_in.as_ref().is_some_and(|folder| folder.account == account && folder.mailbox == mailbox)
+    }
+
     fn fetch_body(&mut self, (account, mailbox, uid): BodyKey, req_id: u64) {
         if !self.core.send(account, ImapCommand::FetchBody { mailbox, uid, req_id }) {
             self.banner("this account is not connected");
@@ -81,12 +88,13 @@ impl App {
     /// A body (or its failure) came back: show it if it is still the message
     /// the user wants, and start the next wanted fetch.
     pub(super) fn body_arrived(&mut self, account: usize, uid: u32, req_id: u64, outcome: std::result::Result<(String, Vec<Attachment>), String>) {
-        let Some(mailbox) = self.open.as_ref().map(|o| o.folder().mailbox.clone()) else { return };
-        let finished = self.bodies.finished(&(account, mailbox, uid), req_id);
+        let Some(mailbox) = self.selected_in.as_ref().map(|folder| folder.mailbox.clone()) else { return };
+        let finished = self.bodies.finished(&(account, mailbox.clone(), uid), req_id);
         if finished.show {
             if let Some(header) = self.selected.clone() {
                 match outcome {
                     Ok((html, attachments)) => {
+                        self.core.cache().index_mail(account, &mailbox, header.clone(), html.clone(), attachments.clone());
                         self.reader.show_message(header, html, attachments);
                         self.set_status("Ready");
                     }
@@ -113,7 +121,9 @@ impl App {
         }
         if since.elapsed() >= MARK_SEEN_DELAY {
             self.seen.cancel(ui);
-            self.store_flags(uid, vec![FLAG_SEEN.to_string()], Vec::new());
+            if let Some(folder) = self.selected_in.clone() {
+                self.store_flags(folder, uid, vec![FLAG_SEEN.to_string()], Vec::new());
+            }
         }
     }
 }

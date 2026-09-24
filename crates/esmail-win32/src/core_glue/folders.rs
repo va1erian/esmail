@@ -59,6 +59,26 @@ impl FolderTree {
         Self { accounts }
     }
 
+    /// Shows the folders the local cache knows for `account`, as a stand-in until
+    /// the server's `LIST` arrives. Ignored once real folders are known. The
+    /// cache stores names only, so nested folders appear flat and no
+    /// special-use roles are known (except `INBOX`, which is special by name).
+    pub fn set_cached_mailboxes(&mut self, account: usize, names: &[String]) {
+        if self.has_folders(account) {
+            return;
+        }
+        let mailboxes: Vec<MailboxInfo> = names
+            .iter()
+            .map(|name| MailboxInfo {
+                name: name.clone(),
+                delimiter: None,
+                special_use: name.eq_ignore_ascii_case("INBOX").then_some(SpecialUse::Inbox),
+                noselect: false,
+            })
+            .collect();
+        self.set_mailboxes(account, &mailboxes);
+    }
+
     /// Replaces `account`'s folders with a fresh `LIST` result.
     pub fn set_mailboxes(&mut self, account: usize, mailboxes: &[MailboxInfo]) {
         if let Some(entry) = self.accounts.get_mut(account) {
@@ -177,6 +197,17 @@ mod tests {
 
     fn texts(nodes: &[Node]) -> Vec<&str> {
         nodes.iter().map(|n| n.text.as_str()).collect()
+    }
+
+    #[test]
+    fn cached_folders_stand_in_until_the_server_lists_them() {
+        let mut tree = FolderTree::new(["Work".to_string()]);
+        tree.set_cached_mailboxes(0, &["Sent".to_string(), "INBOX".to_string()]);
+        let account = tree.children(None)[0].id;
+        assert_eq!(texts(&tree.children(Some(account))), ["INBOX", "Sent"]);
+        tree.set_mailboxes(0, &[mailbox("INBOX", false)]);
+        tree.set_cached_mailboxes(0, &["Stale".to_string()]);
+        assert_eq!(texts(&tree.children(Some(account))), ["INBOX"]);
     }
 
     #[test]

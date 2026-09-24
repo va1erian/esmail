@@ -7,12 +7,16 @@
 //! merges it into what is loaded, so new mail appears at the top without the
 //! list losing its place.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use esmail::imap::MailHeader;
 use esmail::view_model::RowModel;
 
 use super::{FolderRef, Latest};
+
+/// How many headers the IMAP actor returns per page.
+const PAGE_SIZE: usize = 50;
 
 /// A page to request: which one, and the id its reply will carry back.
 #[derive(Debug, PartialEq, Eq)]
@@ -60,6 +64,8 @@ pub struct OpenFolder {
     headers: Vec<MailHeader>,
     rows: Vec<RowModel>,
     next_page: u32,
+    /// Whether the server has answered the first page yet.
+    first_page_arrived: bool,
     total_pages: Option<u32>,
     ids: Latest,
     page_request: Option<u64>,
@@ -75,6 +81,7 @@ impl OpenFolder {
             headers: Vec::new(),
             rows: Vec::new(),
             next_page: 1,
+            first_page_arrived: false,
             total_pages: None,
             ids: Latest::default(),
             page_request: None,
@@ -102,7 +109,7 @@ impl OpenFolder {
     /// first page has loaded (there is nothing to merge into yet). A refresh
     /// asked for while another is in flight supersedes it.
     pub fn refresh_request(&mut self) -> Option<u64> {
-        if self.next_page == 1 {
+        if !self.first_page_arrived {
             return None;
         }
         let id = self.ids.begin();
@@ -114,8 +121,17 @@ impl OpenFolder {
     pub fn apply_reply(&mut self, id: u64, page: u32, total_pages: u32, headers: Vec<MailHeader>) -> Option<Applied> {
         if self.page_request == Some(id) {
             self.page_request = None;
-            self.next_page = page + 1;
             self.total_pages = Some(total_pages);
+            let seeded = self.is_cached_only();
+            self.first_page_arrived = true;
+            if seeded {
+                // The newest page is not "older messages": merge it into the
+                // cached rows like a refresh, and keep the page cursor the
+                // seed set.
+                self.next_page = self.next_page.max(page + 1);
+                return Some(Applied::Refreshed(self.merge_newest(headers)));
+            }
+            self.next_page = page + 1;
             return Some(Applied::Page { added: self.append(headers) });
         }
         if self.refresh_request == Some(id) {
@@ -124,6 +140,30 @@ impl OpenFolder {
             return Some(Applied::Refreshed(self.merge_newest(headers)));
         }
         None
+    }
+
+    /// Fills the folder from the local cache (newest first) so it can be shown
+    /// before the server answers. Refused, returning `false`, once the server's
+    /// first page is in (it is fresher) or when the cache held nothing.
+    ///
+    /// The server's first page then merges into these rows as a refresh. The
+    /// cursor for older pages starts one page back from the end of the cache, so
+    /// the next fetch overlaps what is loaded (duplicates are dropped) instead
+    /// of skipping messages the server has since deleted from the middle.
+    pub fn seed(&mut self, headers: Vec<MailHeader>) -> bool {
+        if self.first_page_arrived || !self.headers.is_empty() || headers.is_empty() {
+            return false;
+        }
+        self.next_page = (headers.len() / PAGE_SIZE).max(1) as u32;
+        self.rows = headers.iter().map(RowModel::from_header).collect();
+        self.headers = headers;
+        true
+    }
+
+    /// Whether every row so far came from the cache: the server has not yet
+    /// answered the first page.
+    pub fn is_cached_only(&self) -> bool {
+        !self.first_page_arrived && !self.headers.is_empty()
     }
 
     /// The outstanding page request failed; allow it to be asked for again.
@@ -147,14 +187,20 @@ impl OpenFolder {
     /// from the reply are gone from the server.
     fn merge_newest(&mut self, fresh: Vec<MailHeader>) -> Vec<Edit> {
         let floor = fresh.last().map_or(0, |header| header.uid);
-        let mut edits = Vec::new();
-        for at in (0..self.headers.len()).rev() {
-            let uid = self.headers[at].uid;
-            if uid >= floor && !fresh.iter().any(|header| header.uid == uid) {
-                edits.push(Edit::Removed { at });
-                self.headers.remove(at);
-                self.rows.remove(at);
-            }
+        let fresh_uids: HashSet<u32> = fresh.iter().map(|header| header.uid).collect();
+        let gone: Vec<usize> = (0..self.headers.len()).filter(|&at| self.headers[at].uid >= floor && !fresh_uids.contains(&self.headers[at].uid)).collect();
+        // One pass rather than a `remove` per message: a cache that no longer
+        // matches the server (a recreated folder) can lose thousands at once.
+        let mut edits: Vec<Edit> = gone.iter().rev().map(|&at| Edit::Removed { at }).collect();
+        if !gone.is_empty() {
+            let keep = |index: &mut usize| {
+                *index += 1;
+                gone.binary_search(&(*index - 1)).is_err()
+            };
+            let mut index = 0;
+            self.headers.retain(|_| keep(&mut index));
+            index = 0;
+            self.rows.retain(|_| keep(&mut index));
         }
         for header in fresh {
             match self.row_of(header.uid) {
@@ -371,6 +417,66 @@ mod tests {
         let new = open.refresh_request().unwrap();
         assert_eq!(open.apply_reply(old, 1, 1, headers(10..12)), None);
         assert!(open.apply_reply(new, 1, 1, headers(10..12)).is_some());
+    }
+
+    /// A folder seeded from a cache holding `uids`, with its first page requested.
+    fn seeded(uids: std::ops::Range<u32>) -> (OpenFolder, PageRequest) {
+        let mut open = folder();
+        let first = open.next_request().unwrap();
+        assert!(open.seed(headers(uids)));
+        (open, first)
+    }
+
+    #[test]
+    fn a_seeded_folder_shows_the_cache_and_merges_the_servers_first_page_as_a_refresh() {
+        let (mut open, first) = seeded(100..180);
+        assert_eq!(open.loaded(), 80);
+        assert_eq!(open.header(0).unwrap().uid, 179);
+        let applied = open.apply_reply(first.id, 1, 5, headers(130..182));
+        assert_eq!(applied, Some(Applied::Refreshed(vec![Edit::Inserted { at: 0 }, Edit::Inserted { at: 1 }])));
+        assert_eq!(open.loaded(), 82);
+        assert_eq!(open.header(81).unwrap().uid, 100);
+        assert_eq!(open.refresh_request().map(|_| ()), Some(()));
+    }
+
+    #[test]
+    fn after_a_seed_older_pages_are_asked_for_from_one_page_before_the_cache_ends() {
+        let (mut open, first) = seeded(0..120);
+        open.apply_reply(first.id, 1, 9, headers(70..120));
+        // 120 cached rows end inside page 3, so page 2 is re-read (its rows are
+        // duplicates and are dropped) before page 3 continues past the cache.
+        let request = open.next_request().unwrap();
+        assert_eq!(request.page, 2);
+        assert_eq!(open.apply_reply(request.id, 2, 9, headers(20..70)), Some(Applied::Page { added: 0 }));
+        assert_eq!(open.next_request().map(|r| r.page), Some(3));
+    }
+
+    #[test]
+    fn a_small_cache_still_moves_on_to_page_two_after_the_first_reply() {
+        let (mut open, first) = seeded(10..15);
+        open.apply_reply(first.id, 1, 3, headers(10..15));
+        assert_eq!(open.next_request().map(|r| r.page), Some(2));
+    }
+
+    #[test]
+    fn the_cache_cannot_replace_rows_the_server_already_sent() {
+        let mut open = loaded(10..15);
+        assert!(!open.seed(headers(1..5)));
+        assert_eq!(open.loaded(), 5);
+    }
+
+    #[test]
+    fn an_empty_cache_seeds_nothing_and_the_first_page_arrives_as_a_page() {
+        let mut open = folder();
+        let first = open.next_request().unwrap();
+        assert!(!open.seed(Vec::new()));
+        assert_eq!(open.apply_reply(first.id, 1, 1, headers(1..4)), Some(Applied::Page { added: 3 }));
+    }
+
+    #[test]
+    fn a_seeded_folder_is_not_refreshed_while_its_first_page_is_in_flight() {
+        let (mut open, _) = seeded(10..15);
+        assert_eq!(open.refresh_request(), None);
     }
 
     #[test]

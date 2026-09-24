@@ -14,10 +14,13 @@
 //! never blocks, so nothing here runs on the UI thread except moving events
 //! out of the channel.
 
+mod cache;
 mod folders;
 mod loads;
 pub mod mailbox;
 pub mod reading;
+mod results;
+mod window_state;
 
 use esmail::auth;
 use esmail::config::{AccountConfig, Config};
@@ -27,8 +30,11 @@ use esmail::waker::Waker;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
+pub use cache::{Cache, CacheEvent};
 pub use folders::{FolderRef, FolderTree, Node, NodeId};
 pub use loads::{BodyLoads, Finished, Latest};
+pub use results::SearchResults;
+pub use window_state::WindowState;
 
 /// Set to give an account a password when the OS keyring has none (used to
 /// point the app at `mail-mock-server` without touching the real keyring).
@@ -52,6 +58,7 @@ pub struct Core {
     sessions: Vec<Option<AccountSession>>,
     accounts: Vec<AccountConfig>,
     events: mpsc::Receiver<AccountEvent>,
+    cache: Cache,
     /// Kept alive for the sessions and never touched again.
     _runtime: Runtime,
     waker: Waker,
@@ -89,13 +96,20 @@ impl Core {
                 }
             }
         }
-        let core = Core { sessions, accounts: config.accounts.clone(), events, _runtime: runtime, waker };
+        let cache = Cache::start(runtime.handle(), config.accounts.iter().map(|a| a.id.clone()).collect(), waker.clone());
+        let core = Core { sessions, accounts: config.accounts.clone(), events, cache, _runtime: runtime, waker };
         Ok((core, issues))
     }
 
     /// The configured accounts, in the order every account index refers to.
     pub fn accounts(&self) -> &[AccountConfig] {
         &self.accounts
+    }
+
+    /// The local cache: shown before the network answers, kept up to date from
+    /// what the network reports, and searched.
+    pub fn cache(&self) -> &Cache {
+        &self.cache
     }
 
     /// Queues `command` for `account`'s IMAP actor. Returns `false` when the
