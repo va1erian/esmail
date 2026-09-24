@@ -11,6 +11,10 @@
 //! requesting more messages yet. `BulkDownload` still pulls the whole
 //! mailbox every time. See PLAN.md §B3 for why that part waited.
 
+mod cached;
+
+pub use cached::CacheReader;
+
 use rusqlite::{params, Connection};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -47,6 +51,15 @@ pub enum DbCommand {
     /// for the still-open gap that opening a single message via `FetchBody`
     /// doesn't index it either.
     IndexHeaders {
+        account_id: String,
+        mailbox: String,
+        headers: Vec<MailHeader>,
+    },
+    /// Like `IndexHeaders`, but a message that was not cached before also gets
+    /// a body-less full-text row, so it is findable by subject, sender and
+    /// recipient (`search` matches through the FTS table). For a frontend that
+    /// caches headers as it lists them but does not bulk-download bodies.
+    IndexHeadersSearchable {
         account_id: String,
         mailbox: String,
         headers: Vec<MailHeader>,
@@ -257,6 +270,11 @@ impl DbActor {
                 }
                 DbCommand::IndexHeaders { account_id, mailbox, headers } => {
                     if let Err(e) = index_headers(&self.conn, &account_id, &mailbox, &headers) {
+                        let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    }
+                }
+                DbCommand::IndexHeadersSearchable { account_id, mailbox, headers } => {
+                    if let Err(e) = cached::index_headers_searchable(&self.conn, &account_id, &mailbox, &headers) {
                         let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
                     }
                 }

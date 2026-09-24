@@ -87,7 +87,7 @@ pub(crate) fn main() {
     let mut bench = false;
     let mut trace = false;
     let mut verbose = false;
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: &[String] = &std::env::args().skip(1).collect::<Vec<_>>();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -141,7 +141,7 @@ pub(crate) fn main() {
                 .on_select(|rows| Some(Msg::Selected(rows.to_vec())))
                 .on_open(|row| Some(Msg::Open(row)))
                 .on_delete(|rows| Some(Msg::Delete(rows.to_vec())))
-                .on_flag(|row| Some(Msg::ToggleFlag(row)))
+                .on_toggle_flag(|row| Some(Msg::ToggleFlag(row)))
                 .on_context(|row, at| Some(Msg::Context(row, at)));
             let started = std::time::Instant::now();
             list.set_rows(make_rows(rows));

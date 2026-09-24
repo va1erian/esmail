@@ -30,6 +30,13 @@ const SUBJECT_SIZE: f32 = 13.0;
 /// Timestamp text size, matching egui.
 const TIMESTAMP_SIZE: f32 = 12.0;
 
+/// The star of a flagged row, and the outline shown on hover to flag it.
+const STAR_FILLED: &str = "\u{2605}";
+const STAR_OUTLINE: &str = "\u{2606}";
+
+/// How far outside the glyph a click still counts as on the star.
+const STAR_SLOP: f32 = 4.0;
+
 /// The ellipsis DirectWrite has no built-in trimming for, appended by
 /// [`ellipsize`].
 const ELLIPSIS: char = '\u{2026}';
@@ -44,6 +51,9 @@ pub struct Fonts {
     pub subject: Font,
     /// The right-aligned date and time.
     pub timestamp: Font,
+    /// The width of the star glyph, reserved on every row so the sender's
+    /// ellipsis does not change when the pointer reveals an outline star.
+    pub star_width: f32,
     /// The fixed row height in device-independent pixels, from the two text
     /// lines plus padding. Constant for every row, which is what makes the
     /// list virtualizable.
@@ -61,11 +71,13 @@ impl Fonts {
         let timestamp = text.font(&win32ui::d2d::FontSpec::new(family, TIMESTAMP_SIZE))?;
         let row_height =
             PAD_Y * 2.0 + sender.metrics().line_height() + LINE_GAP + subject.metrics().line_height();
+        let star_width = sender.width(STAR_FILLED).max(sender.width(STAR_OUTLINE));
         Ok(Fonts {
             sender,
             sender_bold,
             subject,
             timestamp,
+            star_width,
             row_height,
         })
     }
@@ -80,6 +92,8 @@ pub struct RowVisual {
     pub selected: bool,
     /// The pointer is over the row.
     pub hovered: bool,
+    /// The pointer is over the row's star, so a click will toggle the flag.
+    pub star_hovered: bool,
     /// The list has the keyboard focus.
     pub focused: bool,
 }
@@ -145,19 +159,23 @@ pub fn paint_row(
     let right = rect.right - PAD_X;
     let full_width = (rect.width() - ACCENT - PAD_X * 2.0).max(0.0);
 
-    let star = row.flagged.then_some("\u{2605}");
+    let star = if row.flagged {
+        Some(STAR_FILLED)
+    } else if visual.hovered {
+        Some(STAR_OUTLINE)
+    } else {
+        None
+    };
     let (date, time) = match &row.local_date_time {
         Some((date, time)) => (Some(date.as_str()), Some(time.as_str())),
         None => (None, None),
     };
 
-    let star_w = star.map_or(0.0, |s| fonts.sender.width(s));
     let time_w = time.map_or(0.0, |t| fonts.timestamp.width(t));
     let date_w = date.map_or(0.0, |d| fonts.timestamp.width(d));
 
     let reserved_time = if time.is_some() { time_w + RIGHT_GAP } else { 0.0 };
-    let reserved_star = if star.is_some() { star_w + RIGHT_GAP } else { 0.0 };
-    let sender_w = (full_width - reserved_time - reserved_star).max(0.0);
+    let sender_w = (full_width - reserved_time - fonts.star_width - RIGHT_GAP).max(0.0);
     let subject_w = (full_width - if date.is_some() { date_w + RIGHT_GAP } else { 0.0 }).max(0.0);
 
     let sender_font = if unread {
@@ -190,11 +208,8 @@ pub fn paint_row(
             );
         }
         if let Some(star_layout) = star_layout {
-            canvas.draw_text(
-                &star_layout,
-                PointF::new(right - reserved_time - star_layout.width(), sender_origin.y),
-                theme.warning,
-            );
+            let color = if row.flagged || visual.star_hovered { theme.warning } else { theme.text_secondary };
+            canvas.draw_text(&star_layout, PointF::new(right - reserved_time - fonts.star_width, sender_origin.y), color);
         }
     }
 
@@ -219,6 +234,17 @@ pub fn paint_row(
         Stroke::solid(1.0),
     );
     phases.draw += mark.elapsed().as_secs_f64() * 1_000_000.0;
+}
+
+/// Whether a point inside a row of width `row_width` is on its star: `x` from
+/// the row's left edge and `y` from its top, in device-independent pixels. The
+/// star sits at the right end of the sender line, left of the time, so this
+/// mirrors the geometry [`paint_row`] draws with.
+pub fn star_hit(row: &RowModel, fonts: &Fonts, row_width: f32, x: f32, y: f32) -> bool {
+    let reserved_time = row.local_date_time.as_ref().map_or(0.0, |(_, time)| fonts.timestamp.width(time) + RIGHT_GAP);
+    let left = row_width - PAD_X - reserved_time - fonts.star_width;
+    let sender_line_bottom = PAD_Y + fonts.sender.metrics().line_height() + LINE_GAP;
+    (left - STAR_SLOP..left + fonts.star_width + STAR_SLOP).contains(&x) && y < sender_line_bottom
 }
 
 /// Truncates `text` to fit on one line within `max_width` device-independent

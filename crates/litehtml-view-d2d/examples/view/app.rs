@@ -74,7 +74,7 @@ const SELECT_DEMO: &str = r#"<!doctype html>
 pub(crate) fn main() {
     env_logger::init();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: &[String] = &std::env::args().skip(1).collect::<Vec<_>>();
     let mut path: Option<String> = None;
     let mut screenshot: Option<String> = None;
     let mut scroll: Option<f32> = None;
