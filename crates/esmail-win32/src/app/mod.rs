@@ -17,6 +17,7 @@
 mod accounts;
 mod actions;
 mod args;
+mod bars;
 mod chrome;
 mod compose;
 mod composes;
@@ -26,10 +27,12 @@ mod links;
 mod message;
 mod placement;
 mod reader;
+mod reader_bar;
 mod screenshot;
 mod search;
 mod startup;
 mod theme;
+mod toolbar;
 mod tree;
 
 use std::cell::RefCell;
@@ -52,10 +55,12 @@ use accounts::{Accounts, FormRequest, ManageRequest, Outcome};
 use args::{Args, ThemeChoice};
 use message::SeenTimer;
 use reader::Reader;
+use reader_bar::ReaderBar;
 use screenshot::{Capture, Step};
 use composes::Composes;
 use search::SearchState;
 use startup::Startup;
+use toolbar::MainBar;
 use tree::{FolderView, SharedFolders};
 
 /// The folder pane's width and the list's, in device-independent pixels, before
@@ -105,6 +110,10 @@ enum Msg {
     SearchFocused(bool),
     /// Esc.
     SearchClear,
+    /// The theme button cycled Dark / Light / System.
+    CycleTheme,
+    /// Export the open message's raw source as an .eml.
+    Export,
     /// The divider between the folders and the list moved (to this width).
     FoldersMoved(f32),
     /// The divider between the list and the reading pane moved.
@@ -138,6 +147,8 @@ struct App {
     search: SearchState,
     tree: FolderView,
     reader: Reader,
+    toolbar: MainBar,
+    reader_bar: ReaderBar,
     status: StatusBar<Msg>,
     theme: ThemeChoice,
     original_colours: bool,
@@ -156,6 +167,9 @@ struct App {
     seen: SeenTimer,
     /// Ids for flag and move commands (the actor echoes them back).
     action_ids: Latest,
+    /// Flag, move or export commands sent to the server and not yet confirmed,
+    /// so the toolbars can disable actions while one is running.
+    pending_actions: usize,
     /// The selected message's body is on screen (screenshots wait for this).
     message_shown: bool,
     select_after_load: Option<usize>,
@@ -233,6 +247,8 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         .on_change(|text| Some(Msg::SearchChanged(text.to_string())))
         .on_focus(|focused| Some(Msg::SearchFocused(focused)));
     let reader = Reader::new(ui, palette_for(&ui.theme())).expect("reading pane");
+    let toolbar = MainBar::new(ui, args.theme).expect("main toolbar");
+    let reader_bar = ReaderBar::new(ui).expect("reader action bar");
     let status = StatusBar::new(ui).expect("status bar");
     status.set_parts(&[-1]);
 
@@ -257,6 +273,8 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         search: SearchState::default(),
         tree,
         reader,
+        toolbar,
+        reader_bar,
         status,
         theme: args.theme,
         original_colours: false,
@@ -268,6 +286,7 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         selected_in: None,
         seen: SeenTimer::default(),
         action_ids: Latest::default(),
+        pending_actions: 0,
         message_shown: false,
         select_after_load: args.select,
         capture,
@@ -319,6 +338,7 @@ impl win32ui::App for App {
     type Msg = Msg;
 
     fn update(&mut self, msg: Msg, ui: &mut Ui<Msg>) {
+        let sync_bars = !matches!(&msg, Msg::Frame);
         match msg {
             Msg::Wake => {
                 self.drain();
@@ -364,6 +384,8 @@ impl win32ui::App for App {
             Msg::Enter => self.enter(ui),
             Msg::SearchFocused(focused) => self.search.set_focused(focused),
             Msg::SearchClear => self.clear_search(ui),
+            Msg::CycleTheme => self.choose_theme(ui, self.theme.next()),
+            Msg::Export => self.export_selected(),
             Msg::FoldersMoved(width) => self.window.folders_width = Some(width),
             Msg::ListMoved(width) => self.window.list_width = Some(width),
             Msg::AddAccount => self.add_account(ui),
@@ -375,13 +397,20 @@ impl win32ui::App for App {
             Msg::Quit => ui.quit(),
             Msg::Timer(id) => self.timer(ui, id),
         }
+        if sync_bars {
+            self.sync_bars(ui);
+        }
     }
 }
 
 impl App {
     fn layout(&self, ui: &Ui<Msg>) {
         let list_pane = column![self.search_edit, self.list.fill(1)];
-        let list_and_reader = split_row![list_pane, self.reader]
+        let reading_pane = Layout::column()
+            .item(self.reader_bar.actions_layout())
+            .item(self.reader_bar.banner_layout())
+            .item(self.reader.fill(1));
+        let list_and_reader = split_row![list_pane, reading_pane]
             .position(dip(self.window.list_width.unwrap_or(DEFAULT_LIST_WIDTH)))
             .min(dip(280.0), dip(320.0))
             .on_moved(|width| Some(Msg::ListMoved(width.value())));
@@ -391,7 +420,11 @@ impl App {
             .on_moved(|width| Some(Msg::FoldersMoved(width.value())));
         // An extended (acrylic) title strip is not part of the frame: start below it.
         let below_strip = Insets::new(dip(0.0), ui.title_bar_height(), dip(0.0), dip(0.0));
-        ui.set_layout(column![panes, self.status].margins(below_strip));
+        let main = Layout::column()
+            .item(self.toolbar.bar_layout(ui.dpi()))
+            .item(panes)
+            .item(&self.status);
+        ui.set_layout(main.margins(below_strip));
     }
 
     /// Opens the wanted folder of the wanted account straight away, and asks the

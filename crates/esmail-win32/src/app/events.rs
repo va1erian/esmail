@@ -88,10 +88,24 @@ impl App {
             }
             ImapEvent::Body { uid, html, attachments, req_id } => self.body_arrived(account, uid, req_id, Ok((html, attachments))),
             ImapEvent::BodyFailed { uid, req_id, error } => self.body_arrived(account, uid, req_id, std::result::Result::Err(error)),
-            ImapEvent::FlagsUpdated { mailbox, uid, flags, .. } => self.flags_updated(account, &mailbox, uid, flags),
-            ImapEvent::FlagsUpdateFailed { uid, error, .. } => self.banner(&format!("Could not update message {uid}: {error}")),
-            ImapEvent::Moved { mailbox, uid, dest, .. } => self.moved(account, &mailbox, uid, &dest),
-            ImapEvent::MoveFailed { uid, error, .. } => self.banner(&format!("Could not move message {uid}: {error}")),
+            ImapEvent::FlagsUpdated { mailbox, uid, flags, .. } => {
+                self.action_finished();
+                self.flags_updated(account, &mailbox, uid, flags);
+            }
+            ImapEvent::FlagsUpdateFailed { uid, error, .. } => {
+                self.action_finished();
+                self.banner(&format!("Could not update message {uid}: {error}"));
+            }
+            ImapEvent::Moved { mailbox, uid, dest, .. } => {
+                self.action_finished();
+                self.moved(account, &mailbox, uid, &dest);
+            }
+            ImapEvent::MoveFailed { uid, error, .. } => {
+                self.action_finished();
+                self.banner(&format!("Could not move message {uid}: {error}"));
+            }
+            ImapEvent::Exported { path } => self.export_done(path),
+            ImapEvent::ExportFailed { error } => self.export_failed(&error),
             _ => {}
         }
         false
