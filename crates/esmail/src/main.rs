@@ -4,6 +4,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use esmail::ipc::message::ToGui;
+use esmail::app::{AccountView, AppCore, Changes, ConnState};
 use esmail::shortcuts::{self, Command};
 use esmail::{auth, compose, config, contacts, db, emoji, icons, imap, oauth, paths, progress, render, search_query, secrets, session, shell, smtp, uninstall};
 use esmail::view_model::{
@@ -33,14 +34,14 @@ use egui_litehtml_webview::{
     ImageRequest, InterceptOutcome, WebView, WebViewConfig, WebViewHandler, WebViewHost,
     WebViewSource,
 };
-use imap::{ImapCommand, ImapEvent, MailHeader};
+use imap::{ImapCommand, MailHeader};
 use db::{DbActor, DbCommand, DbEvent};
 use compose::{ComposeId, ComposeState};
 use compose_window::ComposeWindow;
 use config::{AccountConfig, Config};
 use search_query::ParsedQuery;
 use secrecy::SecretString;
-use session::{AccountEvent, AccountId, AccountSession, Hooks, SessionParams};
+use session::{AccountId, NotifyFn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -127,38 +128,6 @@ impl WebViewHandler for MessageViewHandler {
     }
 }
 
-/// A dismissable error notice (B9), replacing the old pattern of clobbering
-/// `EsMailApp::status` with `format!("Error: {e}")`/`format!("DB Error: {e}")`
-/// — which lost whatever the status string was showing before (e.g. "Page 3
-/// of 9") the moment an unrelated background error arrived, and gave the
-/// user no way to see more than the single most recent one. `status` itself
-/// stays for transient, non-error progress text ("Connecting...", "Page 3 of
-/// 9") — this only replaces the error half of that one field's job.
-struct Banner {
-    id: u64,
-    message: String,
-}
-
-/// The one middle-to-long operation shown in the bottom status bar, if any --
-/// issue #79's single progress slot. A report for a new operation replaces
-/// whatever was there, and a terminal event clears it only while it is still
-/// the kind being shown, so a superseded report can't blank the current one.
-struct ProgressView {
-    kind: ProgressKind,
-    progress: Progress,
-}
-
-/// A bulk action over a selection (mark read/unread, star/unstar, archive,
-/// delete) in flight. Only one runs at a time -- the buttons that start one
-/// are disabled while this is `Some` (issue #79's one-at-a-time decision) --
-/// and [`EsMailApp::advance_bulk_action`] turns each per-message reply into an
-/// update of the status bar's `done/total`.
-struct BulkAction {
-    kind: ProgressKind,
-    total: u32,
-    pending: std::collections::BTreeSet<u32>,
-}
-
 /// A finished background attachment write, drained by
 /// [`EsMailApp::handle_attachment_io`]. `error` is `None` on success.
 enum AttachmentIoEvent {
@@ -179,66 +148,10 @@ enum AttachmentWrite {
 /// The host the "Sign in with Google" option is offered for.
 const GMAIL_IMAP_HOST: &str = "imap.gmail.com";
 
-/// Where one account's connection stands, for the folder pane.
-#[derive(Debug, Clone, PartialEq)]
-enum ConnState {
-    /// The first connect is still in flight.
-    Connecting,
-    Connected,
-    /// The connection dropped; the actor is reconnecting on its own.
-    Disconnected,
-    /// The first connect failed (bad password, unreachable server). The
-    /// session is kept so the failure shows next to the account, and so
-    /// "Reconnect" has something to replace.
-    Failed(String),
-}
-
-/// One signed-in account and the state that is per account: the session
-/// (actor + watcher, see `session.rs`), its mailbox tree and its unread
-/// counts. Dropping it is a real logout.
-struct AccountView {
-    session: AccountSession,
-    state: ConnState,
-    /// The mailbox tree (B8), flattened for the folder pane -- see
-    /// `imap::flatten_tree`'s doc for why a flat, owned `Vec` rather than a
-    /// real recursive tree widget.
-    mailbox_rows: Vec<imap::MailboxRow>,
-    /// `STATUS (UNSEEN)` per mailbox (B8), refreshed whenever `Mailboxes`
-    /// arrives and after a flag/move changes what's unread. A mailbox
-    /// missing from this map (rather than present with `0`) means its count
-    /// hasn't been fetched yet, not that it's read.
-    unread_counts: std::collections::HashMap<String, u32>,
-    /// What the session signs in with -- a password, or the account's own
-    /// Google token source. Kept so SMTP sends reuse the very same OAuth
-    /// source (one cached access token per account, not one per connection).
-    auth: auth::Auth,
-    /// For an account added through the form: the config entry and credential
-    /// to save once the connection actually succeeds (not on every click,
-    /// and never for a password the server rejected). `None` for an account
-    /// that came from the saved list.
-    pending_persist: Option<(AccountConfig, auth::Auth)>,
-}
-
-impl AccountView {
-    fn id(&self) -> &str {
-        self.session.id()
-    }
-
-    fn label(&self) -> &str {
-        self.session.label()
-    }
-
-    fn total_unread(&self) -> u32 {
-        self.mailbox_rows
-            .iter()
-            .filter_map(|r| r.full_name.as_ref())
-            .filter(|name| name.eq_ignore_ascii_case("INBOX"))
-            .filter_map(|name| self.unread_counts.get(name))
-            .sum()
-    }
-}
-
 struct EsMailApp {
+    /// Everything about the accounts, the message list and the open message
+    /// that is not drawing. See `esmail::app`.
+    core: AppCore,
     web_view: WebView,
     /// Creates views; see `egui_litehtml_webview::WebViewHost`'s own doc for
     /// why this is little more than a texture-id counter now. Kept as a
@@ -258,19 +171,6 @@ struct EsMailApp {
     screenshotter: screenshot::Screenshotter,
     /// Show only the webview, with no IMAP account. See ESMAIL_PREVIEW.
     preview: bool,
-    /// Every connected (or connecting) account, in the order they were
-    /// added. Each holds its own `ImapActor`, `IDLE` watch and new-mail
-    /// watermark (see `session.rs`); removing one drops all of them.
-    accounts: Vec<AccountView>,
-    /// The account the message list and reading pane show. `None` until the
-    /// first account has connected, and again once the last one is gone.
-    active: Option<AccountId>,
-    /// Handed (cloned) to each new [`AccountSession`], whose forwarder tags
-    /// what it forwards with the account id.
-    imap_events_tx: mpsc::Sender<AccountEvent>,
-    imap_rx: mpsc::Receiver<AccountEvent>,
-    /// Callbacks every new session gets: the toast and the repaint request.
-    session_hooks: Hooks,
     /// Show the "Add account" form even though accounts are already
     /// connected. With no accounts the form is shown regardless.
     adding_account: bool,
@@ -312,7 +212,6 @@ struct EsMailApp {
     /// The Drafts window's contents, refreshed by `DbEvent::DraftList` --
     /// `None` while the window is closed.
     drafts_window: Option<Vec<db::DraftSummary>>,
-    db_tx: mpsc::Sender<DbCommand>,
     db_rx: mpsc::Receiver<DbEvent>,
     smtp_tx: mpsc::Sender<smtp::SmtpCommand>,
     smtp_rx: mpsc::Receiver<smtp::SmtpEvent>,
@@ -355,20 +254,12 @@ struct EsMailApp {
     /// servers that need `StartTls`/`None` used to require editing the
     /// account in Settings after adding it.
     smtp_tls: config::TlsMode,
-    status: String,
 
     /// First-run wizard (B9): an email address typed on the login screen, to
     /// look up in `config::provider_for_email` and autofill the host/port
     /// fields from — see `apply_provider_wizard`. Not itself persisted; it
     /// only ever feeds the other fields, which are.
     wizard_email: String,
-
-    /// Active error banners (B9), newest last. See [`Banner`].
-    banners: Vec<Banner>,
-    /// Monotonic source for `Banner::id`, so a dismiss click can target the
-    /// exact banner clicked even if another one is added/removed the same
-    /// frame — mirrors `next_req_id`'s reasoning.
-    next_banner_id: u64,
 
     /// Current theme preference (B9), mirrored from `config.theme` and kept
     /// in sync with it on every toggle. Applied to the `egui::Context` once
@@ -386,50 +277,17 @@ struct EsMailApp {
     /// exiting.
     geometry_saved_on_close: bool,
 
-    /// The mailbox open in the message list, within the `active` account.
-    selected_mailbox: String,
-
-    headers: Vec<MailHeader>,
-    selected_uid: Option<u32>,
-    /// Multi-select (B8): every UID selected via shift/ctrl-click, in
-    /// addition to `selected_uid` (the one whose body is actually shown --
-    /// always the most recently *plain*-clicked message, or the sole member
-    /// of a multi-selection made by ctrl/shift-clicking from scratch).
-    /// Bulk actions (archive/delete/mark read or unread) act on this set
-    /// when it's non-empty, falling back to `selected_uid` alone otherwise.
-    selected_uids: std::collections::BTreeSet<u32>,
-    /// Anchor for shift-click range selection: the last *plain* (no
-    /// modifier) click, or the single UID a ctrl-click started a fresh
-    /// selection from.
-    select_anchor: Option<u32>,
-    /// Set when a message is opened, cleared once its `\Seen` flag has been
-    /// sent (or the user navigates away first) -- B8's "mark as read with a
-    /// delay" so briefly passing over a message in the list doesn't mark it
-    /// read. Checked once per frame in `ui()`.
-    pending_mark_seen: Option<(u32, std::time::Instant)>,
     /// The search box `TextEdit`'s widget id, captured where it's drawn so
     /// Ctrl+F (B8) can `request_focus` it from the keyboard-shortcut check
     /// below, which runs outside that closure (and so has no access to a
     /// freshly-computed id of its own -- egui ids depend on the enclosing
     /// panel, not just the widget's own salt).
     search_box_id: Option<egui::Id>,
-    current_page: u32,
-    total_pages: u32,
-    /// Attachments for the currently-open message (B6), if fetched directly
-    /// from IMAP. Cleared whenever a different message is opened. A message
-    /// opened from a cached search result never populates this — the cache
-    /// only stores rendered HTML, not the raw bytes attachments come from;
-    /// see PLAN.md §B6.
-    current_attachments: Vec<render::Attachment>,
     /// Lowercased address of the open message's sender (`None` when nothing
     /// is open or the header has no address). What the remote-images bar
     /// offers to trust, and what `open_message` looked up in
     /// `Config::image_trusted_senders` when it opened the message.
     current_sender: Option<String>,
-    /// The currently-open message's rendered HTML, kept only so
-    /// Reply/Reply All/Forward (B7) can quote it — see `compose.rs`. Empty
-    /// when no message is loaded.
-    current_message_html: String,
 
     /// The open compose windows, one native window per message (see
     /// `compose_window.rs`). Sending or discarding one leaves the rest alone.
@@ -448,33 +306,6 @@ struct EsMailApp {
     /// Asking whether to quit although compose windows hold unsent text.
     confirm_quit: bool,
 
-    /// Monotonic source for `ImapCommand::FetchHeaders`/`FetchBody` request
-    /// ids. Only the reply matching `current_headers_req`/`current_body_req`
-    /// is applied; an older one arriving late (e.g. a slow page-2 fetch
-    /// answered after the user already moved to page 3) is dropped instead of
-    /// clobbering newer state.
-    next_req_id: u64,
-    current_headers_req: u64,
-    current_body_req: u64,
-
-    // Search and Progress
-    search_query: String,
-    search_results: Option<Vec<MailHeader>>,
-    /// Where each entry of `search_results` lives (account, mailbox), index
-    /// for index. A search can span accounts, and a UID means nothing without
-    /// them. Empty exactly when `search_results` is `None`.
-    search_origins: Vec<(AccountId, String)>,
-    /// Search every account instead of only the active one.
-    search_all_accounts: bool,
-    /// Opening a search hit from another mailbox moved `active` /
-    /// `selected_mailbox` there without reloading `headers`; when the search
-    /// is cleared the message list has to be fetched again.
-    headers_stale: bool,
-    /// The one operation the bottom status bar is showing, if any. See
-    /// [`ProgressView`].
-    progress: Option<ProgressView>,
-    /// The bulk flag/move action in flight, if any. See [`BulkAction`].
-    bulk_action: Option<BulkAction>,
     /// Compose ids whose SMTP send has not come back yet, so the status bar
     /// can show "Sending…" while any is outstanding -- including a background
     /// outbox retry that has no compose window of its own.
@@ -517,15 +348,8 @@ impl EsMailApp {
     /// account to select once its session comes up.
     fn new(cc: &eframe::CreationContext<'_>, open_account: Option<String>) -> Self {
         init_logging();
-        
-        // Every account's events arrive here, tagged with the account id by
-        // that account's `AccountSession` forwarder (session.rs). Each
-        // session also runs its own new-mail watch (B10) as a plain tokio
-        // task, not anything hung off `EsMailApp::ui`/`logic`, so toasts
-        // keep coming for as long as the process is alive, independent of
-        // whether the main window is visible. See platform/windows.rs for how the window
-        // survives being "closed".
-        let (imap_events_tx, imap_rx) = mpsc::channel(64);
+
+        let runtime = tokio::runtime::Handle::current();
         let (db_cmd_tx, db_cmd_rx) = mpsc::channel(32);
         let (db_evt_tx, db_evt_rx) = mpsc::channel(32);
 
@@ -580,28 +404,31 @@ impl EsMailApp {
         // The listener toasts the same mail; while it is connected this
         // process's own hook is muted so the user sees one toast, not two.
         let toast_enabled = Arc::new(AtomicBool::new(true));
-        let session_hooks = Hooks {
-            notify: {
-                let enabled = Arc::clone(&toast_enabled);
-                Arc::new(move |account: &str, title: &str, body: &str| {
-                    if enabled.load(Ordering::Relaxed) {
-                        platform::show_new_mail_toast(account, title, body);
-                    }
-                })
-            },
-            repaint: Arc::clone(&waker),
+        let notify: NotifyFn = {
+            let enabled = Arc::clone(&toast_enabled);
+            Arc::new(move |account: &str, title: &str, body: &str| {
+                if enabled.load(Ordering::Relaxed) {
+                    platform::show_new_mail_toast(account, title, body);
+                }
+            })
         };
+        // Each session also runs its own new-mail watch (B10) as a plain
+        // tokio task, not anything hung off `EsMailApp::ui`/`logic`, so
+        // toasts keep coming for as long as the process is alive, independent
+        // of whether the main window is visible. See platform/windows.rs for
+        // how the window survives being "closed".
+        let mut core = AppCore::new(runtime.clone(), Arc::clone(&waker), notify, db_cmd_tx);
 
         // Wrap DB events
         let (tx_db, mut rx_db) = mpsc::channel(32);
         let waker_db = Arc::clone(&waker);
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             while let Some(evt) = rx_db.recv().await {
                 let _ = db_evt_tx.send(evt).await;
                 waker_db();
             }
         });
-        DbActor::spawn(db_cmd_rx, tx_db);
+        DbActor::spawn(&runtime, db_cmd_rx, tx_db);
 
         let compose_registry: Arc<std::sync::Mutex<std::collections::HashMap<ComposeId, ComposeWindow>>> =
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -612,7 +439,7 @@ impl EsMailApp {
         let ctx_clone_smtp = egui_ctx.clone();
         let waker_smtp = Arc::clone(&waker);
         let compose_registry_smtp = compose_registry.clone();
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             while let Some(evt) = rx_smtp.recv().await {
                 // Act on the compose window directly, from this thread, as
                 // well as forwarding below -- see `compose_window.rs`'s
@@ -641,7 +468,7 @@ impl EsMailApp {
                 waker_smtp();
             }
         });
-        smtp::SmtpActor::spawn(smtp_cmd_rx, tx_smtp);
+        smtp::SmtpActor::spawn(&runtime, smtp_cmd_rx, tx_smtp);
 
         // Preview mode: render one page full-window with no IMAP account, so the
         // webview itself can be exercised and screenshotted. ESMAIL_PREVIEW is
@@ -726,7 +553,6 @@ impl EsMailApp {
                     config::TlsMode::Ssl,
                 ),
             };
-        let initial_status = "Ready".to_string();
 
         // The form starts on "Sign in with Google" for a returning OAuth
         // user, and for a brand-new one whenever a Google client is
@@ -770,7 +596,7 @@ impl EsMailApp {
 
         // Start the resident listener if none is running, and hold a link to
         // it. Preview/screenshot runs stay single-process.
-        let listener = if preview.is_none() { ListenerClient::start() } else { ListenerClient::disabled() };
+        let listener = if preview.is_none() { ListenerClient::start(&runtime) } else { ListenerClient::disabled(&runtime) };
 
         let initial_theme = config.theme;
 
@@ -779,14 +605,13 @@ impl EsMailApp {
         // watched from the moment the app starts. A preview run has no
         // accounts by design; an account with no usable credential is left
         // for the Add account form / Settings, with a note saying why.
-        let mut accounts = Vec::new();
         let mut startup_notes = Vec::new();
         if preview.is_none() {
             let now = oauth::now_unix();
             for account in &config.accounts {
                 match accounts::saved_auth(&config, account) {
                     Ok(auth) => {
-                        accounts.push(spawn_account_view(account, auth, None, &imap_events_tx, &session_hooks));
+                        core.open_session(account, auth, None);
                         if let Some(note) = auth::oauth_expiry_warning(account, now) {
                             startup_notes.push(note);
                         }
@@ -804,16 +629,12 @@ impl EsMailApp {
         let (attachment_io_tx, attachment_io_rx) = std::sync::mpsc::channel();
 
         let mut app = Self {
+            core,
             web_view_host,
             web_view,
             message_view_handler,
             screenshotter: screenshot::Screenshotter::from_env(),
             preview: preview.is_some(),
-            accounts,
-            active: None,
-            imap_events_tx,
-            imap_rx,
-            session_hooks,
             adding_account: false,
             sending_from: std::collections::HashMap::new(),
             outbox_owner: std::collections::HashMap::new(),
@@ -825,7 +646,6 @@ impl EsMailApp {
             compose_last_autosave: std::collections::HashMap::new(),
             outbox_window: None,
             drafts_window: None,
-            db_tx: db_cmd_tx,
             db_rx: db_evt_rx,
             smtp_tx: smtp_cmd_tx,
             smtp_rx: smtp_evt_rx,
@@ -838,40 +658,17 @@ impl EsMailApp {
             smtp_host: smtp_host_str,
             smtp_port: smtp_port_str,
             smtp_tls: smtp_tls_val,
-            status: initial_status,
             wizard_email: String::new(),
-            banners: Vec::new(),
-            next_banner_id: 0,
             theme: initial_theme,
             window_geometry: None,
             geometry_saved_on_close: false,
-            selected_mailbox: "INBOX".to_string(),
-            headers: Vec::new(),
-            selected_uid: None,
-            selected_uids: std::collections::BTreeSet::new(),
-            select_anchor: None,
-            pending_mark_seen: None,
             search_box_id: None,
-            current_page: 1,
-            total_pages: 1,
-            current_attachments: Vec::new(),
             current_sender: None,
-            current_message_html: String::new(),
             compose_windows: Vec::new(),
             compose_registry,
             next_compose_id: 0,
             window_icon: icons::window_icon().map(|icon| Arc::new(icon_data(icon))),
             confirm_quit: false,
-            next_req_id: 0,
-            current_headers_req: 0,
-            current_body_req: 0,
-            search_query: String::new(),
-            search_results: None,
-            search_origins: Vec::new(),
-            search_all_accounts: false,
-            headers_stale: false,
-            progress: None,
-            bulk_action: None,
             sends_in_flight: std::collections::HashSet::new(),
             attachment_io_tx,
             attachment_io_rx,
@@ -890,366 +687,23 @@ impl EsMailApp {
             settings: None,
         };
         for note in startup_notes {
-            app.push_banner(note);
+            app.core.push_banner(note);
         }
         app
-    }
-
-    /// Route what every account's session produced since the last frame.
-    /// Events that change per-account state (mailbox tree, unread counts,
-    /// connection state, cache bookkeeping) apply to the account they name;
-    /// events about the message list and the reading pane only apply while
-    /// that account is the `active` one, since those show one account's
-    /// mailbox at a time.
-    fn handle_imap_events(&mut self) {
-        while let Ok((account, evt)) = self.imap_rx.try_recv() {
-            // The account was removed while this was still queued.
-            if self.view(&account).is_none() {
-                continue;
-            }
-            let is_active = self.active.as_deref() == Some(account.as_str());
-            match evt {
-                ImapEvent::Connected => {
-                    let from_form = self.view(&account).is_some_and(|v| v.pending_persist.is_some());
-                    if let Some(view) = self.view_mut(&account) {
-                        view.state = ConnState::Connected;
-                    }
-                    self.persist_pending(&account);
-                    // A newly added account (not a reconnect) is a change to
-                    // the saved list the listener should pick up.
-                    if from_form {
-                        self.listener.notify_config_changed();
-                    }
-                    // An account connecting in the background (a saved one
-                    // at startup, or a reconnect) must not dismiss the Add
-                    // account form someone is typing into; only the account
-                    // that form started does.
-                    if from_form {
-                        self.adding_account = false;
-                    }
-                    self.status = format!("Connected: {}", self.account_label(&account));
-                    self.send_imap_to(&account, ImapCommand::FetchMailboxes);
-                    if self.active.is_none() {
-                        self.activate(&account, "INBOX".to_string());
-                    } else if is_active {
-                        self.fetch_headers(self.selected_mailbox.clone(), 1);
-                    }
-                }
-                ImapEvent::Disconnected => {
-                    if let Some(view) = self.view_mut(&account) {
-                        view.state = ConnState::Disconnected;
-                    }
-                    if is_active {
-                        self.status = "Connection lost, reconnecting...".to_string();
-                    }
-                }
-                ImapEvent::Error(e) => {
-                    // A failed `BulkDownload` reports through this generic
-                    // variant (it has no per-uid/req_id to attribute to), so
-                    // clear its bar rather than leaving it stuck at whatever
-                    // it last showed.
-                    self.clear_progress(ProgressKind::Index);
-                    if let Some(view) = self.view_mut(&account) {
-                        // A first connect that failed, or a reconnect that gave
-                        // up (a revoked Google sign-in, say): either way the
-                        // account is not going to recover by itself.
-                        if matches!(view.state, ConnState::Connecting | ConnState::Disconnected) {
-                            view.state = ConnState::Failed(e.clone());
-                        }
-                    }
-                    self.push_account_banner(&account, format!("IMAP error: {e}"));
-                }
-                ImapEvent::Mailboxes(mbs) => {
-                    // B8: render as a tree (name split on the server's
-                    // delimiter, special-use folders first) instead of a
-                    // flat alphabetical list.
-                    let names: Vec<String> = mbs.iter().map(|m| m.name.clone()).collect();
-                    if let Some(view) = self.view_mut(&account) {
-                        view.mailbox_rows = imap::flatten_tree(&imap::mailbox_tree(&mbs));
-                    }
-                    self.send_imap_to(&account, ImapCommand::FetchUnreadCounts { mailboxes: names });
-                }
-                ImapEvent::Headers { mailbox, headers, page, total_pages, req_id, mailbox_state } => {
-                    // Only the most recently issued FetchHeaders' reply is
-                    // applied; an older one arriving late (e.g. the mailbox
-                    // was changed again before it came back) is dropped.
-                    if is_active && req_id == self.current_headers_req && mailbox == self.selected_mailbox {
-                        self.headers = headers;
-                        self.current_page = page;
-                        self.total_pages = total_pages;
-                        self.status = format!("Page {} of {}", page, total_pages);
-                    }
-                    // Rides along on every header fetch regardless of
-                    // req_id/mailbox staleness — db.rs's cache bookkeeping for
-                    // `mailbox` should stay current even if this particular
-                    // reply is no longer the one the UI is showing.
-                    let _ = self.db_tx.try_send(DbCommand::ReportMailboxState {
-                        account_id: account,
-                        mailbox,
-                        uid_validity: mailbox_state.uid_validity,
-                        uid_next: mailbox_state.uid_next,
-                    });
-                }
-                ImapEvent::Body { uid, html, attachments, req_id } => {
-                    // Matching `req_id`+`uid` is sufficient on its own now
-                    // that `open_message` bumps `current_body_req` on every
-                    // open (including a cache-served search result) -- a
-                    // stale live reply from before a search-result open can
-                    // no longer slip through just because `uid` happens to
-                    // coincide, since its `req_id` is guaranteed stale too.
-                    // (This used to also require `self.search_results.is_none()`,
-                    // which incidentally also blocked the *legitimate* case
-                    // fixed here: a live fallback fetch issued while the
-                    // search results list is still showing, from a DB cache
-                    // miss -- see the `DbEvent::MailFetchFailed` arm below.)
-                    if is_active && req_id == self.current_body_req && self.selected_uid == Some(uid) {
-                        self.current_message_html = html.clone();
-                        self.web_view.load(WebViewSource::Html(html));
-                        self.current_attachments = attachments;
-                    }
-                }
-                ImapEvent::BodyFailed { uid, req_id, error } => {
-                    // Without this, a failed body fetch (dropped connection,
-                    // exhausted reconnect retries, message no longer on the
-                    // server) left `open_message`'s "Loading message..."
-                    // placeholder on screen forever: the generic `Error`
-                    // variant this used to arrive as carries no uid/req_id,
-                    // so nothing could tell it apart from an unrelated error
-                    // and resolve the pending fetch. This is the actual fix
-                    // for the "stuck on Loading message..." bug (issue #13).
-                    if is_active && req_id == self.current_body_req && self.selected_uid == Some(uid) {
-                        let msg = format!("<i>Could not load message: {}</i>", ammonia::clean_text(&error));
-                        self.current_message_html = msg.clone();
-                        self.web_view.load(WebViewSource::Html(msg));
-                    }
-                    self.push_account_banner(&account, format!("Could not load message: {error}"));
-                }
-                ImapEvent::Exported { path } => {
-                    self.clear_progress(ProgressKind::Export);
-                    self.status = format!("Exported message to {}", path.display());
-                }
-                ImapEvent::ExportFailed { error } => {
-                    self.clear_progress(ProgressKind::Export);
-                    self.push_account_banner(&account, format!("Could not export message: {error}"));
-                }
-                ImapEvent::Progress { kind, progress: update } => {
-                    // Indexing is the active account's selected mailbox, so a
-                    // report for another account's is ignored; an append or an
-                    // export belongs to whichever account it was issued for,
-                    // so those show regardless.
-                    let indexing_done = kind == ProgressKind::Index
-                        && matches!(update, Progress::Counted { current, total } if current == total);
-                    if kind != ProgressKind::Index || is_active {
-                        if indexing_done {
-                            self.clear_progress(ProgressKind::Index);
-                            self.status = "Download complete".to_string();
-                        } else {
-                            self.set_progress(kind, update);
-                        }
-                    }
-                }
-                ImapEvent::MailData { mailbox, header, body, attachments } => {
-                    let _ = self.db_tx.try_send(DbCommand::IndexMail {
-                        account_id: account,
-                        mailbox,
-                        header,
-                        body,
-                        attachments,
-                    });
-                }
-                ImapEvent::MailboxPolled { .. } => {
-                    // B10's new-mail signal: already consumed by the
-                    // account's forwarder (session.rs) before this event
-                    // reached the UI channel at all (it decides whether to
-                    // poll again / fetch new envelopes / show a toast).
-                    // Nothing left here for the UI to do.
-                }
-                ImapEvent::NewHeaders { .. } => {
-                    // Same: the forwarder already turned it into a toast.
-                    // What the UI still owes is the unread counts, so an
-                    // account that is not on screen (with several accounts
-                    // most are not) shows its new mail in the folder pane.
-                    let names = self.mailbox_names(&account);
-                    if !names.is_empty() {
-                        self.send_imap_to(&account, ImapCommand::FetchUnreadCounts { mailboxes: names });
-                    }
-                }
-                ImapEvent::Appended { mailbox } => {
-                    // B7: confirmation that the just-sent message was saved
-                    // to `mailbox` (see the `Append` sent from
-                    // `handle_smtp_events`'s `Sent` arm). Nothing else for the
-                    // UI to update -- the compose window and "Message sent"
-                    // status already reflect the send itself, which
-                    // succeeded independently of this.
-                    self.clear_progress(ProgressKind::Append);
-                    log::debug!("appended sent message to {mailbox}");
-                }
-                ImapEvent::AppendFailed { mailbox, error } => {
-                    // Deliberately not `self.status` -- see the variant's
-                    // doc in imap.rs: the send itself already succeeded and
-                    // is already reflected there, and this is a background,
-                    // best-effort step the user never explicitly asked to
-                    // watch. A banner (B9), unlike the old single `status`
-                    // string this replaces, can say so *alongside* "Message
-                    // sent" instead of only being able to overwrite it --
-                    // which is exactly the problem that made this event a
-                    // log-only affair up to now.
-                    self.clear_progress(ProgressKind::Append);
-                    log::warn!("could not save sent message to {mailbox}: {error}");
-                    self.push_account_banner(&account, format!("Sent, but could not save a copy to {mailbox}: {error}"));
-                }
-                ImapEvent::HeadersFrom { mailbox, headers } => {
-                    // B3: reply to the `FetchHeadersFrom` sent in
-                    // `handle_db_events`'s `SyncPlan::FetchFrom`/`Resync`
-                    // arm -- index into the cache now that these envelopes
-                    // are in hand. See `ImapCommand::FetchHeadersFrom`'s doc
-                    // for why this is a separate event from `NewHeaders`
-                    // rather than reusing it.
-                    let _ = self.db_tx.try_send(DbCommand::IndexHeaders {
-                        account_id: account,
-                        mailbox,
-                        headers,
-                    });
-                }
-                ImapEvent::PollFailed(e) => {
-                    // Deliberately not `self.status` -- see the variant's
-                    // doc in imap.rs: a background poll failing every 60s
-                    // shouldn't overwrite whatever the user is looking at.
-                    log::warn!("background new-mail poll for {account} failed: {e}");
-                }
-                ImapEvent::FlagsUpdated { mailbox, uid, flags, req_id: _ } => {
-                    self.advance_bulk_action(ProgressKind::Flags, uid);
-                    // B8: reflect the server-confirmed flags back into the
-                    // visible header list, any active search-results list,
-                    // and the local cache. Only touches self.headers/
-                    // self.search_results when `mailbox` of the active
-                    // account is what's actually on screen -- both lists
-                    // only ever hold messages from `self.selected_mailbox`
-                    // (search is itself scoped to it, see the `Search`
-                    // send-site below), so an event for a different mailbox
-                    // (or account) finding a same-numbered UID in either
-                    // list would otherwise patch the wrong message's row.
-                    // The unread count belongs to the event's own account
-                    // and mailbox, and the DB write is keyed by both, so
-                    // both are correct regardless of what's displayed.
-                    let mut was_seen = None;
-                    if is_active && mailbox == self.selected_mailbox {
-                        was_seen = self.headers.iter().find(|h| h.uid == uid).map(|h| h.is_seen());
-                        if let Some(header) = self.headers.iter_mut().find(|h| h.uid == uid) {
-                            header.flags = flags.clone();
-                        }
-                    }
-                    // Search results can come from any account and mailbox, so
-                    // they are matched on their own origin rather than on what
-                    // is open.
-                    if let Some(results) = self.search_results.as_mut() {
-                        for (i, header) in results.iter_mut().enumerate() {
-                            let origin = self.search_origins.get(i);
-                            if header.uid == uid && origin.is_some_and(|(a, m)| *a == account && *m == mailbox) {
-                                header.flags = flags.clone();
-                            }
-                        }
-                    }
-                    if let Some(was_seen) = was_seen {
-                        if let Some(count) = self.view_mut(&account).and_then(|v| v.unread_counts.get_mut(&mailbox)) {
-                            let now_seen = flags.iter().any(|f| f.eq_ignore_ascii_case(imap::FLAG_SEEN));
-                            if was_seen && !now_seen {
-                                *count += 1;
-                            } else if !was_seen && now_seen {
-                                *count = count.saturating_sub(1);
-                            }
-                        }
-                    }
-                    let _ = self.db_tx.try_send(DbCommand::UpdateFlags {
-                        account_id: account,
-                        mailbox,
-                        uid,
-                        flags,
-                    });
-                }
-                ImapEvent::FlagsUpdateFailed { mailbox: _, uid, error, req_id: _ } => {
-                    self.advance_bulk_action(ProgressKind::Flags, uid);
-                    self.push_account_banner(&account, format!("Could not update flags on message {uid}: {error}"));
-                }
-                ImapEvent::Moved { mailbox, uid, dest, req_id: _ } => {
-                    self.advance_bulk_action(ProgressKind::Move, uid);
-                    // B8: delete-to-Trash/archive succeeded -- drop the
-                    // message from the visible list, any active
-                    // search-results list, the cache, and any selection it
-                    // was part of. See FlagsUpdated above for why the
-                    // header/search-results mutations are guarded on this
-                    // being the active account's selected mailbox.
-                    let on_screen = is_active && mailbox == self.selected_mailbox;
-                    let was_unread = on_screen
-                        && self.headers.iter().find(|h| h.uid == uid).map(|h| !h.is_seen()).unwrap_or(false);
-                    if on_screen {
-                        self.headers.retain(|h| h.uid != uid);
-                    }
-                    if let Some(results) = self.search_results.as_mut() {
-                        let origins = std::mem::take(&mut self.search_origins);
-                        let (kept, kept_origins): (Vec<_>, Vec<_>) = results
-                            .drain(..)
-                            .zip(origins)
-                            .filter(|(h, (a, m))| !(h.uid == uid && *a == account && *m == mailbox))
-                            .unzip();
-                        *results = kept;
-                        self.search_origins = kept_origins;
-                    }
-                    if is_active {
-                        self.selected_uids.remove(&uid);
-                        if self.selected_uid == Some(uid) {
-                            self.selected_uid = None;
-                            self.web_view.load(WebViewSource::Html("<i>Message moved.</i>".to_string()));
-                        }
-                        self.status = format!("Moved to {dest}");
-                    }
-                    if was_unread {
-                        if let Some(view) = self.view_mut(&account) {
-                            if let Some(count) = view.unread_counts.get_mut(&mailbox) {
-                                *count = count.saturating_sub(1);
-                            }
-                            // The message just landed in `dest` unread --
-                            // bump its count too if we're already tracking
-                            // it (it may not be yet if FetchUnreadCounts
-                            // hasn't completed), so the sidebar doesn't
-                            // read "no new mail in Archive/Trash" for a
-                            // message that just arrived there.
-                            if let Some(count) = view.unread_counts.get_mut(&dest) {
-                                *count += 1;
-                            }
-                        }
-                    }
-                    let _ = self.db_tx.try_send(DbCommand::RemoveMessage {
-                        account_id: account,
-                        mailbox,
-                        uid,
-                    });
-                }
-                ImapEvent::MoveFailed { mailbox: _, uid, error, req_id: _ } => {
-                    self.advance_bulk_action(ProgressKind::Move, uid);
-                    self.push_account_banner(&account, format!("Could not move message {uid}: {error}"));
-                }
-                ImapEvent::UnreadCounts(counts) => {
-                    if let Some(view) = self.view_mut(&account) {
-                        view.unread_counts = counts;
-                    }
-                }
-            }
-        }
     }
 
     fn handle_db_events(&mut self) {
         while let Ok(evt) = self.db_rx.try_recv() {
             match evt {
                 DbEvent::SearchResult { hits } => {
-                    self.search_origins = hits.iter().map(|h| (h.account_id.clone(), h.mailbox.clone())).collect();
-                    self.search_results = Some(hits.into_iter().map(|h| h.header).collect());
+                    self.core.search_origins = hits.iter().map(|h| (h.account_id.clone(), h.mailbox.clone())).collect();
+                    self.core.search_results = Some(hits.into_iter().map(|h| h.header).collect());
                 }
                 DbEvent::MailFetched { header, body, attachments } => {
-                    if self.selected_uid == Some(header.uid) {
-                        self.current_message_html = body.clone();
+                    if self.core.selected_uid == Some(header.uid) {
+                        self.core.current_message_html = body.clone();
                         self.web_view.load(WebViewSource::Html(body));
-                        self.current_attachments = attachments;
+                        self.core.current_attachments = attachments;
                     }
                 }
                 DbEvent::MailFetchFailed { uid, error } => {
@@ -1266,9 +720,9 @@ impl EsMailApp {
                     // this is what root-caused issue #13. Falling back to a
                     // real `FetchBody` here both fixes that and actually
                     // loads the message rather than just reporting failure.
-                    if self.selected_uid == Some(uid) {
+                    if self.core.selected_uid == Some(uid) {
                         log::debug!("cached body for uid {uid} unavailable ({error}); falling back to a live fetch");
-                        self.fetch_body(self.selected_mailbox.clone(), uid);
+                        self.core.fetch_body(self.core.selected_mailbox.clone(), uid);
                     }
                 }
                 DbEvent::SyncPlan { account_id, mailbox, plan } => {
@@ -1287,10 +741,10 @@ impl EsMailApp {
                     match plan {
                         db::SyncPlan::UpToDate => {}
                         db::SyncPlan::FetchFrom { first_new_uid } => {
-                            self.send_imap_to(&account_id, ImapCommand::FetchHeadersFrom { mailbox, first_uid: first_new_uid });
+                            self.core.send_imap_to(&account_id, ImapCommand::FetchHeadersFrom { mailbox, first_uid: first_new_uid });
                         }
                         db::SyncPlan::Resync => {
-                            self.send_imap_to(&account_id, ImapCommand::FetchHeadersFrom { mailbox, first_uid: 1 });
+                            self.core.send_imap_to(&account_id, ImapCommand::FetchHeadersFrom { mailbox, first_uid: 1 });
                         }
                     }
                 }
@@ -1328,7 +782,7 @@ impl EsMailApp {
                                 // (removed, renamed, or never connected) --
                                 // back it off like any other failure rather
                                 // than retrying every single poll forever.
-                                let _ = self.db_tx.try_send(DbCommand::MarkOutboxFailed {
+                                let _ = self.core.db_tx.try_send(DbCommand::MarkOutboxFailed {
                                     id: item.id,
                                     error: "No SMTP password on file for this account".to_string(),
                                 });
@@ -1353,7 +807,7 @@ impl EsMailApp {
                     self.drafts_window = None;
                 }
                 DbEvent::Error(e) => {
-                    self.push_banner(format!("Database error: {e}"));
+                    self.core.push_banner(format!("Database error: {e}"));
                 }
             }
         }
@@ -1381,7 +835,7 @@ impl EsMailApp {
             if !has_content {
                 continue;
             }
-            let _ = self.db_tx.try_send(DbCommand::SaveDraft {
+            let _ = self.core.db_tx.try_send(DbCommand::SaveDraft {
                 id: compose.draft_id,
                 compose_id: id,
                 account_id: compose.account_id.clone(),
@@ -1400,7 +854,7 @@ impl EsMailApp {
             return;
         }
         self.last_outbox_check = now;
-        let _ = self.db_tx.try_send(DbCommand::DueOutbox);
+        let _ = self.core.db_tx.try_send(DbCommand::DueOutbox);
     }
 
     fn handle_smtp_events(&mut self, ctx: &egui::Context) {
@@ -1413,7 +867,7 @@ impl EsMailApp {
                     // being a draft now that it's actually gone out.
                     if let Some(window) = self.compose_windows.iter().find(|w| w.id() == id) {
                         if let Some(draft_id) = window.snapshot().draft_id {
-                            let _ = self.db_tx.try_send(DbCommand::DeleteDraft { id: draft_id });
+                            let _ = self.core.db_tx.try_send(DbCommand::DeleteDraft { id: draft_id });
                         }
                     }
                     // Only the window that sent it closes; a failure (the
@@ -1425,10 +879,10 @@ impl EsMailApp {
                     // arm) -- that attempt just succeeded, so the row is
                     // done.
                     if let Some(outbox_id) = self.outbox_owner.remove(&id) {
-                        let _ = self.db_tx.try_send(DbCommand::MarkOutboxSent { id: outbox_id });
+                        let _ = self.core.db_tx.try_send(DbCommand::MarkOutboxSent { id: outbox_id });
                         self.outbox_in_flight.remove(&outbox_id);
                     }
-                    self.status = "Message sent".to_string();
+                    self.core.status = "Message sent".to_string();
                     // B7: save a copy to Sent, the way every other mail
                     // client does (SMTP itself doesn't). Best-effort -- a
                     // failure here only logs (via the generic
@@ -1439,7 +893,7 @@ impl EsMailApp {
                     // per account).
                     if let Some(account) = self.sending_from.remove(&id) {
                         let mailbox = self.special_use_mailbox_for(&account, imap::SpecialUse::Sent, SENT_MAILBOX);
-                        self.send_imap_to(&account, ImapCommand::Append { mailbox, raw });
+                        self.core.send_imap_to(&account, ImapCommand::Append { mailbox, raw });
                     }
                 }
                 smtp::SmtpEvent::Error { id, error } => {
@@ -1458,13 +912,13 @@ impl EsMailApp {
                     // docs.
                     match self.outbox_owner.get(&id).copied() {
                         Some(outbox_id) => {
-                            let _ = self.db_tx.try_send(DbCommand::MarkOutboxFailed { id: outbox_id, error: error.clone() });
+                            let _ = self.core.db_tx.try_send(DbCommand::MarkOutboxFailed { id: outbox_id, error: error.clone() });
                             self.outbox_in_flight.remove(&outbox_id);
                         }
                         None => {
                             if let Some(window) = self.compose_windows.iter().find(|w| w.id() == id) {
                                 if let Some(account_id) = window.account_id() {
-                                    let _ = self.db_tx.try_send(DbCommand::EnqueueOutbox {
+                                    let _ = self.core.db_tx.try_send(DbCommand::EnqueueOutbox {
                                         id: None,
                                         compose_id: id,
                                         account_id,
@@ -1483,7 +937,7 @@ impl EsMailApp {
                     // which leaves nobody to show it to but the main window.
                     match self.compose_windows.iter().find(|w| w.id() == id) {
                         Some(window) => window.set_error_and_wake(message),
-                        None => self.push_banner(message),
+                        None => self.core.push_banner(message),
                     }
                 }
             }
@@ -1592,7 +1046,7 @@ impl EsMailApp {
             return;
         }
         let accounts: Vec<(String, String)> =
-            self.accounts.iter().map(|v| (v.id().to_string(), v.label().to_string())).collect();
+            self.core.accounts.iter().map(|v| (v.id().to_string(), v.label().to_string())).collect();
         // One shared contact set for every window this frame: it is the same
         // for all of them and can be a few hundred addresses.
         let contacts = std::sync::Arc::new(self.recipient_contacts());
@@ -1606,7 +1060,7 @@ impl EsMailApp {
     /// addresses. Rebuilt from what is in memory each frame -- there is no
     /// persistent address book yet (see #62).
     fn recipient_contacts(&self) -> contacts::Contacts {
-        let headers = self.headers.iter().chain(self.search_results.iter().flatten());
+        let headers = self.core.headers.iter().chain(self.core.search_results.iter().flatten());
         let own = self.config.accounts.iter().map(|account| account.username.as_str());
         contacts::Contacts::from_headers(headers, own)
     }
@@ -1658,139 +1112,36 @@ impl EsMailApp {
         }
     }
 
-    /// Add a new error banner (B9). Callers pass a complete, already-worded
-    /// message; this just assigns it an id and appends it — dismissal is a
-    /// separate click handled in `ui()`, since building the message needs
-    /// `&mut self` at the call site but the dismiss button needs it while
-    /// iterating `self.banners`, and those can't overlap in one place.
-    fn push_banner(&mut self, message: String) {
-        self.next_banner_id += 1;
-        self.banners.push(Banner { id: self.next_banner_id, message });
-    }
-
-    /// [`Self::push_banner`] for an error that belongs to one account. Names
-    /// the account once there is more than one, so "IMAP error: login
-    /// failed" says which of them; with a single account the text is what it
-    /// always was.
-    fn push_account_banner(&mut self, account: &str, message: String) {
-        if self.accounts.len() > 1 {
-            let label = self.account_label(account);
-            self.push_banner(format!("{label}: {message}"));
-        } else {
-            self.push_banner(message);
+    /// Do what the core reports it changed beyond its own state: show the
+    /// reading pane's new content, and save accounts that just connected for
+    /// the first time.
+    fn apply_changes(&mut self, changes: Changes) {
+        if let Some(html) = changes.reading_pane {
+            self.web_view.load(WebViewSource::Html(html));
         }
-    }
-
-    fn view(&self, account: &str) -> Option<&AccountView> {
-        self.accounts.iter().find(|v| v.id() == account)
-    }
-
-    fn view_mut(&mut self, account: &str) -> Option<&mut AccountView> {
-        self.accounts.iter_mut().find(|v| v.id() == account)
-    }
-
-    /// The account's display name, or its id if it is not (or no longer) a
-    /// live session.
-    fn account_label(&self, account: &str) -> String {
-        self.view(account).map_or_else(|| account.to_string(), |v| v.label().to_string())
-    }
-
-    /// Every selectable mailbox of `account` (the ones `FetchUnreadCounts`
-    /// can `STATUS`), from its current mailbox tree.
-    fn mailbox_names(&self, account: &str) -> Vec<String> {
-        self.view(account)
-            .map(|v| v.mailbox_rows.iter().filter_map(|r| r.full_name.clone()).collect())
-            .unwrap_or_default()
-    }
-
-    /// Send a command to one account's actor. Dropped if that account has
-    /// been removed -- there is nothing left to answer it.
-    fn send_imap_to(&self, account: &str, cmd: ImapCommand) {
-        if let Some(view) = self.view(account) {
-            let _ = view.session.imap_tx().try_send(cmd);
-        }
-    }
-
-    /// Send a command to the active account's actor (a no-op with no active
-    /// account). Everything the message list and reading pane do goes
-    /// through here, since they only ever show the active account.
-    fn send_imap(&self, cmd: ImapCommand) {
-        if let Some(account) = &self.active {
-            self.send_imap_to(account, cmd);
-        }
-    }
-
-    /// Make `account` the one the message list and reading pane show, open
-    /// `mailbox` in it, and start fetching its first page. Everything that
-    /// belonged to the previous account's list -- selection, search results,
-    /// the open message -- is dropped, since none of it is meaningful in the
-    /// new one.
-    fn activate(&mut self, account: &str, mailbox: String) {
-        let switching = self.active.as_deref() != Some(account);
-        self.active = Some(account.to_string());
-        self.headers_stale = false;
-        if switching {
-            self.search_query.clear();
-            self.search_results = None;
-            self.search_origins.clear();
-            self.headers.clear();
-            self.web_view.load(WebViewSource::Html(String::new()));
-            self.current_message_html.clear();
-            self.current_attachments.clear();
-        }
-        self.selected_mailbox = mailbox.clone();
-        self.selected_uid = None;
-        self.selected_uids.clear();
-        self.select_anchor = None;
-        self.pending_mark_seen = None;
-        self.current_page = 1;
-        self.total_pages = 1;
-        self.fetch_headers(mailbox, 1);
-    }
-
-    /// Real Logout / Remove account: drop the account's session, which stops
-    /// its actor, its body worker and its `IDLE` watch (see
-    /// `AccountSession`'s `Drop`), and leaves every other account alone. If
-    /// it was the active one, the next remaining connected account takes
-    /// over.
-    fn disconnect_account(&mut self, account: &str) {
-        let label = self.account_label(account);
-        self.accounts.retain(|v| v.id() != account);
-        // "All accounts" only exists as a choice with more than one.
-        if self.accounts.len() < 2 {
-            self.search_all_accounts = false;
-        }
-        if self.active.as_deref() == Some(account) {
-            self.active = None;
-            // A bulk action's replies are dropped once its account is gone
-            // (see `handle_imap_events`'s removal guard), so without this an
-            // in-flight one would leave the status bar and the disabled
-            // buttons stuck forever.
-            self.bulk_action = None;
-            self.clear_progress(ProgressKind::Flags);
-            self.clear_progress(ProgressKind::Move);
-            self.clear_progress(ProgressKind::Index);
-            self.headers.clear();
-            self.search_results = None;
-            self.search_origins.clear();
-            self.headers_stale = false;
-            self.selected_uid = None;
-            self.selected_uids.clear();
-            self.select_anchor = None;
-            self.pending_mark_seen = None;
-            self.current_message_html.clear();
-            self.current_attachments.clear();
-            self.web_view.load(WebViewSource::Html(String::new()));
-            let next = self
-                .accounts
-                .iter()
-                .find(|v| v.state == ConnState::Connected)
-                .map(|v| v.id().to_string());
-            if let Some(next) = next {
-                self.activate(&next, "INBOX".to_string());
+        for account in changes.persist_accounts {
+            if self.persist_pending(&account) {
+                // A newly added account (not a reconnect) is a change to the
+                // saved list the listener should pick up.
+                self.listener.notify_config_changed();
+                // An account connecting in the background must not dismiss the
+                // Add account form someone is typing into; only the account
+                // that form started does.
+                self.adding_account = false;
             }
         }
-        self.status = format!("Logged out of {label}");
+    }
+
+    fn activate(&mut self, account: &str, mailbox: String) {
+        self.core.activate(account, mailbox);
+        let changes = self.core.take_changes();
+        self.apply_changes(changes);
+    }
+
+    fn disconnect_account(&mut self, account: &str) {
+        self.core.disconnect_account(account);
+        let changes = self.core.take_changes();
+        self.apply_changes(changes);
     }
 
     /// Apply `theme` to both `self.config` (so it's saved) and the live
@@ -1874,87 +1225,24 @@ impl EsMailApp {
     /// explicitly; this is only for the ones the UI itself issues on behalf
     /// of the message list.
     fn active_account_id(&self) -> Option<AccountId> {
-        self.active.clone()
+        self.core.active.clone()
     }
 
     /// The active account's login name, which doubles as its address --
     /// empty before any account is active.
     fn active_username(&self) -> String {
-        self.active
+        self.core.active
             .as_deref()
             .and_then(|id| self.config.accounts.iter().find(|a| a.id == id))
             .map(|a| a.username.clone())
             .unwrap_or_default()
     }
 
-    /// A fresh request id for `FetchHeaders`/`FetchBody`, mechanically
-    /// distinct from the last one handed out.
-    fn next_req_id(&mut self) -> u64 {
-        self.next_req_id += 1;
-        self.next_req_id
-    }
-
-    /// Show `kind` as the operation the status bar is reporting, replacing
-    /// whatever was there before (one slot at a time -- see [`ProgressView`]).
-    fn set_progress(&mut self, kind: ProgressKind, progress: Progress) {
-        self.progress = Some(ProgressView { kind, progress });
-    }
-
-    /// Clear the status bar, but only if it is still showing `kind`: a
-    /// terminal event for an operation another one already replaced must not
-    /// blank the newer operation's indicator.
-    fn clear_progress(&mut self, kind: ProgressKind) {
-        if self.progress.as_ref().is_some_and(|view| view.kind == kind) {
-            self.progress = None;
-        }
-    }
-
-    /// Whether a bulk action is already running, in which case starting a
-    /// second one is disabled rather than shown concurrently (issue #79).
-    /// Covers both a flag/move loop tracked here and an indexing run reported
-    /// by the IMAP actor.
-    fn bulk_action_in_flight(&self) -> bool {
-        self.bulk_action.is_some()
-            || self.progress.as_ref().is_some_and(|view| view.kind.is_bulk())
-    }
-
-    /// Start the status bar counting a bulk action's `targets`, and remember
-    /// them so [`Self::advance_bulk_action`] knows when it is done.
-    fn begin_bulk_action(&mut self, kind: ProgressKind, targets: &[u32]) {
-        let total = targets.len() as u32;
-        // A single-message action is one round trip and needs no progress UI
-        // (issue #79); only an aggregate loop over a selection does.
-        if total < 2 {
-            return;
-        }
-        self.bulk_action = Some(BulkAction { kind, total, pending: targets.iter().copied().collect() });
-        self.set_progress(kind, Progress::Counted { current: 0, total });
-    }
-
-    /// Tick a bulk action's progress for one message. A reply for a `uid` this
-    /// action did not target (e.g. B8's delayed mark-as-read firing while a
-    /// bulk flag change is running) is ignored.
-    fn advance_bulk_action(&mut self, kind: ProgressKind, uid: u32) {
-        let Some(action) = self.bulk_action.as_mut() else { return };
-        if action.kind != kind || !action.pending.remove(&uid) {
-            return;
-        }
-        let done = action.total - action.pending.len() as u32;
-        let total = action.total;
-        let finished = action.pending.is_empty();
-        if finished {
-            self.bulk_action = None;
-            self.clear_progress(kind);
-        } else {
-            self.set_progress(kind, Progress::Counted { current: done, total });
-        }
-    }
-
     /// Record a send as started and show "Sending…" until every send in
     /// flight has come back.
     fn mark_send_started(&mut self, id: ComposeId) {
         self.sends_in_flight.insert(id);
-        self.set_progress(ProgressKind::Send, Progress::Indeterminate);
+        self.core.set_progress(ProgressKind::Send, Progress::Indeterminate);
     }
 
     /// Record a send as finished; the indicator only clears once no send is
@@ -1962,7 +1250,7 @@ impl EsMailApp {
     fn mark_send_finished(&mut self, id: ComposeId) {
         self.sends_in_flight.remove(&id);
         if self.sends_in_flight.is_empty() {
-            self.clear_progress(ProgressKind::Send);
+            self.core.clear_progress(ProgressKind::Send);
         }
     }
 
@@ -1973,39 +1261,24 @@ impl EsMailApp {
         while let Ok(event) = self.attachment_io_rx.try_recv() {
             match event {
                 AttachmentIoEvent::Saved { path, error } => {
-                    self.clear_progress(ProgressKind::Attachment);
+                    self.core.clear_progress(ProgressKind::Attachment);
                     match error {
-                        None => self.status = format!("Saved attachment to {}", path.display()),
+                        None => self.core.status = format!("Saved attachment to {}", path.display()),
                         Some(error) => {
                             log::warn!("could not save attachment to {}: {error}", path.display());
-                            self.push_banner(format!("Could not save attachment: {error}"));
+                            self.core.push_banner(format!("Could not save attachment: {error}"));
                         }
                     }
                 }
                 AttachmentIoEvent::Opened { filename, error } => {
-                    self.clear_progress(ProgressKind::Attachment);
+                    self.core.clear_progress(ProgressKind::Attachment);
                     if let Some(error) = error {
                         log::warn!("could not open attachment {filename}: {error}");
-                        self.push_banner(format!("Could not open attachment: {error}"));
+                        self.core.push_banner(format!("Could not open attachment: {error}"));
                     }
                 }
             }
         }
-    }
-
-    /// Send `FetchHeaders`, recording its request id as the only one whose
-    /// reply `handle_imap_events` will still accept.
-    fn fetch_headers(&mut self, mailbox: String, page: u32) {
-        let req_id = self.next_req_id();
-        self.current_headers_req = req_id;
-        self.send_imap(ImapCommand::FetchHeaders { mailbox, page, req_id });
-    }
-
-    /// Send `FetchBody`, recording its request id the same way `fetch_headers` does.
-    fn fetch_body(&mut self, mailbox: String, uid: u32) {
-        let req_id = self.next_req_id();
-        self.current_body_req = req_id;
-        self.send_imap(ImapCommand::FetchBody { mailbox, uid, req_id });
     }
 
     /// Save-as, via a native picker pre-filled with the attachment's name.
@@ -2016,14 +1289,14 @@ impl EsMailApp {
         let Some(path) = rfd::FileDialog::new().set_file_name(&filename).save_file() else {
             return;
         };
-        self.set_progress(ProgressKind::Attachment, Progress::Indeterminate);
+        self.core.set_progress(ProgressKind::Attachment, Progress::Indeterminate);
         spawn_attachment_write(self.attachment_io_tx.clone(), AttachmentWrite::Save { path, data }, ctx.clone());
     }
 
     /// Open-with: write the attachment to a temp file and hand that to the
     /// OS's default handler, both on a background thread (issue #79).
     fn open_attachment(&mut self, filename: String, data: Vec<u8>, ctx: &egui::Context) {
-        self.set_progress(ProgressKind::Attachment, Progress::Indeterminate);
+        self.core.set_progress(ProgressKind::Attachment, Progress::Indeterminate);
         spawn_attachment_write(self.attachment_io_tx.clone(), AttachmentWrite::Open { filename, data }, ctx.clone());
     }
 
@@ -2039,10 +1312,10 @@ impl EsMailApp {
         else {
             return;
         };
-        self.status = format!("Exporting message to {}...", path.display());
-        self.set_progress(ProgressKind::Export, Progress::Indeterminate);
-        self.send_imap(ImapCommand::ExportMessage {
-            mailbox: self.selected_mailbox.clone(),
+        self.core.status = format!("Exporting message to {}...", path.display());
+        self.core.set_progress(ProgressKind::Export, Progress::Indeterminate);
+        self.core.send_imap(ImapCommand::ExportMessage {
+            mailbox: self.core.selected_mailbox.clone(),
             uid: header.uid,
             path,
         });
@@ -2054,7 +1327,7 @@ impl EsMailApp {
     /// `DbCommand::FetchMail` (a cached search result) it -- then schedule
     /// B8's mark-as-read delay.
     fn open_message(&mut self, uid: u32, is_search: bool) {
-        self.selected_uid = Some(uid);
+        self.core.selected_uid = Some(uid);
         // A new message defaults to blocked remote content, same as any
         // other mail client; "Load remote images" opts back in per view, and
         // "Always load from ..." opts a sender in for good. The sender comes
@@ -2062,15 +1335,16 @@ impl EsMailApp {
         // handler is set before it does, so a trusted sender's first frame
         // already has its images.
         self.current_sender = self
+            .core
             .search_results
             .as_ref()
-            .unwrap_or(&self.headers)
+            .unwrap_or(&self.core.headers)
             .iter()
             .find(|h| h.uid == uid)
             .and_then(MailHeader::sender_address);
         let trusted = self.current_sender.as_deref().is_some_and(|a| self.config.is_image_trusted(a));
         self.message_view_handler.set_allow_remote(trusted);
-        self.current_attachments.clear();
+        self.core.current_attachments.clear();
         self.web_view.load(WebViewSource::Html("<i>Loading message...</i>".to_string()));
         if is_search {
             // Bump (invalidate) `current_body_req` even though this request
@@ -2082,25 +1356,25 @@ impl EsMailApp {
             // the `ImapEvent::Body` arm's doc). A cache miss below still
             // falls back to a real live fetch through `fetch_body`, which
             // hands out its own fresh id and legitimately updates this.
-            self.current_body_req = self.next_req_id();
+            self.core.current_body_req = self.core.next_req_id();
             if let Some(account_id) = self.active_account_id() {
-                let _ = self.db_tx.try_send(DbCommand::FetchMail {
+                let _ = self.core.db_tx.try_send(DbCommand::FetchMail {
                     account_id,
-                    mailbox: self.selected_mailbox.clone(),
+                    mailbox: self.core.selected_mailbox.clone(),
                     uid,
                 });
             }
         } else {
-            self.fetch_body(self.selected_mailbox.clone(), uid);
+            self.core.fetch_body(self.core.selected_mailbox.clone(), uid);
         }
         // B8: don't mark \Seen immediately -- only after the message has
         // stayed open for MARK_SEEN_DELAY, so quickly arrowing past a
         // message in the list doesn't mark it read. `ui()` checks this once
         // per frame and fires the actual StoreFlags when it elapses.
-        if !self.headers.iter().any(|h| h.uid == uid && h.is_seen()) {
-            self.pending_mark_seen = Some((uid, std::time::Instant::now()));
+        if !self.core.headers.iter().any(|h| h.uid == uid && h.is_seen()) {
+            self.core.pending_mark_seen = Some((uid, std::time::Instant::now()));
         } else {
-            self.pending_mark_seen = None;
+            self.core.pending_mark_seen = None;
         }
     }
 
@@ -2108,10 +1382,10 @@ impl EsMailApp {
     /// Delete) applies to: the multi-selection if non-empty, else the
     /// single open message, else nothing.
     fn action_targets(&self) -> Vec<u32> {
-        if !self.selected_uids.is_empty() {
-            self.selected_uids.iter().copied().collect()
+        if !self.core.selected_uids.is_empty() {
+            self.core.selected_uids.iter().copied().collect()
         } else {
-            self.selected_uid.into_iter().collect()
+            self.core.selected_uid.into_iter().collect()
         }
     }
 
@@ -2119,15 +1393,15 @@ impl EsMailApp {
     /// reporting `done/total` in the status bar as each reply arrives. A
     /// no-op while another bulk action is already running (issue #79).
     fn store_flags_on_selection(&mut self, add: Vec<String>, remove: Vec<String>) {
-        if self.bulk_action_in_flight() {
+        if self.core.bulk_action_in_flight() {
             return;
         }
         let targets = self.action_targets();
-        let mailbox = self.selected_mailbox.clone();
-        self.begin_bulk_action(ProgressKind::Flags, &targets);
+        let mailbox = self.core.selected_mailbox.clone();
+        self.core.begin_bulk_action(ProgressKind::Flags, &targets);
         for uid in targets {
-            let req_id = self.next_req_id();
-            self.send_imap(ImapCommand::StoreFlags {
+            let req_id = self.core.next_req_id();
+            self.core.send_imap(ImapCommand::StoreFlags {
                 mailbox: mailbox.clone(),
                 uid,
                 add: add.clone(),
@@ -2142,12 +1416,12 @@ impl EsMailApp {
     /// active, else `headers`) -- used by `toggle_star_on_selection` so each
     /// message's own state decides its own direction.
     fn is_flagged_uid(&self, uid: u32) -> bool {
-        match &self.search_results {
+        match &self.core.search_results {
             Some(results) => results
                 .iter()
                 .enumerate()
                 .any(|(i, h)| h.uid == uid && h.is_flagged() && self.in_open_context(i)),
-            None => self.headers.iter().any(|h| h.uid == uid && h.is_flagged()),
+            None => self.core.headers.iter().any(|h| h.uid == uid && h.is_flagged()),
         }
     }
 
@@ -2155,8 +1429,8 @@ impl EsMailApp {
     /// `active` account's `selected_mailbox`) -- the context UID-based
     /// actions and the reading pane refer to.
     fn in_open_context(&self, i: usize) -> bool {
-        match (&self.active, self.search_origins.get(i)) {
-            (Some(active), Some((account, mailbox))) => account == active && *mailbox == self.selected_mailbox,
+        match (&self.core.active, self.core.search_origins.get(i)) {
+            (Some(active), Some((account, mailbox))) => account == active && *mailbox == self.core.selected_mailbox,
             _ => false,
         }
     }
@@ -2165,20 +1439,20 @@ impl EsMailApp {
     /// them is open (it may be in a mailbox `headers` does not hold), else
     /// from the message list.
     fn selected_header(&self) -> Option<MailHeader> {
-        let uid = self.selected_uid?;
-        if let Some(results) = &self.search_results {
+        let uid = self.core.selected_uid?;
+        if let Some(results) = &self.core.search_results {
             if let Some(h) = results.iter().enumerate().find(|(i, h)| h.uid == uid && self.in_open_context(*i)).map(|(_, h)| h) {
                 return Some(h.clone());
             }
         }
-        self.headers.iter().find(|h| h.uid == uid).cloned()
+        self.core.headers.iter().find(|h| h.uid == uid).cloned()
     }
 
     /// Open search result `i`: move to its account and mailbox first if it
     /// lives elsewhere, then open it from the cache like any search result.
     fn open_search_hit(&mut self, i: usize) {
         let (Some(header), Some((account, mailbox))) =
-            (self.search_results.as_ref().and_then(|r| r.get(i)), self.search_origins.get(i).cloned())
+            (self.core.search_results.as_ref().and_then(|r| r.get(i)), self.core.search_origins.get(i).cloned())
         else {
             return;
         };
@@ -2186,17 +1460,17 @@ impl EsMailApp {
         // A hit can come from an account that is saved but not connected. Moving
         // the reading pane there would leave every action (flags, move, reply)
         // with no session to run on, so ask for the connection instead.
-        if self.view(&account).is_none() {
-            let label = self.account_label(&account);
-            self.push_banner(format!("{label} is not connected. Connect it under Settings > Accounts to open this message."));
+        if self.core.view(&account).is_none() {
+            let label = self.core.account_label(&account);
+            self.core.push_banner(format!("{label} is not connected. Connect it under Settings > Accounts to open this message."));
             return;
         }
-        if self.active.as_deref() != Some(account.as_str()) || self.selected_mailbox != mailbox {
+        if self.core.active.as_deref() != Some(account.as_str()) || self.core.selected_mailbox != mailbox {
             // The message list still holds the previous mailbox's page;
             // `clear_search` reloads it.
-            self.headers_stale = true;
-            self.active = Some(account);
-            self.selected_mailbox = mailbox;
+            self.core.headers_stale = true;
+            self.core.active = Some(account);
+            self.core.selected_mailbox = mailbox;
         }
         self.open_message(uid, true);
     }
@@ -2204,10 +1478,10 @@ impl EsMailApp {
     /// Leave search: drop the results, and reload the message list if
     /// opening a hit moved it to another mailbox meanwhile.
     fn clear_search(&mut self) {
-        self.search_results = None;
-        self.search_origins.clear();
-        if std::mem::take(&mut self.headers_stale) {
-            self.fetch_headers(self.selected_mailbox.clone(), 1);
+        self.core.search_results = None;
+        self.core.search_origins.clear();
+        if std::mem::take(&mut self.core.headers_stale) {
+            self.core.fetch_headers(self.core.selected_mailbox.clone(), 1);
         }
     }
 
@@ -2220,20 +1494,20 @@ impl EsMailApp {
     /// silently flip messages the user never intended to touch whenever a
     /// multi-selection has mixed flag states.
     fn toggle_star_on_selection(&mut self) {
-        if self.bulk_action_in_flight() {
+        if self.core.bulk_action_in_flight() {
             return;
         }
         let targets = self.action_targets();
-        let mailbox = self.selected_mailbox.clone();
-        self.begin_bulk_action(ProgressKind::Flags, &targets);
+        let mailbox = self.core.selected_mailbox.clone();
+        self.core.begin_bulk_action(ProgressKind::Flags, &targets);
         for uid in targets {
-            let req_id = self.next_req_id();
+            let req_id = self.core.next_req_id();
             let (add, remove) = if self.is_flagged_uid(uid) {
                 (vec![], vec![imap::FLAG_FLAGGED.to_string()])
             } else {
                 (vec![imap::FLAG_FLAGGED.to_string()], vec![])
             };
-            self.send_imap(ImapCommand::StoreFlags {
+            self.core.send_imap(ImapCommand::StoreFlags {
                 mailbox: mailbox.clone(),
                 uid,
                 add,
@@ -2247,15 +1521,15 @@ impl EsMailApp {
     /// [`Self::action_targets`], reporting `done/total` in the status bar as
     /// each reply arrives. A no-op while another bulk action is running.
     fn move_selection(&mut self, dest: &str) {
-        if self.bulk_action_in_flight() {
+        if self.core.bulk_action_in_flight() {
             return;
         }
         let targets = self.action_targets();
-        let mailbox = self.selected_mailbox.clone();
-        self.begin_bulk_action(ProgressKind::Move, &targets);
+        let mailbox = self.core.selected_mailbox.clone();
+        self.core.begin_bulk_action(ProgressKind::Move, &targets);
         for uid in targets {
-            let req_id = self.next_req_id();
-            self.send_imap(ImapCommand::MoveMessage {
+            let req_id = self.core.next_req_id();
+            self.core.send_imap(ImapCommand::MoveMessage {
                 mailbox: mailbox.clone(),
                 uid,
                 dest: dest.to_string(),
@@ -2280,13 +1554,13 @@ impl EsMailApp {
     /// Discovery is per account -- each account has its own mailbox tree --
     /// so this asks about `account`, not "the" account.
     fn special_use_mailbox_for(&self, account: &str, want: imap::SpecialUse, default: &str) -> String {
-        let rows = self.view(account).map_or(&[][..], |v| v.mailbox_rows.as_slice());
+        let rows = self.core.view(account).map_or(&[][..], |v| v.mailbox_rows.as_slice());
         find_special_use_mailbox(rows, want, default)
     }
 
     /// [`Self::special_use_mailbox_for`] for the active account.
     fn special_use_mailbox(&self, want: imap::SpecialUse, default: &str) -> String {
-        match &self.active {
+        match &self.core.active {
             Some(account) => self.special_use_mailbox_for(account, want, default),
             None => default.to_string(),
         }
@@ -2314,18 +1588,18 @@ impl EsMailApp {
     /// is simply dropped -- the message the user moved on to gets its own
     /// timer from its own `open_message` call). Checked once per frame.
     fn handle_mark_seen_delay(&mut self) {
-        let Some((uid, at)) = self.pending_mark_seen else { return };
-        if self.selected_uid != Some(uid) {
-            self.pending_mark_seen = None;
+        let Some((uid, at)) = self.core.pending_mark_seen else { return };
+        if self.core.selected_uid != Some(uid) {
+            self.core.pending_mark_seen = None;
             return;
         }
         if at.elapsed() < MARK_SEEN_DELAY {
             return;
         }
-        self.pending_mark_seen = None;
-        let mailbox = self.selected_mailbox.clone();
-        let req_id = self.next_req_id();
-        self.send_imap(ImapCommand::StoreFlags {
+        self.core.pending_mark_seen = None;
+        let mailbox = self.core.selected_mailbox.clone();
+        let req_id = self.core.next_req_id();
+        self.core.send_imap(ImapCommand::StoreFlags {
             mailbox,
             uid,
             add: vec![imap::FLAG_SEEN.to_string()],
@@ -2374,14 +1648,14 @@ impl EsMailApp {
     /// `j`/`k`: open the next (or previous) message in whichever list is
     /// showing.
     fn step_selection(&mut self, next: bool) {
-        let is_search = self.search_results.is_some();
-        let list = self.search_results.as_ref().unwrap_or(&self.headers);
+        let is_search = self.core.search_results.is_some();
+        let list = self.core.search_results.as_ref().unwrap_or(&self.core.headers);
         if list.is_empty() {
             return;
         }
         // In search results the open message is found by UID within
         // the open mailbox, since UIDs repeat across accounts.
-        let idx = self.selected_uid.and_then(|uid| {
+        let idx = self.core.selected_uid.and_then(|uid| {
             list.iter().enumerate().position(|(i, h)| h.uid == uid && (!is_search || self.in_open_context(i)))
         });
         let new_idx = match idx {
@@ -2390,8 +1664,8 @@ impl EsMailApp {
             None => 0,
         };
         let uid = list[new_idx].uid;
-        self.selected_uids.clear();
-        self.select_anchor = Some(uid);
+        self.core.selected_uids.clear();
+        self.core.select_anchor = Some(uid);
         if is_search {
             self.open_search_hit(new_idx);
         } else {
@@ -2400,8 +1674,8 @@ impl EsMailApp {
     }
 
     fn reopen_selection(&mut self) {
-        if let Some(uid) = self.selected_uid {
-            let is_search = self.search_results.is_some();
+        if let Some(uid) = self.core.selected_uid {
+            let is_search = self.core.search_results.is_some();
             self.open_message(uid, is_search);
         }
     }
@@ -2409,7 +1683,7 @@ impl EsMailApp {
     fn reply_to_selection(&mut self) {
         if let Some(header) = self.selected_header() {
             self.open_compose(
-                ComposeState::reply(&header, &self.current_message_html).with_account(self.active_account_id()),
+                ComposeState::reply(&header, &self.core.current_message_html).with_account(self.active_account_id()),
                 compose_window::Focus::Body,
             );
         }
@@ -2446,10 +1720,10 @@ impl EsMailApp {
         });
 
         if let Some(id) = load_clicked {
-            let _ = self.db_tx.try_send(DbCommand::LoadDraft { id });
+            let _ = self.core.db_tx.try_send(DbCommand::LoadDraft { id });
         }
         if let Some(id) = delete_clicked {
-            let _ = self.db_tx.try_send(DbCommand::DeleteDraft { id });
+            let _ = self.core.db_tx.try_send(DbCommand::DeleteDraft { id });
             if let Some(drafts) = &mut self.drafts_window {
                 drafts.retain(|d| d.id != id);
             }
@@ -2502,13 +1776,13 @@ impl EsMailApp {
             if let Some(items) = &mut self.outbox_window {
                 if let Some(pos) = items.iter().position(|i| i.id == id) {
                     let item = items.remove(pos);
-                    let _ = self.db_tx.try_send(DbCommand::DeleteOutbox { id });
+                    let _ = self.core.db_tx.try_send(DbCommand::DeleteOutbox { id });
                     self.open_compose(item.compose.with_account(Some(item.account_id)), compose_window::Focus::Body);
                 }
             }
         }
         if let Some(id) = delete_clicked {
-            let _ = self.db_tx.try_send(DbCommand::DeleteOutbox { id });
+            let _ = self.core.db_tx.try_send(DbCommand::DeleteOutbox { id });
             if let Some(items) = &mut self.outbox_window {
                 items.retain(|i| i.id != id);
             }
@@ -2583,7 +1857,7 @@ impl EsMailApp {
         }
         self.open_pending_account();
         // The tooltip carries the unread total over all accounts.
-        let unread: u32 = self.accounts.iter().map(AccountView::total_unread).sum();
+        let unread: u32 = self.core.accounts.iter().map(AccountView::total_unread).sum();
         // Without a tray a close request really closes -- unless a compose
         // window holds unsent text, which is asked about first.
         if self.tray.is_none()
@@ -2638,7 +1912,7 @@ impl EsMailApp {
     /// saved account has that id.
     fn open_pending_account(&mut self) {
         let Some(account) = self.pending_open_account.clone() else { return };
-        if self.view(&account).is_some() {
+        if self.core.view(&account).is_some() {
             let mailbox = self
                 .config
                 .accounts
@@ -2734,14 +2008,15 @@ impl eframe::App for EsMailApp {
         }
 
         self.handle_oauth_events();
-        self.handle_imap_events();
+        let changes = self.core.pump();
+        self.apply_changes(changes);
         self.handle_db_events();
         self.handle_attachment_io();
 
         // The main (folder pane + message list) view is shown as soon as
         // there is any account at all -- the login form is no longer a gate
         // -- unless the Add account form has been asked for.
-        let main_view = !self.accounts.is_empty() && !self.adding_account;
+        let main_view = !self.core.accounts.is_empty() && !self.adding_account;
 
         if main_view {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -2752,20 +2027,20 @@ impl eframe::App for EsMailApp {
                     }
                     ui.separator();
                     if ui.button("Download All (This Mailbox)").clicked() {
-                        self.send_imap(ImapCommand::BulkDownload { mailbox: self.selected_mailbox.clone() });
+                        self.core.send_imap(ImapCommand::BulkDownload { mailbox: self.core.selected_mailbox.clone() });
                         ui.close();
                     }
                     ui.separator();
                     // Logs out of the *active* account only; every other
                     // account stays connected and watched. Also stops this
                     // account's IDLE watch (see `disconnect_account`).
-                    let active_label = self.active.as_deref().map(|id| self.account_label(id));
+                    let active_label = self.core.active.as_deref().map(|id| self.core.account_label(id));
                     let logout = match &active_label {
                         Some(label) => format!("Logout {label}"),
                         None => "Logout".to_string(),
                     };
-                    if ui.add_enabled(self.active.is_some(), egui::Button::new(logout)).clicked() {
-                        if let Some(id) = self.active.clone() {
+                    if ui.add_enabled(self.core.active.is_some(), egui::Button::new(logout)).clicked() {
+                        if let Some(id) = self.core.active.clone() {
                             self.disconnect_account(&id);
                         }
                         ui.close();
@@ -2779,18 +2054,18 @@ impl eframe::App for EsMailApp {
                 ui.heading("esMail");
                 ui.separator();
                 
-                if main_view && self.active.is_some() {
+                if main_view && self.core.active.is_some() {
                     ui.label("Search:");
                     // A fixed id (rather than the auto-generated one) so
                     // Ctrl+F (B8) can `request_focus` it from outside this
-                    // closure, where `self.search_query`'s borrow isn't
+                    // closure, where `self.core.search_query`'s borrow isn't
                     // available to re-add the same widget.
-                    let search_resp = ui.add(egui::TextEdit::singleline(&mut self.search_query).id_salt("search_box").hint_text("Enter keywords..."));
+                    let search_resp = ui.add(egui::TextEdit::singleline(&mut self.core.search_query).id_salt("search_box").hint_text("Enter keywords..."));
                     self.search_box_id = Some(search_resp.id);
                     // Only worth offering once there is more than one account
                     // to choose between.
-                    let scope_changed = self.accounts.len() > 1
-                        && ui.checkbox(&mut self.search_all_accounts, "All accounts").changed();
+                    let scope_changed = self.core.accounts.len() > 1
+                        && ui.checkbox(&mut self.core.search_all_accounts, "All accounts").changed();
                     if search_resp.changed() || scope_changed || (search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                         // `from:`/`to:`/`subject:`/`body:` and bare text
                         // become an FTS5 MATCH expression; `since:`/`before:`
@@ -2799,7 +2074,7 @@ impl eframe::App for EsMailApp {
                         // isn't applied yet, so a query made only of it is
                         // treated the same as an empty one (see
                         // search_query.rs).
-                        let parsed = ParsedQuery::parse(&self.search_query);
+                        let parsed = ParsedQuery::parse(&self.core.search_query);
                         if parsed.is_empty() {
                             self.clear_search();
                         } else {
@@ -2807,13 +2082,13 @@ impl eframe::App for EsMailApp {
                             // -- with "All accounts" -- every mailbox of every
                             // account (the FTS index is keyed per account, so this
                             // is one query).
-                            let (account_id, mailbox) = if self.search_all_accounts {
+                            let (account_id, mailbox) = if self.core.search_all_accounts {
                                 (None, None)
                             } else {
-                                (self.active_account_id(), Some(self.selected_mailbox.clone()))
+                                (self.active_account_id(), Some(self.core.selected_mailbox.clone()))
                             };
-                            if self.search_all_accounts || account_id.is_some() {
-                                let _ = self.db_tx.try_send(DbCommand::Search {
+                            if self.core.search_all_accounts || account_id.is_some() {
+                                let _ = self.core.db_tx.try_send(DbCommand::Search {
                                     account_id,
                                     query: parsed,
                                     mailbox,
@@ -2822,16 +2097,16 @@ impl eframe::App for EsMailApp {
                         }
                     }
                     if ui.button("Clear").clicked() {
-                        self.search_query.clear();
+                        self.core.search_query.clear();
                         self.clear_search();
                     }
                     ui.separator();
                 }
 
-                ui.label(&self.status);
+                ui.label(&self.core.status);
 
                 // Theme toggle (B9): right-aligned so it stays in a
-                // consistent spot regardless of how long `self.status` is.
+                // consistent spot regardless of how long `self.core.status` is.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let label = format!("Theme: {}", self.theme.label());
                     if ui.button(label).on_hover_text("Cycle Dark / Light / System").clicked() {
@@ -2848,10 +2123,10 @@ impl eframe::App for EsMailApp {
         // Error banners (B9) — see `Banner`'s doc. Shown below the top panel
         // so they don't shove the search box around; a dismissed banner is
         // just removed from the list, nothing more.
-        if !self.banners.is_empty() {
+        if !self.core.banners.is_empty() {
             egui::Panel::top("error_banners").show(ui, |ui| {
                 let mut dismissed = None;
-                for banner in &self.banners {
+                for banner in &self.core.banners {
                     ui.horizontal(|ui| {
                         ui.colored_label(egui::Color32::from_rgb(180, 40, 40), "⚠");
                         ui.colored_label(egui::Color32::from_rgb(180, 40, 40), &banner.message);
@@ -2861,12 +2136,12 @@ impl eframe::App for EsMailApp {
                     });
                 }
                 if let Some(id) = dismissed {
-                    self.banners.retain(|b| b.id != id);
+                    self.core.banners.retain(|b| b.id != id);
                 }
             });
         }
 
-        if main_view && self.active.is_some() {
+        if main_view && self.core.active.is_some() {
             self.handle_mark_seen_delay();
             self.handle_keyboard_shortcuts(ui);
         }
@@ -2876,14 +2151,14 @@ impl eframe::App for EsMailApp {
                 ui.vertical_centered(|ui| {
                     ui.group(|ui| {
                         ui.set_width(300.0);
-                        ui.heading(if self.accounts.is_empty() { "Login" } else { "Add account" });
+                        ui.heading(if self.core.accounts.is_empty() { "Login" } else { "Add account" });
 
                         if !self.config.accounts.is_empty() {
                             ui.label("Saved accounts:");
                             let mut to_remove = None;
                             for account in self.config.accounts.clone() {
                                 ui.horizontal(|ui| {
-                                    let connected = self.view(&account.id).is_some();
+                                    let connected = self.core.view(&account.id).is_some();
                                     let name = if connected {
                                         format!("{} (connected)", account.display_name)
                                     } else {
@@ -2982,7 +2257,7 @@ impl eframe::App for EsMailApp {
                                 }
                                 // Only offered once there is a main view to go
                                 // back to.
-                                if !self.accounts.is_empty() && ui.button("Cancel").clicked() {
+                                if !self.core.accounts.is_empty() && ui.button("Cancel").clicked() {
                                     self.adding_account = false;
                                 }
                             });
@@ -3017,20 +2292,20 @@ impl eframe::App for EsMailApp {
                 }
                 if ui.add_sized([full_width, 28.0], egui::Button::new("Drafts")).clicked() {
                     self.drafts_window = Some(Vec::new());
-                    let _ = self.db_tx.try_send(DbCommand::ListDrafts);
+                    let _ = self.core.db_tx.try_send(DbCommand::ListDrafts);
                 }
                 if ui.add_sized([full_width, 28.0], egui::Button::new("Outbox")).clicked() {
                     self.outbox_window = Some(Vec::new());
-                    let _ = self.db_tx.try_send(DbCommand::ListOutbox);
+                    let _ = self.core.db_tx.try_send(DbCommand::ListOutbox);
                 }
                 ui.separator();
 
                 // Deferred past the loop for the same reason as the message
                 // list below: acting on a click needs &mut self, which can't
-                // happen while the rows still borrow `self.accounts`.
+                // happen while the rows still borrow `self.core.accounts`.
                 let mut clicked_mailbox: Option<(AccountId, String)> = None;
                 // Same deferral for a fold toggle: it edits `self.config`, which
-                // the rows (borrowed from `self.accounts`) are alive across.
+                // the rows (borrowed from `self.core.accounts`) are alive across.
                 let mut toggled_folder: Option<(AccountId, String, bool)> = None;
                 let mut logout: Option<AccountId> = None;
                 let mut reconnect: Option<AccountId> = None;
@@ -3043,7 +2318,7 @@ impl eframe::App for EsMailApp {
                 });
                 egui::ScrollArea::vertical().id_salt("mailboxes_scroll").show(ui, |ui| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                        for view in &self.accounts {
+                        for view in &self.core.accounts {
                             let status_color = match &view.state {
                                 ConnState::Connected => egui::Color32::from_rgb(60, 160, 80),
                                 ConnState::Connecting | ConnState::Disconnected => egui::Color32::from_rgb(210, 150, 30),
@@ -3162,7 +2437,7 @@ impl eframe::App for EsMailApp {
                                             });
                                             continue;
                                         };
-                                        let is_selected = self.active.as_deref() == Some(view.id()) && self.selected_mailbox == *full_name;
+                                        let is_selected = self.core.active.as_deref() == Some(view.id()) && self.core.selected_mailbox == *full_name;
                                         let unread = subtree_unread(Some(full_name));
                                         let label = if unread > 0 {
                                             format!("{}  ({unread})", row.label)
@@ -3211,16 +2486,16 @@ impl eframe::App for EsMailApp {
 
             // Message list, as its own column next to the mailbox tree.
             egui::Panel::left("message_list_panel").resizable(true).default_size(320.0).show(ui, |ui| {
-                let title = if self.search_results.is_some() {
+                let title = if self.core.search_results.is_some() {
                     "Search Results".to_string()
                 } else {
-                    self.selected_mailbox.clone()
+                    self.core.selected_mailbox.clone()
                 };
                 ui.horizontal(|ui| {
                     ui.heading(&title);
-                    if self.search_results.is_none() {
+                    if self.core.search_results.is_none() {
                         if ui.button("Refresh").clicked() {
-                            self.fetch_headers(self.selected_mailbox.clone(), self.current_page);
+                            self.core.fetch_headers(self.core.selected_mailbox.clone(), self.core.current_page);
                         }
                     }
                 });
@@ -3232,7 +2507,7 @@ impl eframe::App for EsMailApp {
                 // changes -- each is simply a no-op send if there's nothing
                 // to act on. Disabled while one is already running, so a
                 // second can't be started on top of it (issue #79).
-                let bulk_busy = self.bulk_action_in_flight();
+                let bulk_busy = self.core.bulk_action_in_flight();
                 ui.horizontal_wrapped(|ui| {
                     if ui.add_enabled(!bulk_busy, egui::Button::new("Mark read")).clicked() {
                         self.store_flags_on_selection(vec![imap::FLAG_SEEN.to_string()], vec![]);
@@ -3254,17 +2529,17 @@ impl eframe::App for EsMailApp {
                     }
                 });
 
-                if self.search_results.is_none() {
+                if self.core.search_results.is_none() {
                     egui::Panel::bottom("pagination_panel").show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            if ui.button("<").clicked() && self.current_page > 1 {
-                                self.current_page -= 1;
-                                self.fetch_headers(self.selected_mailbox.clone(), self.current_page);
+                            if ui.button("<").clicked() && self.core.current_page > 1 {
+                                self.core.current_page -= 1;
+                                self.core.fetch_headers(self.core.selected_mailbox.clone(), self.core.current_page);
                             }
-                            ui.label(format!("Page {} of {}", self.current_page, self.total_pages));
-                            if ui.button(">").clicked() && self.current_page < self.total_pages {
-                                self.current_page += 1;
-                                self.fetch_headers(self.selected_mailbox.clone(), self.current_page);
+                            ui.label(format!("Page {} of {}", self.core.current_page, self.core.total_pages));
+                            if ui.button(">").clicked() && self.core.current_page < self.core.total_pages {
+                                self.core.current_page += 1;
+                                self.core.fetch_headers(self.core.selected_mailbox.clone(), self.core.current_page);
                             }
                         });
                     });
@@ -3273,29 +2548,29 @@ impl eframe::App for EsMailApp {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
                         // `clicked` defers the FetchBody/FetchMail send
-                        // until after `list`'s borrow of self.headers /
-                        // self.search_results ends below: fetch_body takes
+                        // until after `list`'s borrow of self.core.headers /
+                        // self.core.search_results ends below: fetch_body takes
                         // &mut self, which the borrow checker won't allow
                         // while `list` (borrowed from those same fields) is
                         // still alive across the loop.
-                        let list = self.search_results.as_ref().unwrap_or(&self.headers);
-                        let is_search = self.search_results.is_some();
+                        let list = self.core.search_results.as_ref().unwrap_or(&self.core.headers);
+                        let is_search = self.core.search_results.is_some();
                         // Clicks are by index: across accounts a UID alone
                         // does not identify a message.
                         let mut clicked: Option<(usize, egui::Modifiers)> = None;
                         // Hits from several accounts/mailboxes say where
                         // each one lives.
-                        let show_origin = is_search && self.search_all_accounts;
+                        let show_origin = is_search && self.core.search_all_accounts;
                         for (i, header) in list.iter().enumerate() {
                             let in_open_context = !is_search || self.in_open_context(i);
                             let is_selected = in_open_context
-                                && (self.selected_uids.contains(&header.uid) || self.selected_uid == Some(header.uid));
+                                && (self.core.selected_uids.contains(&header.uid) || self.core.selected_uid == Some(header.uid));
                             let resp = message_row(ui, &RowModel::from_header(header), is_selected);
                             if show_origin {
-                                if let Some((account, mailbox)) = self.search_origins.get(i) {
+                                if let Some((account, mailbox)) = self.core.search_origins.get(i) {
                                     ui.add(
                                         egui::Label::new(
-                                            egui::RichText::new(format!("{} \u{b7} {mailbox}", self.account_label(account)))
+                                            egui::RichText::new(format!("{} \u{b7} {mailbox}", self.core.account_label(account)))
                                                 .small()
                                                 .weak(),
                                         )
@@ -3313,22 +2588,22 @@ impl eframe::App for EsMailApp {
                             // mailbox; hits from several are opened one at
                             // a time.
                             let modifiers = if show_origin { egui::Modifiers::NONE } else { modifiers };
-                            if modifiers.shift && self.select_anchor.is_some() {
-                                let anchor = self.select_anchor.expect("just checked is_some");
-                                self.selected_uids = select_range(list, anchor, uid);
+                            if modifiers.shift && self.core.select_anchor.is_some() {
+                                let anchor = self.core.select_anchor.expect("just checked is_some");
+                                self.core.selected_uids = select_range(list, anchor, uid);
                             } else if modifiers.command || modifiers.ctrl {
-                                if self.selected_uids.is_empty() {
-                                    if let Some(prev) = self.selected_uid {
-                                        self.selected_uids.insert(prev);
+                                if self.core.selected_uids.is_empty() {
+                                    if let Some(prev) = self.core.selected_uid {
+                                        self.core.selected_uids.insert(prev);
                                     }
                                 }
-                                if !self.selected_uids.remove(&uid) {
-                                    self.selected_uids.insert(uid);
+                                if !self.core.selected_uids.remove(&uid) {
+                                    self.core.selected_uids.insert(uid);
                                 }
-                                self.select_anchor = Some(uid);
+                                self.core.select_anchor = Some(uid);
                             } else {
-                                self.selected_uids.clear();
-                                self.select_anchor = Some(uid);
+                                self.core.selected_uids.clear();
+                                self.core.select_anchor = Some(uid);
                             }
                             if is_search {
                                 self.open_search_hit(idx);
@@ -3340,10 +2615,10 @@ impl eframe::App for EsMailApp {
                 });
             });
 
-            if let Some(view) = &self.progress {
+            if let Some(view) = &self.core.progress {
                 egui::Panel::bottom("progress_status").show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(progress_label(view.kind, &self.selected_mailbox));
+                        ui.label(progress_label(view.kind, &self.core.selected_mailbox));
                         match view.progress {
                             Progress::Counted { current, total } => {
                                 let fraction = if total == 0 { 0.0 } else { current as f32 / total as f32 };
@@ -3358,11 +2633,11 @@ impl eframe::App for EsMailApp {
             }
 
             egui::CentralPanel::default().show(ui, |ui| {
-                if self.selected_uid.is_some() {
+                if self.core.selected_uid.is_some() {
                     // Cloned rather than borrowed: the Reply/Reply All/
                     // Forward buttons below need `&mut self` while
                     // this is in scope, which can't coexist with a borrow of
-                    // `self.headers` (the same reason the mailbox/message
+                    // `self.core.headers` (the same reason the mailbox/message
                     // list loops elsewhere in this file defer their sends).
                     if let Some(header) = self.selected_header() {
                         egui::Panel::top("mail_info").show(ui, |ui| {
@@ -3386,7 +2661,7 @@ impl eframe::App for EsMailApp {
                             ui.horizontal(|ui| {
                                 if ui.button("Reply").clicked() {
                                     self.open_compose(
-                                        ComposeState::reply(&header, &self.current_message_html).with_account(self.active_account_id()),
+                                        ComposeState::reply(&header, &self.core.current_message_html).with_account(self.active_account_id()),
                                         compose_window::Focus::Body,
                                     );
                                 }
@@ -3395,14 +2670,14 @@ impl eframe::App for EsMailApp {
                                     // message, so Reply All drops that
                                     // address from Cc.
                                     self.open_compose(
-                                        ComposeState::reply_all(&header, &self.current_message_html, &self.active_username())
+                                        ComposeState::reply_all(&header, &self.core.current_message_html, &self.active_username())
                                             .with_account(self.active_account_id()),
                                         compose_window::Focus::Body,
                                     );
                                 }
                                 if ui.button("Forward").clicked() {
                                     self.open_compose(
-                                        ComposeState::forward(&header, &self.current_message_html).with_account(self.active_account_id()),
+                                        ComposeState::forward(&header, &self.core.current_message_html).with_account(self.active_account_id()),
                                         compose_window::Focus::To,
                                     );
                                 }
@@ -3415,7 +2690,7 @@ impl eframe::App for EsMailApp {
                                 // common "just this one" case without first
                                 // needing to select it in the list.
                                 let star_label = if header.is_flagged() { "☆ Unstar" } else { "★ Star" };
-                                let bulk_busy = self.bulk_action_in_flight();
+                                let bulk_busy = self.core.bulk_action_in_flight();
                                 if ui.add_enabled(!bulk_busy, egui::Button::new(star_label)).clicked() {
                                     self.toggle_star_on_selection();
                                 }
@@ -3490,16 +2765,16 @@ impl eframe::App for EsMailApp {
                         });
                     }
 
-                    if !self.current_attachments.is_empty() {
+                    if !self.core.current_attachments.is_empty() {
                         // The clicks are collected first and acted on after the
                         // loop: `save_attachment`/`open_attachment` take
                         // `&mut self`, which can't coexist with the borrow of
-                        // `self.current_attachments` the loop holds.
+                        // `self.core.current_attachments` the loop holds.
                         let ctx = ui.ctx().clone();
                         let (mut save, mut open) = (None, None);
                         egui::Panel::top("attachments_bar").show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
-                                for (i, attachment) in self.current_attachments.iter().enumerate() {
+                                for (i, attachment) in self.core.current_attachments.iter().enumerate() {
                                     ui.group(|ui| {
                                         ui.label(format!(
                                             "{} — {}, {}",
@@ -3519,14 +2794,14 @@ impl eframe::App for EsMailApp {
                         });
                         if let Some(i) = save {
                             let (filename, data) = {
-                                let attachment = &self.current_attachments[i];
+                                let attachment = &self.core.current_attachments[i];
                                 (attachment.filename.clone(), attachment.data.clone())
                             };
                             self.save_attachment(filename, data, &ctx);
                         }
                         if let Some(i) = open {
                             let (filename, data) = {
-                                let attachment = &self.current_attachments[i];
+                                let attachment = &self.core.current_attachments[i];
                                 (attachment.filename.clone(), attachment.data.clone())
                             };
                             self.open_attachment(filename, data, &ctx);
@@ -3578,51 +2853,6 @@ const MARK_SEEN_DELAY: std::time::Duration = std::time::Duration::from_millis(12
 const OUTBOX_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 /// How often an open compose window autosaves itself as a draft.
 const DRAFT_AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Start a session for `account` and wrap it in the per-account UI state.
-/// `pending_persist` is `Some` for an account added through the form, which
-/// is only saved once its connection succeeds.
-///
-/// The session's new-mail watch (B10) runs as a plain tokio task, not
-/// anything driven by `EsMailApp::logic`/`ui`, so it keeps running -- and can
-/// keep showing toasts -- for as long as the process is alive, independent of
-/// whether the main window is visible. That's what "notifications work even
-/// with the window closed" means in practice: the process (and these tasks)
-/// survives a window close because the tray (`platform`) turns that close into
-/// hide-to-tray instead of exit.
-fn spawn_account_view(
-    account: &AccountConfig,
-    auth: auth::Auth,
-    pending_persist: Option<(AccountConfig, auth::Auth)>,
-    events: &mpsc::Sender<AccountEvent>,
-    hooks: &Hooks,
-) -> AccountView {
-    let session = AccountSession::spawn(
-        SessionParams {
-            id: account.id.clone(),
-            label: account.display_name.clone(),
-            host: account.imap_host.clone(),
-            port: account.imap_port,
-            username: account.username.clone(),
-            auth: auth.clone(),
-            watch_mailbox: account
-                .watch_mailbox
-                .clone()
-                .unwrap_or_else(|| session::DEFAULT_WATCH_MAILBOX.to_string()),
-        },
-        events.clone(),
-        hooks.clone(),
-    );
-    AccountView {
-        session,
-        state: ConnState::Connecting,
-        mailbox_rows: Vec::new(),
-        unread_counts: std::collections::HashMap::new(),
-        auth,
-        pending_persist,
-    }
-}
-
 
 impl AttachmentWrite {
     /// Runs the disk half of the operation. Called on the background thread.

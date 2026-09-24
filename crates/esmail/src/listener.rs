@@ -157,7 +157,7 @@ async fn serve(server: Server<LocalSocket>, mut tray: mpsc::UnboundedReceiver<Tr
     let (connection_tx, mut connection_rx) = mpsc::channel(8);
     tokio::spawn(accept_connections(server, connection_tx));
 
-    let mut watcher = Watcher::new(Arc::new(platform::show_new_mail_toast));
+    let mut watcher = Watcher::new(tokio::runtime::Handle::current(), Arc::new(platform::show_new_mail_toast));
     apply_config(&mut watcher);
 
     loop {

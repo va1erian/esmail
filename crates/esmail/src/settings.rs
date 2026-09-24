@@ -217,7 +217,7 @@ impl EsMailApp {
         });
         ui.add_space(8.0);
         ui.heading("Accounts");
-        let connected = self.accounts.iter().filter(|v| v.state == ConnState::Connected).count();
+        let connected = self.core.accounts.iter().filter(|v| v.state == ConnState::Connected).count();
         ui.label(format!(
             "{} saved, {connected} connected. Every connected account is watched for new mail \
              at once, even while this window is closed to the tray.",
@@ -256,7 +256,7 @@ impl EsMailApp {
         }
         egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
             for account in &self.config.accounts {
-                let view = self.view(&account.id);
+                let view = self.core.view(&account.id);
                 let signing_in = self.oauth_tasks.contains_key(&account.id);
                 let (color, status) = match view.map(|v| &v.state) {
                     _ if signing_in => (AMBER, "Waiting for Google sign-in in the browser\u{2026}".to_string()),
@@ -411,11 +411,11 @@ impl EsMailApp {
             return None; // Removed while the dialog was open.
         };
         let Ok(imap_port) = dialog.imap_port.trim().parse::<u16>() else {
-            self.push_banner("The IMAP port must be a number.".to_string());
+            self.core.push_banner("The IMAP port must be a number.".to_string());
             return Some(dialog);
         };
         let Ok(smtp_port) = dialog.smtp_port.trim().parse::<u16>() else {
-            self.push_banner("The SMTP port must be a number.".to_string());
+            self.core.push_banner("The SMTP port must be a number.".to_string());
             return Some(dialog);
         };
         let mut account = self.config.accounts[index].clone();
@@ -427,7 +427,7 @@ impl EsMailApp {
             && account.auth == config::AuthKind::GoogleOAuth
             && new_password.is_none()
         {
-            self.push_banner("Enter a password to stop using Google sign-in for this account.".to_string());
+            self.core.push_banner("Enter a password to stop using Google sign-in for this account.".to_string());
             return Some(dialog);
         }
 
@@ -454,7 +454,7 @@ impl EsMailApp {
         // `watch_mailbox` when the new one is `None`, which here means "cleared".
         self.config.accounts[index] = account.clone();
         if let Err(e) = self.config.save() {
-            self.push_banner(format!("Could not save the account: {e}"));
+            self.core.push_banner(format!("Could not save the account: {e}"));
         }
         // The listener watches the same accounts: reload now rather than on
         // its own next event.
@@ -466,12 +466,12 @@ impl EsMailApp {
             let mut google = account;
             google.auth = config::AuthKind::GoogleOAuth;
             self.begin_google_sign_in(google);
-        } else if self.view(&account.id).is_some() || new_password.is_some() {
+        } else if self.core.view(&account.id).is_some() || new_password.is_some() {
             // A live session keeps the label, ports and password it started
             // with; replace it so the change takes effect.
             match accounts::saved_auth(&self.config, &account) {
                 Ok(auth) => self.connect_account(account, auth, false),
-                Err(reason) => self.push_banner(format!("{}: {reason}", account.display_name)),
+                Err(reason) => self.core.push_banner(format!("{}: {reason}", account.display_name)),
             }
         }
         None
@@ -486,8 +486,8 @@ impl EsMailApp {
             client_secret: (!client_secret.is_empty()).then_some(client_secret),
         });
         match self.config.save() {
-            Ok(()) => self.status = "Settings saved".to_string(),
-            Err(e) => self.push_banner(format!("Could not save settings: {e}")),
+            Ok(()) => self.core.status = "Settings saved".to_string(),
+            Err(e) => self.core.push_banner(format!("Could not save settings: {e}")),
         }
         self.listener.notify_config_changed();
         // A first-time user who has just configured a client and is looking

@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use esmail::ipc::message::{ToGui, ToListener};
 use esmail::ipc::{self, Endpoint, LocalSocket, Transport};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 /// How long to keep trying to reach a listener we just started, or one that is
@@ -37,6 +38,7 @@ pub(super) struct ListenerClient {
     connected: Arc<AtomicBool>,
     /// Where and how to reach the listener, set once a connection succeeds.
     link: Arc<OnceLock<Link>>,
+    runtime: Handle,
 }
 
 #[derive(Clone)]
@@ -48,37 +50,37 @@ struct Link {
 impl ListenerClient {
     /// Start the connection task and return immediately. See the module doc
     /// for when this stays disconnected.
-    pub(super) fn start() -> Self {
+    pub(super) fn start(runtime: &Handle) -> Self {
         if std::env::var_os("ESMAIL_NO_LISTENER").is_some() {
             log::info!("ESMAIL_NO_LISTENER is set; running without a background listener");
-            return Self::disabled();
+            return Self::disabled(runtime);
         }
         // The listener's tray is Windows-only (see `platform/other.rs`), so a
         // listener elsewhere would be headless and unquittable; keep today's
         // single-process behavior there.
         if !cfg!(windows) {
-            return Self::disabled();
+            return Self::disabled(runtime);
         }
         let Some(data_dir) = esmail::paths::data_dir() else {
             log::warn!("no data directory; running without a background listener");
-            return Self::disabled();
+            return Self::disabled(runtime);
         };
         let (incoming_tx, incoming) = mpsc::channel(16);
         let connected = Arc::new(AtomicBool::new(false));
         let link = Arc::new(OnceLock::new());
-        tokio::spawn({
+        runtime.spawn({
             let connected = Arc::clone(&connected);
             let link = Arc::clone(&link);
             async move { connect_to_listener(data_dir, incoming_tx, connected, link).await }
         });
-        Self { incoming, connected, link }
+        Self { incoming, connected, link, runtime: runtime.clone() }
     }
 
     /// A client that never connects: preview/screenshot runs, or a platform
     /// with no listener.
-    pub(super) fn disabled() -> Self {
+    pub(super) fn disabled(runtime: &Handle) -> Self {
         let (_, incoming) = mpsc::channel(1);
-        Self { incoming, connected: Arc::new(AtomicBool::new(false)), link: Arc::new(OnceLock::new()) }
+        Self { incoming, connected: Arc::new(AtomicBool::new(false)), link: Arc::new(OnceLock::new()), runtime: runtime.clone() }
     }
 
     /// Whether the listener is reachable right now.
@@ -98,7 +100,7 @@ impl ListenerClient {
             return;
         }
         let Some(link) = self.link.get().cloned() else { return };
-        tokio::spawn(async move {
+        self.runtime.spawn(async move {
             match ipc::connect::<LocalSocket>(&link.endpoint, &link.token).await {
                 Ok(mut connection) => {
                     if let Err(e) = connection.send(&ToListener::ConfigChanged).await {

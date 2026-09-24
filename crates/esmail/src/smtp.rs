@@ -25,6 +25,7 @@ use lettre::message::{Attachment, Message, MultiPart, SinglePart, header::Conten
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use secrecy::ExposeSecret;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use crate::auth::Auth;
@@ -67,9 +68,9 @@ pub struct SmtpActor {
 }
 
 impl SmtpActor {
-    pub fn spawn(cmd_rx: mpsc::Receiver<SmtpCommand>, event_tx: mpsc::Sender<SmtpEvent>) {
+    pub fn spawn(runtime: &Handle, cmd_rx: mpsc::Receiver<SmtpCommand>, event_tx: mpsc::Sender<SmtpEvent>) {
         let mut actor = SmtpActor { cmd_rx, event_tx };
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             actor.run().await;
         });
     }
