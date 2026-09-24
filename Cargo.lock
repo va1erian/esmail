@@ -5079,7 +5079,7 @@ checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 [[package]]
 name = "win32ui"
 version = "0.1.0"
-source = "git+https://github.com/va1erian/win32ui.git?branch=main#9b217b3e719baedf8d2c4e43bf5e7d23811107f4"
+source = "git+https://github.com/va1erian/win32ui.git?branch=main#4afed84bc7c47b5f4077f619656a866c23986101"
 dependencies = [
  "embed-resource",
  "thiserror 2.0.18",
