@@ -18,6 +18,7 @@ impl App {
     /// View > Theme, and the start-up theme.
     pub(super) fn choose_theme(&mut self, ui: &mut Ui<Msg>, choice: ThemeChoice) {
         self.theme = choice;
+        self.toolbar.set_theme_label(choice);
         let following = choice == ThemeChoice::System;
         ui.follow_system_theme(following);
         ui.set_theme(chrome::theme(choice));

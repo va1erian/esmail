@@ -62,7 +62,9 @@ impl App {
 
     pub(super) fn store_flags(&mut self, folder: FolderRef, uid: u32, add: Vec<String>, remove: Vec<String>) {
         let req_id = self.action_ids.begin();
-        if !self.core.send(folder.account, ImapCommand::StoreFlags { mailbox: folder.mailbox, uid, add, remove, req_id }) {
+        if self.core.send(folder.account, ImapCommand::StoreFlags { mailbox: folder.mailbox, uid, add, remove, req_id }) {
+            self.pending_actions += 1;
+        } else {
             self.account_unavailable(folder.account);
         }
     }
@@ -85,7 +87,9 @@ impl App {
             }
             let req_id = self.action_ids.begin();
             let command = ImapCommand::MoveMessage { mailbox: folder.mailbox, uid: header.uid, dest, req_id };
-            if !self.core.send(folder.account, command) {
+            if self.core.send(folder.account, command) {
+                self.pending_actions += 1;
+            } else {
                 self.account_unavailable(folder.account);
                 return;
             }
@@ -93,6 +97,40 @@ impl App {
         if let Some(dest) = already_there {
             self.set_status(&format!("Some of these messages are already in {dest}"));
         }
+    }
+
+    /// A flag or move command settled (success or failure): the bars stop
+    /// disabling the actions that were in flight.
+    pub(super) fn action_finished(&mut self) {
+        self.pending_actions = self.pending_actions.saturating_sub(1);
+    }
+
+    /// Export the open message's raw source as an `.eml`, chosen by the user.
+    pub(super) fn export_selected(&mut self) {
+        let (Some(folder), Some(header)) = (self.selected_in.clone(), self.selected.clone()) else {
+            self.set_status("Select a message to export first");
+            return;
+        };
+        let name = format!("{}.eml", esmail::view_model::safe_attachment_filename(&header.subject));
+        let Some(path) = rfd::FileDialog::new().set_title("Export message").set_file_name(name).save_file() else { return };
+        self.set_status(&format!("Exporting {}...", path.display()));
+        if self.core.send(folder.account, ImapCommand::ExportMessage { mailbox: folder.mailbox, uid: header.uid, path }) {
+            self.pending_actions += 1;
+        } else {
+            self.account_unavailable(folder.account);
+        }
+    }
+
+    /// The server wrote the exported message to `path`.
+    pub(super) fn export_done(&mut self, path: std::path::PathBuf) {
+        self.action_finished();
+        self.set_status(&format!("Saved {}", path.display()));
+    }
+
+    /// The export failed: fetching the message or writing the file.
+    pub(super) fn export_failed(&mut self, error: &str) {
+        self.action_finished();
+        self.banner(&format!("Could not export the message: {error}"));
     }
 
     /// The server confirmed new flags: show them, and refresh the folder's

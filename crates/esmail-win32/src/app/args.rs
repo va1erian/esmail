@@ -16,6 +16,26 @@ pub enum ThemeChoice {
     System,
 }
 
+impl ThemeChoice {
+    /// The name shown on the theme button.
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeChoice::Light => "Light",
+            ThemeChoice::Dark => "Dark",
+            ThemeChoice::System => "System",
+        }
+    }
+
+    /// The next choice in the cycle the theme button walks.
+    pub fn next(self) -> ThemeChoice {
+        match self {
+            ThemeChoice::Light => ThemeChoice::Dark,
+            ThemeChoice::Dark => ThemeChoice::System,
+            ThemeChoice::System => ThemeChoice::Light,
+        }
+    }
+}
+
 /// What the flags asked for.
 #[derive(Debug)]
 pub struct Args {
