@@ -27,8 +27,9 @@
 //!     .on_context(|row, at| Some(Msg::Context(row, at)));
 //!
 //! list.set_rows(rows);            // replace the model (clears selection, scrolls to top)
-//! list.rows_changed(10..12);      // repaint a range (a flag/seen change)
-//! list.rows_inserted(0..5);       // refresh after an insert, keeping scroll + selection
+//! list.update_rows(rows);         // same length, rows changed (a flag/seen change)
+//! list.insert_rows(rows, 0, 5);   // new mail: keeps scroll + selection on their messages
+//! list.remove_rows(rows, 3, 1);   // a message left: same
 //! list.set_selection(&[3, 7]);    // select from the app
 //! let sel = list.selection();     // ascending, deduplicated indices
 //! list.ensure_visible(42);        // scroll so row 42 is fully visible
@@ -50,6 +51,8 @@ mod events;
 mod message_list;
 #[cfg(windows)]
 mod paint;
+#[cfg(windows)]
+mod selection;
 #[cfg(windows)]
 mod state;
 #[cfg(windows)]

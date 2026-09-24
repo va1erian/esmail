@@ -11,8 +11,9 @@
 //! [`crate::state::ViewState`], so the input handling here is thin glue over
 //! unit-tested transitions.
 
+mod rows;
+
 use std::cell::{Cell, RefCell};
-use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,6 +28,7 @@ use win32ui::{
 
 use crate::events::MessageListEvents;
 use crate::paint::{self, Fonts, Phases, RowVisual};
+use crate::selection::nav_target;
 use crate::state::{ViewState, clamp_scroll, is_near_end, row_at, scroll_for_row, visible_range};
 use crate::timing::{invalidate, Timing};
 
@@ -73,6 +75,13 @@ impl MessageListWidget {
         let view = self.view.borrow();
         let doc_y = y as f32 / scale + view.scroll;
         row_at(doc_y, self.fonts.row_height, view.len)
+    }
+
+    /// Where `key` would move the focused row, if it is a navigation key.
+    fn nav_target(&self, key: Key) -> Option<usize> {
+        let view = self.view.borrow();
+        let page = (self.viewport.get() / self.fonts.row_height) as usize;
+        nav_target(key, view.selection.focus, view.len, page.max(1))
     }
 
     fn emit_selected(&self, cx: &WidgetCx<MessageListEvent>) {
@@ -214,6 +223,12 @@ impl CustomWidget for MessageListWidget {
                     if !selected.is_empty() {
                         cx.emit(MessageListEvent::Delete(selected));
                     }
+                } else if let Some(target) = self.nav_target(key) {
+                    self.view.borrow_mut().selection.move_focus(target, modifiers.ctrl, modifiers.shift);
+                    if !modifiers.ctrl {
+                        self.emit_selected(cx);
+                    }
+                    cx.invalidate();
                 } else if key == Key::SPACE {
                     if let Some(index) = self.view.borrow().selection.focus {
                         cx.emit(MessageListEvent::ToggleFlag(index));
@@ -368,53 +383,14 @@ impl<M: 'static> MessageList<M> {
         self
     }
 
-    /// Replaces the model with a longer one that starts with the same rows (an
-    /// older page appended), keeping the scroll position and the selection.
-    pub fn extend_rows(&self, rows: Arc<[RowModel]>) {
-        *self.custom.widget().borrow().rows.borrow_mut() = rows;
-        self.rows_inserted(0..0);
-    }
-
-    /// Replaces the model. This is a new mailbox: the selection is dropped and
-    /// the view returns to the top.
-    pub fn set_rows(&self, rows: Arc<[RowModel]>) {
-        let len = rows.len();
-        let row_height = {
-            let widget = self.custom.widget();
-            let w = widget.borrow_mut();
-            *w.rows.borrow_mut() = rows;
-            w.view.borrow_mut().set_rows(len);
-            w.fonts.row_height
-        };
-        self.custom.set_content_height(dip(len as f32 * row_height));
-        self.custom.scroll_to(dip(0.0));
-        self.custom.invalidate();
-    }
-
-    /// Repaints the visible rows after the rows in `range` changed (a flag or
-    /// seen toggle). Scroll and selection are untouched. `range` is accepted
-    /// for `ListView` API parity; the list repaints only what is visible
-    /// anyway, so a whole-widget repaint is already cheap.
-    pub fn rows_changed(&self, _range: Range<usize>) {
-        self.custom.invalidate();
-    }
-
-    /// Refreshes after rows were inserted, keeping the scroll position and the
-    /// selection. The row count is re-read from the model (which the caller has
-    /// already replaced via [`set_rows`](Self::set_rows)); `range` describes
-    /// where the rows went in and is kept for `ListView` API parity.
-    pub fn rows_inserted(&self, _range: Range<usize>) {
-        let widget = self.custom.widget();
-        let row_height = widget.borrow().fonts.row_height;
-        let len = widget.borrow().rows.borrow().len();
-        widget.borrow().view.borrow_mut().recount(len);
-        self.custom.set_content_height(dip(len as f32 * row_height));
-        self.custom.invalidate();
-    }
-
     /// Every selected row, ascending.
     pub fn selection(&self) -> Vec<usize> {
         self.custom.widget().borrow().view.borrow().selection.selected.clone()
+    }
+
+    /// The row the keyboard moves (and Space acts on), if there is one.
+    pub fn focus_row(&self) -> Option<usize> {
+        self.custom.widget().borrow().view.borrow().selection.focus
     }
 
     /// Makes `rows` the selection, deselecting everything else. Out-of-range

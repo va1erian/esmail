@@ -38,7 +38,7 @@ const KEY_LINE_DIP: f32 = 40.0;
 const DRAG_SLOP_DIP: f32 = 3.0;
 /// Longest gap between clicks that still extends a multi-click.
 const MULTI_CLICK: Duration = Duration::from_millis(500);
-/// The translucent highlight fill over the (always white) page.
+/// The translucent highlight fill over the page.
 const SELECTION_FILL: win32ui::d2d::Rgba = win32ui::d2d::Rgba::with_alpha(0x33, 0x99, 0xFF, 0x80);
 
 fn to_rectf(r: Rect) -> RectF {
@@ -60,6 +60,9 @@ pub struct HtmlWidget {
     failed: Cell<bool>,
     html: RefCell<String>,
     frame: RefCell<Option<Frame>>,
+    /// What shows behind (and around) the document; white unless the host
+    /// themes it.
+    background: Cell<Color>,
     /// Vertical scroll offset in device-independent pixels.
     scroll: Cell<f32>,
     /// The viewport height as of the last paint, for page-scroll clamping.
@@ -106,6 +109,7 @@ impl HtmlWidget {
             failed: Cell::new(false),
             html: RefCell::new(html),
             frame: RefCell::new(None),
+            background: Cell::new(Color::rgb(255, 255, 255)),
             scroll: Cell::new(0.0),
             viewport_height: Cell::new(0.0),
             selection: Cell::new(None),
@@ -118,6 +122,11 @@ impl HtmlWidget {
             scale: Cell::new(scale),
             hwnd,
         }
+    }
+
+    /// Sets the colour shown behind the document.
+    pub fn set_background(&self, color: Color) {
+        self.background.set(color);
     }
 
     /// Load a new page, dropping the current frame immediately so a slow render
@@ -303,10 +312,10 @@ impl CustomWidget for HtmlWidget {
         let viewport = Rect::new(0.0, 0.0, width, height);
         match self.frame.borrow().as_ref() {
             Some(frame) => {
-                self.painter.borrow_mut().paint(&frame.list, canvas, viewport, scroll);
+                self.painter.borrow_mut().paint(&frame.list, canvas, viewport, scroll, self.background.get());
                 self.paint_selection(canvas);
             }
-            None => canvas.clear(Color::rgb(255, 255, 255)),
+            None => canvas.clear(self.background.get()),
         }
     }
 

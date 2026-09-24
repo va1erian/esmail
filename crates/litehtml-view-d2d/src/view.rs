@@ -76,6 +76,14 @@ impl<M: Send + 'static> HtmlView<M> {
         self.widget.invalidate();
     }
 
+    /// Sets the colour shown behind the document and wherever it paints
+    /// nothing (white by default). Pair it with a stylesheet that sets the
+    /// text colour, so unstyled messages follow the app's theme.
+    pub fn set_background(&self, color: win32ui::Color) {
+        self.widget.widget().borrow().set_background(color);
+        self.widget.invalidate();
+    }
+
     /// Whether the newest render has finished.
     pub fn is_ready(&self) -> bool {
         self.widget.widget().borrow().is_ready()

@@ -61,11 +61,11 @@ impl Painter {
 
     /// Replays `list` with its top-left scrolled to `scroll` device-independent
     /// pixels above the viewport's top. Only what intersects the viewport is
-    /// drawn; a tall newsletter costs only what is on screen.
-    pub fn paint(&mut self, list: &DisplayList, canvas: &mut D2dCanvas, viewport: Rect, scroll: f32) {
+    /// drawn; a tall newsletter costs only what is on screen. `background`
+    /// shows wherever the document paints nothing of its own.
+    pub fn paint(&mut self, list: &DisplayList, canvas: &mut D2dCanvas, viewport: Rect, scroll: f32, background: Color) {
         let t = std::time::Instant::now();
-        // The page is white, whatever the app theme.
-        canvas.clear(Color::rgb(255, 255, 255));
+        canvas.clear(background);
         canvas.push_clip(to_rect(viewport));
         canvas.set_translation(0.0, -scroll);
 
