@@ -80,7 +80,7 @@ impl Core {
                             watch_mailbox: account.watch_mailbox.clone().unwrap_or_else(|| DEFAULT_WATCH_MAILBOX.to_string()),
                         };
                         let hooks = Hooks { notify: std::sync::Arc::new(|_, _, _| {}), repaint: waker.clone() };
-                        sessions.push(Some(AccountSession::spawn(params, event_tx.clone(), hooks)));
+                        sessions.push(Some(AccountSession::spawn(runtime.handle(), params, event_tx.clone(), hooks)));
                     }
                     Err(message) => {
                         issues.push(StartupIssue { account: index, message });
