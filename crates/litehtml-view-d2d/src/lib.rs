@@ -77,3 +77,4 @@ pub use crate::paint::Painter;
 pub use crate::selection::{Selection, TextPos};
 pub use crate::text_runs::{TextRun, TextRunTable};
 pub use crate::view::{HtmlView, HtmlViewEvent};
+pub use crate::worker::ImageFetcher;

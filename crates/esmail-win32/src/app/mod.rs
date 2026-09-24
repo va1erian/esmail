@@ -17,15 +17,18 @@
 mod actions;
 mod args;
 mod chrome;
+mod compose;
+mod composes;
 mod events;
 mod folder;
+mod links;
 mod message;
-mod native_tree;
 mod placement;
 mod reader;
 mod screenshot;
 mod search;
 mod startup;
+mod theme;
 mod tree;
 
 use std::cell::RefCell;
@@ -41,14 +44,17 @@ use win32ui::{column, split_row};
 use esmail_win32::MessageList;
 use esmail_win32::core_glue::mailbox::OpenFolder;
 use esmail_win32::core_glue::reading::Palette;
+use esmail::compose::ComposeId;
+use esmail_win32::core_glue::compose::Kind;
 use esmail_win32::core_glue::{BodyLoads, Core, FolderRef, FolderTree, Latest, WindowState, load_config};
 use args::{Args, ThemeChoice};
 use message::SeenTimer;
 use reader::Reader;
 use screenshot::{Capture, Step};
+use composes::Composes;
 use search::SearchState;
 use startup::Startup;
-use tree::SharedFolders;
+use tree::{FolderView, SharedFolders};
 
 /// The folder pane's width and the list's, in device-independent pixels, before
 /// the user has dragged a divider.
@@ -70,6 +76,14 @@ enum Msg {
     SetTheme(ThemeChoice),
     /// View > Original colours.
     OriginalColours(bool),
+    /// Ctrl+N, Ctrl+R, Ctrl+Shift+R, Ctrl+L or the list's R, Shift+R, F.
+    Compose(Kind),
+    /// A compose window asks for something.
+    ComposeRequest(ComposeId, compose::Request),
+    /// View > Load remote images.
+    RemoteImages(bool),
+    /// A save or open of an attachment finished on its thread.
+    AttachmentDone(std::result::Result<String, String>),
     Refresh,
     ToggleFlag,
     /// A click on a row's star, or Space on it.
@@ -105,7 +119,7 @@ struct App {
     list: MessageList<Msg>,
     search_edit: Edit<Msg>,
     search: SearchState,
-    tree: TreeView<Msg>,
+    tree: FolderView,
     reader: Reader,
     status: StatusBar<Msg>,
     theme: ThemeChoice,
@@ -132,6 +146,13 @@ struct App {
     window: WindowState,
     window_path: Option<PathBuf>,
     startup: Startup,
+    composes: Composes,
+    /// View > Load remote images.
+    remote_images: bool,
+    /// The timer that watches the followed system theme.
+    theme_poll: Option<TimerId>,
+    /// Asks the outbox for messages due another send attempt.
+    outbox_poll: Option<TimerId>,
 }
 
 pub(crate) fn main() {
@@ -151,7 +172,7 @@ pub(crate) fn main() {
         }
     };
 
-    let theme = chrome::palette(args.theme);
+    let theme = chrome::theme(args.theme);
     let result = win32ui::run_app(WindowSpec::new("esMail").size(dip(1200.0), dip(760.0)).theme(theme), |ui| {
         build(ui, &args, &config, began)
     });
@@ -182,7 +203,8 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         .on_toggle_flag(|row| Some(Msg::ToggleFlagAt(row)))
         .on_delete(|_| Some(Msg::Delete))
         .on_context(|_, _| Some(Msg::Context))
-        .on_near_end(|| Some(Msg::NearEnd));
+        .on_near_end(|| Some(Msg::NearEnd))
+        .on_compose(|kind| Some(Msg::Compose(kind)));
     let search_edit = Edit::single_line(ui)
         .expect("search box")
         .cue("Search mail (Ctrl+F)")
@@ -192,12 +214,16 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
     let status = StatusBar::new(ui).expect("status bar");
     status.set_parts(&[-1]);
 
-    ui.set_menu_bar(chrome::menu_bar(args.theme, false));
+    ui.set_menu_bar(chrome::menu_bar(args.theme, false, false));
     ui.accelerator(Shortcut::key(Key::F5), || Some(Msg::Refresh));
     ui.accelerator(Shortcut::ctrl(Key::F), || Some(Msg::SearchFocus));
     ui.accelerator(Shortcut::key(Key::ESCAPE), || Some(Msg::SearchClear));
     ui.accelerator(Shortcut::key(Key::RETURN), || Some(Msg::Enter));
     ui.accelerator(Shortcut::ctrl(Key::Q), || Some(Msg::Quit));
+    ui.accelerator(Shortcut::ctrl(Key::N), || Some(Msg::Compose(Kind::New)));
+    ui.accelerator(Shortcut::ctrl(Key::R), || Some(Msg::Compose(Kind::Reply)));
+    ui.accelerator(Shortcut::ctrl(Key::R).with_shift(), || Some(Msg::Compose(Kind::ReplyAll)));
+    ui.accelerator(Shortcut::ctrl(Key::L), || Some(Msg::Compose(Kind::Forward)));
     ui.on_close(|| Some(Msg::Close));
     ui.on_timer(|id| Some(Msg::Timer(id)));
     let capture = args.screenshot.clone().map(|path| (ui.set_timer(50).expect("screenshot timer"), Capture::new(path)));
@@ -228,8 +254,16 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         window,
         window_path,
         startup: Startup::new(began),
+        composes: Composes::default(),
+        remote_images: false,
+        theme_poll: None,
+        outbox_poll: ui.set_timer(composes::OUTBOX_POLL_MILLIS).ok(),
     };
     app.layout(ui);
+    ui.follow_system_theme(args.theme == ThemeChoice::System);
+    if args.theme == ThemeChoice::System {
+        app.theme_poll = ui.set_timer(theme::POLL_MILLIS).ok();
+    }
     if let Some(bounds) = app.window.bounds {
         placement::restore(ui.hwnd(), bounds, app.window.maximized);
     }
@@ -241,6 +275,7 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         app.banner(&format!("{name}: {}", issue.message));
     }
     app.open_from_cache(ui);
+    app.core.cache().due_outbox();
     app
 }
 
@@ -267,19 +302,17 @@ impl win32ui::App for App {
                     self.request_page();
                 }
             }
-            Msg::Link(href) => self.set_status(&format!("Links are not opened in this prototype: {href}")),
-            Msg::SetTheme(choice) => {
-                self.theme = choice;
-                let theme = chrome::palette(choice);
-                self.reader.set_palette(palette_for(&theme));
-                ui.set_theme(theme);
-                ui.set_menu_bar(chrome::menu_bar(choice, self.original_colours));
-            }
+            Msg::Link(href) => self.link_clicked(ui, href),
+            Msg::AttachmentDone(result) => self.attachment_done(result),
+            Msg::SetTheme(choice) => self.choose_theme(ui, choice),
             Msg::OriginalColours(original) => {
                 self.original_colours = original;
                 self.reader.set_original_colours(original);
-                ui.set_menu_bar(chrome::menu_bar(self.theme, original));
+                ui.set_menu_bar(chrome::menu_bar(self.theme, original, self.remote_images));
             }
+            Msg::Compose(kind) => self.open_compose(ui, kind),
+            Msg::ComposeRequest(id, request) => self.compose_request(id, request),
+            Msg::RemoteImages(allow) => self.set_remote_images(ui, allow),
             Msg::Refresh => self.refresh(ui),
             Msg::ToggleFlag => self.toggle_flag(),
             Msg::ToggleFlagAt(row) => self.toggle_flag_at(row),
@@ -294,10 +327,7 @@ impl win32ui::App for App {
             Msg::SearchClear => self.clear_search(ui),
             Msg::FoldersMoved(width) => self.window.folders_width = Some(width),
             Msg::ListMoved(width) => self.window.list_width = Some(width),
-            Msg::Close => {
-                self.save_window_state(ui);
-                ui.quit();
-            }
+            Msg::Close => self.close(ui),
             Msg::Quit => ui.quit(),
             Msg::Timer(id) => self.timer(ui, id),
         }
@@ -361,6 +391,10 @@ impl App {
     fn timer(&mut self, ui: &mut Ui<Msg>, id: TimerId) {
         if self.seen.owns(id) {
             self.mark_seen_when_due(ui);
+        } else if self.outbox_poll == Some(id) {
+            self.core.cache().due_outbox();
+        } else if self.theme_poll == Some(id) {
+            self.sync_reader_theme(ui);
         } else if self.search.owns(id) {
             self.run_search(ui);
         } else if self.capture.as_ref().is_some_and(|(timer, _)| *timer == id) {

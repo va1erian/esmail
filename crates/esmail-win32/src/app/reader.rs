@@ -3,9 +3,12 @@
 
 use esmail::imap::MailHeader;
 use esmail::render::Attachment;
-use litehtml_view_d2d::{HtmlView, HtmlViewEvent};
+use std::sync::Arc;
+
+use litehtml_view_d2d::{HtmlView, HtmlViewEvent, ImageFetcher};
 use win32ui::prelude::*;
 
+use esmail_win32::core_glue::images;
 use esmail_win32::core_glue::reading::{self, Appearance, Palette};
 
 use super::Msg;
@@ -50,6 +53,17 @@ impl Reader {
         self.render();
     }
 
+    /// View > Load remote images: fetch the images of the message on screen (and of
+    /// the next ones) from the web, or leave them blank.
+    pub fn set_remote_images(&self, allow: bool) {
+        self.view.set_image_fetcher(allow.then(|| Arc::new(images::fetch) as ImageFetcher));
+        self.render();
+    }
+
+    pub fn is_dark(&self) -> bool {
+        self.appearance.palette.dark
+    }
+
     pub fn set_palette(&mut self, palette: Palette) {
         self.appearance.palette = palette;
         self.render();
@@ -73,6 +87,22 @@ impl Reader {
                 self.view.set_background(color(self.appearance.page_background(themed)));
                 self.view.load(reading::document(header, body, attachments, palette, themed));
             }
+        }
+    }
+
+    /// The message on screen: its header and sanitised HTML body.
+    /// The attachments of the message on screen.
+    pub fn current_attachments(&self) -> &[Attachment] {
+        match &self.content {
+            Content::Message { attachments, .. } => attachments,
+            Content::Notice(_) => &[],
+        }
+    }
+
+    pub fn current_message(&self) -> Option<(&MailHeader, &str)> {
+        match &self.content {
+            Content::Message { header, body, .. } => Some((header, body)),
+            Content::Notice(_) => None,
         }
     }
 

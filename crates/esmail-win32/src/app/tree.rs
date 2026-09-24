@@ -3,35 +3,41 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use win32ui::{Rect, TreeEntry, TreeSource, TreeView, Ui};
+use win32ui::{Node, TreeModel, TreeView, Ui};
 
-use esmail_win32::core_glue::FolderTree;
+use esmail_win32::core_glue::{FolderTree, NodeId};
 
 use super::Msg;
-use super::native_tree;
 
 /// The folder model, shared with the app so the control's lazily loaded
 /// branches always see the current folders.
 pub type SharedFolders = Rc<RefCell<FolderTree>>;
 
+/// The folder tree in the shape `TreeView` reads.
+pub type FolderView = TreeView<NodeId, Msg>;
+
 struct Source(SharedFolders);
 
-impl TreeSource for Source {
-    fn children(&self, parent: Option<i64>) -> Vec<TreeEntry> {
+impl TreeModel for Source {
+    type Key = NodeId;
+
+    fn children(&self, parent: Option<&NodeId>) -> Vec<Node<NodeId>> {
         self.0
             .borrow()
-            .children(parent)
+            .children(parent.copied())
             .into_iter()
-            .map(|node| if node.has_children { TreeEntry::branch(node.text, node.id) } else { TreeEntry::leaf(node.text, node.id) })
+            .map(|node| if node.has_children { Node::branch(node.id, node.text) } else { Node::leaf(node.id, node.text) })
             .collect()
     }
 }
 
 /// A tree showing `folders`, with every account expanded. Later changes to the
-/// folder model reach it through [`native_tree::sync`], which keeps the
-/// selection and expansion.
-pub fn build(ui: &mut Ui<Msg>, folders: &SharedFolders) -> win32ui::Result<TreeView<Msg>> {
-    let tree = TreeView::new(ui, Rect::default(), Box::new(Source(folders.clone())))?.on_select(|item| item.map(Msg::Folder));
-    native_tree::expand_roots(&tree);
+/// folder model reach it through `TreeView::refresh`, which keeps the selection
+/// and expansion.
+pub fn build(ui: &mut Ui<Msg>, folders: &SharedFolders) -> win32ui::Result<FolderView> {
+    let tree = TreeView::new(ui, Source(folders.clone()))?.on_select(|id| Some(Msg::Folder(*id)));
+    for account in folders.borrow().children(None) {
+        tree.expand(&account.id, true);
+    }
     Ok(tree)
 }

@@ -3,7 +3,7 @@
 use esmail::imap::{ImapCommand, ImapEvent};
 use esmail_win32::core_glue::CacheEvent;
 
-use super::{App, native_tree};
+use super::App;
 
 impl App {
     /// Applies everything the core and the cache have queued. Never blocks.
@@ -15,8 +15,9 @@ impl App {
         for (account, event) in self.core.pump() {
             tree_changed |= self.handle(account, event);
         }
+        self.smtp_events();
         if tree_changed {
-            native_tree::sync(&self.tree, &self.folders.borrow());
+            self.tree.refresh();
         }
     }
 
@@ -29,6 +30,9 @@ impl App {
             }
             CacheEvent::Headers { account, mailbox, headers } => self.seed_from_cache(account, &mailbox, headers),
             CacheEvent::Search(hits) => self.search_arrived(hits),
+            CacheEvent::DraftSaved { id, compose_id } => self.draft_saved(id, compose_id),
+            CacheEvent::OutboxEnqueued { id, compose_id } => self.outbox_enqueued(id, compose_id),
+            CacheEvent::OutboxDue(items) => self.outbox_due(items),
             CacheEvent::Failed(message) => self.banner(&format!("Cache: {message}")),
         }
         false

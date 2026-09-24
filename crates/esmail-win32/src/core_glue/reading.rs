@@ -10,6 +10,8 @@ use esmail::imap::MailHeader;
 use esmail::render::Attachment;
 use esmail::view_model::format_size;
 
+use super::links;
+
 /// The reading pane's colours, as `0xRRGGBB` values a frontend maps from its
 /// theme. Only the header block, notices and (in the dark palette) messages
 /// that set no colours of their own use them.
@@ -75,8 +77,8 @@ fn contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
 
 fn header_style(palette: &Palette) -> String {
     format!(
-        "<style>.esmail-head{{background:#{:06x};border-bottom:1px solid #{:06x};margin:-12px -12px 12px -12px;padding:12px}}.esmail-head .subject{{font-size:18px;font-weight:bold;margin-bottom:6px;color:#{:06x}}}.esmail-head .field{{color:#{:06x};font-size:13px}}.esmail-head .field b{{color:#{:06x}}}</style>",
-        palette.header_background, palette.header_border, palette.text, palette.muted, palette.text
+        "<style>.esmail-head{{background:#{:06x};border-bottom:1px solid #{:06x};margin:-12px -12px 12px -12px;padding:12px}}.esmail-head .subject{{font-size:18px;font-weight:bold;margin-bottom:6px;color:#{:06x}}}.esmail-head .field{{color:#{:06x};font-size:13px}}.esmail-head .field b{{color:#{:06x}}}.esmail-head .attachment{{font-size:13px;margin-top:4px;color:#{:06x}}}.esmail-head a{{color:#{:06x}}}</style>",
+        palette.header_background, palette.header_border, palette.text, palette.muted, palette.text, palette.muted, palette.link
     )
 }
 
@@ -126,12 +128,31 @@ fn header_block(header: &MailHeader, attachments: &[Attachment]) -> String {
         Some((day, time)) => field(&mut block, "Date", &format!("{day} {time}")),
         None => field(&mut block, "Date", &header.date),
     }
-    if !attachments.is_empty() {
-        let names: Vec<String> = attachments.iter().map(|a| format!("{} ({})", a.filename, format_size(a.data.len()))).collect();
-        field(&mut block, "Attachments", &names.join(", "));
-    }
+    attachment_list(&mut block, attachments);
     block.push_str("</div>");
     block
+}
+
+/// One line per attachment with its Save and Open links, and Save all when there
+/// are several.
+fn attachment_list(block: &mut String, attachments: &[Attachment]) {
+    if attachments.is_empty() {
+        return;
+    }
+    block.push_str("<div class=\"attachments\">");
+    for (n, attachment) in attachments.iter().enumerate() {
+        block.push_str(&format!(
+            "<div class=\"attachment\"><b>{}</b> ({}) <a href=\"{}\">Save</a> <a href=\"{}\">Open</a></div>",
+            escape(&attachment.filename),
+            format_size(attachment.data.len()),
+            links::save_href(n),
+            links::open_href(n)
+        ));
+    }
+    if attachments.len() > 1 {
+        block.push_str(&format!("<div class=\"attachment\"><a href=\"{}\">Save all</a></div>", links::save_all_href()));
+    }
+    block.push_str("</div>");
 }
 
 fn field(block: &mut String, name: &str, value: &str) {
@@ -202,7 +223,9 @@ mod tests {
         let attachment = Attachment { filename: "report.pdf".into(), mime_type: "application/pdf".into(), data: vec![0; 2048] };
         let html = document(&header, "", &[attachment], &Palette::LIGHT, false);
         assert!(!html.contains("<b>To:</b>"));
-        assert!(html.contains("report.pdf (2.0 KB)"));
+        assert!(html.contains("report.pdf</b> (2.0 KB)"));
+        assert!(html.contains("esmail-attachment:save/0") && html.contains("esmail-attachment:open/0"));
+        assert!(!html.contains("Save all"), "one attachment needs no Save all");
     }
 
     fn appearance(palette: Palette, original_colours: bool) -> Appearance {

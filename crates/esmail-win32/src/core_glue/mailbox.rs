@@ -246,6 +246,11 @@ impl OpenFolder {
         self.headers.get(row)
     }
 
+    /// The loaded headers, newest first.
+    pub fn headers(&self) -> &[MailHeader] {
+        &self.headers
+    }
+
     /// The rows for the list widget.
     pub fn rows(&self) -> Arc<[RowModel]> {
         self.rows.as_slice().into()

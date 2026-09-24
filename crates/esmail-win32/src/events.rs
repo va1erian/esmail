@@ -3,6 +3,8 @@
 
 use win32ui::Point;
 
+use crate::core_glue::compose::Kind;
+
 /// An event raised by a [`MessageList`], mapped to the app's `Msg` by the
 /// closures given at construction.
 #[derive(Clone, Debug)]
@@ -16,6 +18,8 @@ pub enum MessageListEvent {
     /// The flag of a row should toggle: its star was clicked, or Space was pressed
     /// on the focused row.
     ToggleFlag(usize),
+    /// R, Shift+R or F was pressed: start a reply, a reply to all or a forward.
+    Compose(Kind),
     /// The keyboard focus moved to a row. The list handles this itself by
     /// scrolling the row into view; it never reaches the app.
     Focus(usize),
@@ -41,6 +45,7 @@ pub(crate) struct MessageListEvents<M> {
     pub(crate) on_toggle_flag: Option<RowMapper<M>>,
     pub(crate) on_context: Option<ContextMapper<M>>,
     pub(crate) on_near_end: Option<Box<dyn Fn() -> Option<M>>>,
+    pub(crate) on_compose: Option<Box<dyn Fn(Kind) -> Option<M>>>,
 }
 
 impl<M> MessageListEvents<M> {
@@ -52,6 +57,7 @@ impl<M> MessageListEvents<M> {
             on_toggle_flag: None,
             on_context: None,
             on_near_end: None,
+            on_compose: None,
         }
     }
 }
