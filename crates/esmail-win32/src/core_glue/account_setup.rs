@@ -33,17 +33,27 @@ pub fn google_client_or_explain(config: &Config) -> Result<OAuthClient, String> 
     })
 }
 
-/// The whole browser round trip of a Google sign-in: consent page, redirect,
-/// code exchange. `browser_failed` is called with the address when the system
-/// browser cannot be opened, so the user can open it by hand; the sign-in keeps
-/// waiting.
-pub async fn google_sign_in(
+/// Google credentials for `account`: the refresh token saved from an earlier
+/// approval, unless `sign_in_again`, else the whole browser round trip (consent
+/// page, redirect, code exchange). `awaiting_browser` is called once the user
+/// has to act in the browser; `browser_failed` gets the address when the system
+/// browser cannot be opened, so the user can open it by hand (the sign-in keeps
+/// waiting).
+pub async fn google_auth(
     client: &OAuthClient,
-    email: &str,
+    account: &AccountConfig,
+    sign_in_again: bool,
+    awaiting_browser: impl FnOnce(),
     browser_failed: impl FnOnce(String),
 ) -> Result<Auth, String> {
+    if !sign_in_again {
+        if let Some(refresh_token) = secrets::get_password(&account.id, "oauth") {
+            return Ok(Auth::OAuth(oauth::TokenSource::from_refresh_token(client.clone(), refresh_token)));
+        }
+    }
+    awaiting_browser();
     let sign_in = async {
-        let pending = oauth::begin(client, email).await?;
+        let pending = oauth::begin(client, &account.username).await?;
         if let Err(error) = opener::open_browser(&pending.url) {
             log::warn!("could not open the browser for Google sign-in: {error}");
             browser_failed(pending.url.clone());

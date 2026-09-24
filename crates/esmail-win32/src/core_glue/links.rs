@@ -8,6 +8,9 @@
 /// The scheme of the attachment links the header block carries.
 pub const ATTACHMENT_SCHEME: &str = "esmail-attachment";
 
+/// The scheme of the "Reconnect" link a sign-in failure notice carries.
+pub const RECONNECT_SCHEME: &str = "esmail-reconnect";
+
 /// The longest link opened; longer ones are almost always an attack or a bug.
 const MAX_LINK_BYTES: usize = 8192;
 
@@ -29,6 +32,8 @@ pub enum LinkAction {
     OpenAttachment(usize),
     /// Save every attachment of the open message.
     SaveAllAttachments,
+    /// Open the account form for the account at this index.
+    Reconnect(usize),
     /// Do nothing, and say why.
     Refuse(String),
 }
@@ -48,6 +53,11 @@ pub fn save_all_href() -> String {
     format!("{ATTACHMENT_SCHEME}:save-all")
 }
 
+/// The href of the "Reconnect" link of the account at index `account`.
+pub fn reconnect_href(account: usize) -> String {
+    format!("{RECONNECT_SCHEME}:{account}")
+}
+
 /// Decides what clicking `href` does.
 pub fn classify(href: &str) -> LinkAction {
     let href = href.trim();
@@ -61,6 +71,7 @@ pub fn classify(href: &str) -> LinkAction {
         "http" | "https" if rest.starts_with("//") && rest.len() > 2 => LinkAction::Browser(href.to_string()),
         "mailto" => mail(rest),
         ATTACHMENT_SCHEME => attachment(rest),
+        RECONNECT_SCHEME => rest.parse().map_or_else(|_| LinkAction::Refuse("Blocked a malformed reconnect link.".to_string()), LinkAction::Reconnect),
         other => LinkAction::Refuse(format!("Blocked a link that opens \"{other}:\"; only web and mail links are opened.")),
     }
 }
@@ -146,6 +157,12 @@ mod tests {
             LinkAction::Mail { to: "ann@example.com".into(), subject: Some("Hello there".into()) }
         );
         assert!(matches!(classify("mailto:nobody"), LinkAction::Refuse(_)));
+    }
+
+    #[test]
+    fn a_reconnect_link_names_its_account() {
+        assert_eq!(classify(&reconnect_href(3)), LinkAction::Reconnect(3));
+        assert!(matches!(classify("esmail-reconnect:x"), LinkAction::Refuse(_)));
     }
 
     #[test]

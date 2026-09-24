@@ -14,6 +14,7 @@
 //! per page, while this list accumulates pages as the user scrolls and merges
 //! refreshes into them, and `AppCore` also needs the egui app's cache task.
 
+mod accounts;
 mod actions;
 mod args;
 mod chrome;
@@ -47,6 +48,7 @@ use esmail_win32::core_glue::reading::Palette;
 use esmail::compose::ComposeId;
 use esmail_win32::core_glue::compose::Kind;
 use esmail_win32::core_glue::{BodyLoads, Core, FolderRef, FolderTree, Latest, WindowState, load_config};
+use accounts::{Accounts, FormRequest, ManageRequest, Outcome};
 use args::{Args, ThemeChoice};
 use message::SeenTimer;
 use reader::Reader;
@@ -107,6 +109,16 @@ enum Msg {
     FoldersMoved(f32),
     /// The divider between the list and the reading pane moved.
     ListMoved(f32),
+    /// File > Add account..., and the first-run form.
+    AddAccount,
+    /// File > Accounts...
+    ManageAccounts,
+    /// The account form asks for something.
+    AccountRequest(FormRequest),
+    /// The Accounts window asks for something.
+    ManageRequest(ManageRequest),
+    /// The work behind the account form reported.
+    AccountOutcome(Outcome),
     /// The window is closing.
     Close,
     Quit,
@@ -115,6 +127,11 @@ enum Msg {
 
 struct App {
     core: Core,
+    /// The accounts as saved: what the core was started with.
+    config: esmail::config::Config,
+    accounts: Accounts,
+    /// Accounts can be added and removed (not while `--profile` reads a copy).
+    editable: bool,
     folders: SharedFolders,
     list: MessageList<Msg>,
     search_edit: Edit<Msg>,
@@ -197,11 +214,7 @@ fn palette_for(theme: &Theme) -> Palette {
 }
 
 fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: Instant) -> App {
-    let proxy = ui.proxy();
-    let waker: esmail::waker::Waker = Arc::new(move || {
-        let _ = proxy.send(Msg::Wake);
-    });
-    let (core, issues) = Core::start(config, waker).expect("start the async runtime");
+    let (core, issues) = Core::start(config, waker(ui)).expect("start the async runtime");
 
     let folders: SharedFolders = Rc::new(RefCell::new(FolderTree::new(config.accounts.iter().map(|a| a.display_name.clone()))));
     let tree = tree::build(ui, &folders).expect("folder tree");
@@ -235,6 +248,9 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
 
     let mut app = App {
         core,
+        config: config.clone(),
+        accounts: Accounts::default(),
+        editable: args.profile.is_none(),
         folders,
         list,
         search_edit,
@@ -275,16 +291,28 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
     if let Some(bounds) = app.window.bounds {
         placement::restore(ui.hwnd(), bounds, app.window.maximized);
     }
+    app.accounts.reset_status(app.core.accounts().len());
     if app.core.accounts().is_empty() {
-        app.banner("No accounts are configured. Add one in the egui esMail first.");
+        app.reader.show_notice("No accounts are set up. Use File > Add account... to add one.");
+        ui.emit(Msg::AddAccount);
+    }
+    if args.accounts {
+        ui.emit(Msg::ManageAccounts);
     }
     for issue in issues {
-        let name = app.core.accounts()[issue.account].display_name.clone();
-        app.banner(&format!("{name}: {}", issue.message));
+        app.account_failed(issue.account, issue.message);
     }
     app.open_from_cache(ui);
     app.core.cache().due_outbox();
     app
+}
+
+/// What makes the window drain the core: called from any thread.
+fn waker(ui: &Ui<Msg>) -> esmail::waker::Waker {
+    let proxy = ui.proxy();
+    Arc::new(move || {
+        let _ = proxy.send(Msg::Wake);
+    })
 }
 
 impl win32ui::App for App {
@@ -338,6 +366,11 @@ impl win32ui::App for App {
             Msg::SearchClear => self.clear_search(ui),
             Msg::FoldersMoved(width) => self.window.folders_width = Some(width),
             Msg::ListMoved(width) => self.window.list_width = Some(width),
+            Msg::AddAccount => self.add_account(ui),
+            Msg::ManageAccounts => self.manage_accounts(ui),
+            Msg::AccountRequest(request) => self.form_request(ui, request),
+            Msg::ManageRequest(request) => self.manage_request(ui, request),
+            Msg::AccountOutcome(outcome) => self.account_outcome(ui, outcome),
             Msg::Close => self.close(ui),
             Msg::Quit => ui.quit(),
             Msg::Timer(id) => self.timer(ui, id),

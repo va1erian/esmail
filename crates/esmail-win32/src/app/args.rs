@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use esmail_win32::core_glue::compose::Kind;
 
 const USAGE: &str = "usage: esmail-win32 [--theme light|dark|system] [--profile NAME] \
-[--screenshot OUT.png] [--select ROW] [--folder NAME] \n[--compose new|reply|reply-all|forward] [--acrylic] [--account N] [--remote-images]";
+[--screenshot OUT.png] [--select ROW] [--folder NAME] \n[--compose new|reply|reply-all|forward] [--acrylic] [--account N] [--remote-images] [--accounts]";
 
 /// How the window is themed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +38,8 @@ pub struct Args {
     pub acrylic: bool,
     /// `--remote-images`: start with View > Load remote images on.
     pub remote_images: bool,
+    /// `--accounts`: open the Accounts window at start.
+    pub accounts: bool,
 }
 
 impl Args {
@@ -47,7 +49,7 @@ impl Args {
     }
 
     fn parse_from(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
-        let mut parsed = Args { theme: ThemeChoice::System, profile: None, screenshot: None, folder: None, account: 0, select: None, compose: None, acrylic: false, remote_images: false };
+        let mut parsed = Args { theme: ThemeChoice::System, profile: None, screenshot: None, folder: None, account: 0, select: None, compose: None, acrylic: false, remote_images: false, accounts: false };
         while let Some(flag) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
             match flag.as_str() {
@@ -67,6 +69,7 @@ impl Args {
                 "--select" => parsed.select = Some(value()?.parse().map_err(|_| format!("--select needs a row number\n{USAGE}"))?),
                 "--acrylic" => parsed.acrylic = true,
                 "--remote-images" => parsed.remote_images = true,
+                "--accounts" => parsed.accounts = true,
                 "--compose" => {
                     parsed.compose = Some(match value()?.as_str() {
                         "new" => Kind::New,

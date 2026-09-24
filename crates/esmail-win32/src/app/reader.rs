@@ -15,8 +15,9 @@ use super::Msg;
 
 /// What the pane shows.
 enum Content {
-    /// A line of text: "Select a message", an error.
-    Notice(String),
+    /// A line of text: "Select a message", an error, with the label and href of
+    /// the action it offers.
+    Notice(String, Option<(String, String)>),
     /// A fetched message, kept so a theme change can re-render it.
     Message { header: MailHeader, body: String, attachments: Vec<Attachment> },
 }
@@ -32,19 +33,25 @@ impl Reader {
         let appearance = Appearance { palette, original_colours: false };
         let view = HtmlView::new(
             ui,
-            reading::notice("", &palette),
+            reading::notice("", None, &palette),
             || Msg::Frame,
             |event| match event {
                 HtmlViewEvent::LinkClicked(href) => Some(Msg::Link(href)),
             },
         )?;
-        let reader = Reader { view, appearance, content: Content::Notice(String::new()) };
+        let reader = Reader { view, appearance, content: Content::Notice(String::new(), None) };
         reader.render();
         Ok(reader)
     }
 
     pub fn show_notice(&mut self, text: &str) {
-        self.content = Content::Notice(text.to_string());
+        self.content = Content::Notice(text.to_string(), None);
+        self.render();
+    }
+
+    /// A notice with a link under it: `action` is the link's label and href.
+    pub fn show_notice_with_link(&mut self, text: &str, label: &str, href: &str) {
+        self.content = Content::Notice(text.to_string(), Some((label.to_string(), href.to_string())));
         self.render();
     }
 
@@ -78,9 +85,10 @@ impl Reader {
     fn render(&self) {
         let palette = &self.appearance.palette;
         match &self.content {
-            Content::Notice(text) => {
+            Content::Notice(text, action) => {
                 self.view.set_background(color(palette.background));
-                self.view.load(reading::notice(text, palette));
+                let action = action.as_ref().map(|(label, href)| (label.as_str(), href.as_str()));
+                self.view.load(reading::notice(text, action, palette));
             }
             Content::Message { header, body, attachments } => {
                 let themed = self.appearance.themes_body(body);
@@ -95,14 +103,14 @@ impl Reader {
     pub fn current_attachments(&self) -> &[Attachment] {
         match &self.content {
             Content::Message { attachments, .. } => attachments,
-            Content::Notice(_) => &[],
+            Content::Notice(..) => &[],
         }
     }
 
     pub fn current_message(&self) -> Option<(&MailHeader, &str)> {
         match &self.content {
             Content::Message { header, body, .. } => Some((header, body)),
-            Content::Notice(_) => None,
+            Content::Notice(..) => None,
         }
     }
 

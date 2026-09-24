@@ -110,10 +110,14 @@ pub fn document(header: &MailHeader, body: &str, attachments: &[Attachment], pal
 }
 
 /// A short notice in the reading pane's style, for "nothing selected" and for
-/// errors that have no message to attach to.
-pub fn notice(text: &str, palette: &Palette) -> String {
+/// errors that have no message to attach to. `action` is an optional link
+/// under the text: its label and href.
+pub fn notice(text: &str, action: Option<(&str, &str)>, palette: &Palette) -> String {
+    let link = action.map_or_else(String::new, |(label, href)| {
+        format!("<p><a style=\"color:#{:06x}\" href=\"{}\">{}</a></p>", palette.link, escape(href), escape(label))
+    });
     format!(
-        "<!doctype html><meta charset=\"utf-8\"><body style=\"font-family:'Segoe UI',sans-serif;font-size:14px;color:#{:06x};margin:24px\">{}</body>",
+        "<!doctype html><meta charset=\"utf-8\"><body style=\"font-family:'Segoe UI',sans-serif;font-size:14px;color:#{:06x};margin:24px\">{}{link}</body>",
         palette.muted,
         escape(text)
     )
