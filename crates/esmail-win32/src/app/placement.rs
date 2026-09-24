@@ -7,11 +7,18 @@ use core::mem::size_of;
 use win32ui::{Hwnd, Placement, Rect, ShowState};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowPlacement, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SetWindowPlacement, WINDOWPLACEMENT, WINDOWPLACEMENT_FLAGS,
+    GetWindowPlacement, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SetForegroundWindow, SetWindowPlacement, WINDOWPLACEMENT, WINDOWPLACEMENT_FLAGS,
 };
 
 fn raw(hwnd: Hwnd) -> HWND {
     HWND(hwnd.raw() as *mut core::ffi::c_void)
+}
+
+/// Brings one of this app's own windows to the front.
+pub fn bring_forward(hwnd: Hwnd) {
+    // SAFETY: plain FFI on a handle of this process's own window; a refusal
+    // (the window is gone) changes nothing.
+    let _ = unsafe { SetForegroundWindow(raw(hwnd)) };
 }
 
 /// The window's restored rectangle (left, top, right, bottom in screen pixels)

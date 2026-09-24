@@ -145,7 +145,7 @@ impl App {
         }
         if unread != self.title_unread {
             self.title_unread = unread;
-            ui.set_title(&if unread == 0 { "esMail".to_string() } else { format!("esMail ({unread})") });
+            self.refresh_title(ui);
         }
     }
 }

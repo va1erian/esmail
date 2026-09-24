@@ -22,6 +22,7 @@ use super::search::SearchState;
 use super::startup::Startup;
 use super::toolbar::MainBar;
 use super::tray::Tray;
+use super::queue::Queues;
 use super::tree::{self, SharedFolders};
 use super::{App, Msg, chrome, notifications, palette_for, placement, theme};
 
@@ -171,6 +172,9 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         acrylic: args.acrylic,
         opened_accounts: Default::default(),
         start_compose: args.compose,
+        start_queue: args.show,
+        queue_pending: false,
+        queues: Queues::default(),
         settings,
         settings_path,
         tray,

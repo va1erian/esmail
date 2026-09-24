@@ -3,14 +3,17 @@
 use esmail::imap::{ImapCommand, ImapEvent};
 use esmail_win32::core_glue::CacheEvent;
 
-use super::App;
+use win32ui::prelude::*;
+
+use super::queue::QueueKind;
+use super::{App, Msg};
 
 impl App {
     /// Applies everything the core and the cache have queued. Never blocks.
-    pub(super) fn drain(&mut self) {
+    pub(super) fn drain(&mut self, ui: &Ui<Msg>) {
         let mut tree_changed = false;
         for event in self.core.cache().pump() {
-            tree_changed |= self.handle_cache(event);
+            tree_changed |= self.handle_cache(ui, event);
         }
         for (account, event) in self.core.pump() {
             tree_changed |= self.handle(account, event);
@@ -34,7 +37,7 @@ impl App {
     }
 
     /// Applies one cache event. Returns whether the folder tree needs syncing.
-    fn handle_cache(&mut self, event: CacheEvent) -> bool {
+    fn handle_cache(&mut self, ui: &Ui<Msg>, event: CacheEvent) -> bool {
         match event {
             CacheEvent::Folders { account, mailboxes } => {
                 self.folders.borrow_mut().set_cached_mailboxes(account, &mailboxes);
@@ -43,8 +46,14 @@ impl App {
             CacheEvent::Headers { account, mailbox, headers } => self.seed_from_cache(account, &mailbox, headers),
             CacheEvent::Search(hits) => self.search_arrived(hits),
             CacheEvent::DraftSaved { id, compose_id } => self.draft_saved(id, compose_id),
-            CacheEvent::OutboxEnqueued { id, compose_id } => self.outbox_enqueued(id, compose_id),
+            CacheEvent::OutboxEnqueued { id, compose_id } => {
+                self.outbox_enqueued(id, compose_id);
+                self.refresh_queue(QueueKind::Outbox);
+            }
             CacheEvent::OutboxDue(items) => self.outbox_due(items),
+            CacheEvent::Drafts(drafts) => self.drafts_listed(&drafts),
+            CacheEvent::Outbox(items) => self.outbox_listed(items),
+            CacheEvent::DraftLoaded { id, compose } => self.draft_loaded(ui, id, compose),
             CacheEvent::Failed(message) => self.banner(&format!("Cache: {message}")),
         }
         false

@@ -238,7 +238,7 @@ impl App {
         self.reader.show_notice("Select a message to read it.");
         self.open = None;
         self.message_shown = false;
-        ui.set_title("esMail");
+        self.refresh_title(ui);
     }
 
     /// Notes what `event` means for the account's status.

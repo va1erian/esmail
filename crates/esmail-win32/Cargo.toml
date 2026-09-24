@@ -11,6 +11,7 @@ license.workspace = true
 # esmail-win32 | grep egui` must stay empty, CI checks it).
 esmail = { path = "../esmail", default-features = false }
 anyhow.workspace = true
+chrono.workspace = true
 log.workspace = true
 # Opens the Google sign-in page in the default browser.
 opener.workspace = true

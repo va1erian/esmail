@@ -22,21 +22,25 @@ impl App {
         self.seen.cancel(ui);
         self.search.reset(ui);
         self.search_edit.set_text("");
-        ui.set_title(&self.window_title(&folder));
         self.set_status(&format!("Loading {}...", folder.mailbox));
         self.list.set_rows(Arc::from([]));
         self.reader.show_notice("Select a message to read it.");
         self.core.cache().load_folder(folder.account, folder.mailbox.clone(), CACHED_ROWS);
         self.open = Some(OpenFolder::new(folder));
+        self.refresh_title(ui);
         self.request_page();
     }
 
-    /// "INBOX - esMail", with the account named when there are several.
-    fn window_title(&self, folder: &FolderRef) -> String {
-        match self.core.accounts() {
-            [_] | [] => format!("{} - esMail", folder.mailbox),
-            accounts => format!("{} - {} - esMail", folder.mailbox, accounts[folder.account].display_name),
-        }
+    /// "(3) INBOX - esMail": the unread total when there is one, the open
+    /// folder, and its account when there are several.
+    pub(super) fn refresh_title(&self, ui: &Ui<Msg>) {
+        let unread = if self.title_unread == 0 { String::new() } else { format!("({}) ", self.title_unread) };
+        let title = match (&self.open, self.core.accounts()) {
+            (None, _) => format!("{unread}esMail"),
+            (Some(open), [_] | []) => format!("{unread}{} - esMail", open.folder().mailbox),
+            (Some(open), accounts) => format!("{unread}{} - {} - esMail", open.folder().mailbox, accounts[open.folder().account].display_name),
+        };
+        ui.set_title(&title);
     }
 
     /// The cache answered with a folder's newest messages: show them, unless the

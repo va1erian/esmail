@@ -21,6 +21,27 @@ impl Cache {
         self.command(DbCommand::DeleteDraft { id });
     }
 
+    /// Asks for every draft; they come back as [`CacheEvent::Drafts`].
+    ///
+    /// [`CacheEvent::Drafts`]: super::CacheEvent::Drafts
+    pub fn list_drafts(&self) {
+        self.command(DbCommand::ListDrafts);
+    }
+
+    /// Asks for one draft's message; it comes back as [`CacheEvent::DraftLoaded`].
+    ///
+    /// [`CacheEvent::DraftLoaded`]: super::CacheEvent::DraftLoaded
+    pub fn load_draft(&self, id: i64) {
+        self.command(DbCommand::LoadDraft { id });
+    }
+
+    /// Asks for every queued message; they come back as [`CacheEvent::Outbox`].
+    ///
+    /// [`CacheEvent::Outbox`]: super::CacheEvent::Outbox
+    pub fn list_outbox(&self) {
+        self.command(DbCommand::ListOutbox);
+    }
+
     /// Records a message that failed to send so it is tried again later. The
     /// row's id comes back as [`CacheEvent::OutboxEnqueued`].
     ///
