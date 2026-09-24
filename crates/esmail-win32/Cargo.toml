@@ -14,13 +14,16 @@ log.workspace = true
 serde.workspace = true
 tokio.workspace = true
 toml.workspace = true
+ureq.workspace = true
 
 # Windows-only: the Direct2D/DirectWrite backend, the widget host, and the
 # HTML reading pane.
 [target.'cfg(windows)'.dependencies]
 litehtml-view-d2d = { path = "../litehtml-view-d2d" }
 win32ui = { git = "https://github.com/va1erian/win32ui.git", branch = "main" }
-windows-registry.workspace = true
+# Attachment save-as/add dialogs, and opening links and files in the default app.
+rfd.workspace = true
+opener.workspace = true
 # Only `InvalidateRect` (the scroll-invalidate workaround in message_list.rs)
 # and, in the example, the raw WM_VSCROLL/WM_MOUSEWHEEL drives for
 # --bench-scroll. Same version and feature discipline as win32ui itself.

@@ -10,6 +10,7 @@ use win32ui::d2d::{D2dCanvas, RectF};
 use win32ui::gdi::Canvas;
 use win32ui::{CustomWidget, Input, Key, KeyResult, Modifiers, MouseButton, Point, Rect, Renderer, Theme, WidgetCx};
 
+use crate::core_glue::compose::Kind;
 use crate::events::MessageListEvent;
 use crate::paint::{self, Fonts, Phases, RowVisual};
 use crate::selection::navigate;
@@ -168,10 +169,14 @@ impl MessageListWidget {
             if !selected.is_empty() {
                 cx.emit(MessageListEvent::Delete(selected));
             }
+        } else if key == Key::R && !modifiers.ctrl {
+            cx.emit(MessageListEvent::Compose(if modifiers.shift { Kind::ReplyAll } else { Kind::Reply }));
         } else if key == Key::SPACE {
             if let Some(index) = focus {
                 cx.emit(MessageListEvent::ToggleFlag(index));
             }
+        } else if key == Key::F && !modifiers.ctrl {
+            cx.emit(MessageListEvent::Compose(Kind::Forward));
         }
     }
 }

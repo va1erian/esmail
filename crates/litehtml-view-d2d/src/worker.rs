@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use litehtml::html::decode_data_uri;
@@ -14,6 +14,12 @@ use win32ui::d2d::TextSystem;
 
 use crate::engine::Engine;
 use crate::list::Frame;
+
+/// Fetches the bytes of a remote image, or `None` when it cannot be had.
+pub type ImageFetcher = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
+
+/// The fetcher the UI thread installs and the render thread reads.
+pub(crate) type ImageSource = Arc<Mutex<Option<ImageFetcher>>>;
 
 /// Upper bound on draw passes for one render job: pass 1 discovers `data:`
 /// image URLs, pass 2 draws with them decoded. (Remote images are out of scope
@@ -55,6 +61,7 @@ pub(crate) struct Worker {
     /// requested; the next job must forget them or a resize mid-load leaves the
     /// message permanently missing images.
     reset_images_next: bool,
+    images: ImageSource,
 }
 
 impl Worker {
@@ -63,8 +70,9 @@ impl Worker {
         out: Sender<Output>,
         latest_id: Arc<AtomicU64>,
         wake: Arc<dyn Fn() + Send + Sync>,
+        images: ImageSource,
     ) -> Self {
-        Self { engine: None, text, out, latest_id, wake, reset_images_next: false }
+        Self { engine: None, text, out, latest_id, wake, reset_images_next: false, images }
     }
 
     fn engine(&mut self) -> &mut Engine {
@@ -118,11 +126,14 @@ impl Worker {
                 break;
             }
 
-            // The prototype decodes `data:` URIs only; remote URLs are left
-            // unloaded (the display list simply never gets pixels for them).
+            // `data:` URIs are decoded here; remote URLs go to the host's fetcher,
+            // if it installed one, and stay unloaded (the display list never gets
+            // pixels for them) otherwise.
+            let fetcher = self.images.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
             let mut loaded = false;
             for (url, _) in pending {
-                if let Some(bytes) = decode_data_uri(&url) {
+                let bytes = decode_data_uri(&url).or_else(|| fetcher.as_ref().and_then(|fetch| fetch(&url)));
+                if let Some(bytes) = bytes {
                     self.engine().load_image_data(&url, &bytes);
                     loaded = true;
                 }

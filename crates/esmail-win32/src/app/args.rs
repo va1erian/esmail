@@ -10,7 +10,7 @@ const USAGE: &str = "usage: esmail-win32 [--theme light|dark|system] [--profile 
 pub enum ThemeChoice {
     Light,
     Dark,
-    /// Follow the Windows "app mode" setting as of when this was chosen.
+    /// Follow the Windows app mode and accent colour, live (the default).
     System,
 }
 
@@ -35,7 +35,7 @@ impl Args {
     }
 
     fn parse_from(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
-        let mut parsed = Args { theme: ThemeChoice::Dark, profile: None, screenshot: None, folder: None, select: None };
+        let mut parsed = Args { theme: ThemeChoice::System, profile: None, screenshot: None, folder: None, select: None };
         while let Some(flag) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
             match flag.as_str() {
@@ -67,9 +67,9 @@ mod tests {
     }
 
     #[test]
-    fn no_flags_means_a_dark_window_on_the_real_profile() {
+    fn no_flags_means_the_system_theme_on_the_real_profile() {
         let args = parse(&[]).unwrap();
-        assert_eq!(args.theme, ThemeChoice::Dark);
+        assert_eq!(args.theme, ThemeChoice::System);
         assert!(args.profile.is_none() && args.screenshot.is_none());
     }
 

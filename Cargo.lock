@@ -1321,13 +1321,15 @@ dependencies = [
  "esmail",
  "litehtml-view-d2d",
  "log",
+ "opener",
  "png 0.17.16",
+ "rfd",
  "serde",
  "tokio",
  "toml 0.8.23",
+ "ureq",
  "win32ui",
  "windows",
- "windows-registry",
 ]
 
 [[package]]

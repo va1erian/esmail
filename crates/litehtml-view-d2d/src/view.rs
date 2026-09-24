@@ -4,13 +4,13 @@
 
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use win32ui::d2d::TextSystem;
 use win32ui::{Custom, Result, Ui};
 
 use crate::widget::HtmlWidget;
-use crate::worker::Worker;
+use crate::worker::{ImageFetcher, ImageSource, Worker};
 
 /// An event raised by an [`HtmlView`], mapped to the app's message type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +29,7 @@ pub enum HtmlViewEvent {
 /// [`HtmlViewEvent`]s to the app's `Msg`.
 pub struct HtmlView<M: 'static> {
     widget: Custom<HtmlWidget, M>,
+    images: ImageSource,
 }
 
 impl<M: Send + 'static> HtmlView<M> {
@@ -44,6 +45,8 @@ impl<M: Send + 'static> HtmlView<M> {
         let (out_tx, out_rx) = mpsc::channel();
         let latest_id = Arc::new(AtomicU64::new(0));
         let scale = ui.dpi() as f32 / 96.0;
+        let images: ImageSource = Arc::new(Mutex::new(None));
+        let worker_images = Arc::clone(&images);
 
         let widget = Custom::new(
             ui,
@@ -60,14 +63,21 @@ impl<M: Send + 'static> HtmlView<M> {
         let spawned = std::thread::Builder::new()
             .name("litehtml-d2d-worker".to_string())
             .spawn(move || {
-                let worker = Worker::new(text, out_tx, latest_id, wake);
+                let worker = Worker::new(text, out_tx, latest_id, wake, worker_images);
                 worker.run(job_rx);
             });
         if let Err(e) = &spawned {
             log::error!("litehtml-view-d2d: could not start the render thread: {e}");
         }
 
-        Ok(HtmlView { widget })
+        Ok(HtmlView { widget, images })
+    }
+
+    /// Sets how `http(s)` images are fetched, or `None` (the default) to leave
+    /// them unloaded. The fetcher runs on the render thread and may block. It
+    /// applies to the next [`load`](Self::load).
+    pub fn set_image_fetcher(&self, fetcher: Option<ImageFetcher>) {
+        *self.images.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = fetcher;
     }
 
     /// Loads a new page, replacing whatever is currently shown.

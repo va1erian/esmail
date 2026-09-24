@@ -23,6 +23,7 @@ use std::time::Instant;
 use win32ui::d2d::TextSystem;
 use win32ui::{AsControl, Control, Custom, Point, Rect, Theme, Themed, Ui, dip};
 
+use crate::core_glue::compose::Kind;
 use crate::events::MessageListEvents;
 use crate::paint::Fonts;
 use crate::state::{clamp_scroll, is_near_end, scroll_for_row};
@@ -77,6 +78,7 @@ impl<M: 'static> MessageList<M> {
                     MessageListEvent::Open(row) => events.on_open.as_ref().and_then(|f| f(row)),
                     MessageListEvent::Delete(rows) => events.on_delete.as_ref().and_then(|f| f(&rows)),
                     MessageListEvent::ToggleFlag(row) => events.on_toggle_flag.as_ref().and_then(|f| f(row)),
+                    MessageListEvent::Compose(kind) => events.on_compose.as_ref().and_then(|f| f(kind)),
                     MessageListEvent::Context { row, at } => events.on_context.as_ref().and_then(|f| f(row, at)),
                     MessageListEvent::Focus(row) => {
                         if let Some(custom) = scroller_for_dispatch.get().and_then(Weak::upgrade) {
@@ -142,6 +144,13 @@ impl<M: 'static> MessageList<M> {
     /// Maps a right-click to a message, with the row and the pointer position.
     pub fn on_context(self, f: impl Fn(usize, Point) -> Option<M> + 'static) -> MessageList<M> {
         self.events.borrow_mut().on_context = Some(Box::new(f));
+        self
+    }
+
+    /// Maps R, Shift+R and F on the focused row to a message: reply, reply to
+    /// all, forward.
+    pub fn on_compose(self, f: impl Fn(Kind) -> Option<M> + 'static) -> MessageList<M> {
+        self.events.borrow_mut().on_compose = Some(Box::new(f));
         self
     }
 
