@@ -94,7 +94,7 @@ impl Form {
                 field(4, &self.subject),
                 self.body.fill(1),
                 self.attachments.list.height(dip(84.0)),
-                self.status.height(dip(38.0)),
+                self.status.height(dip(52.0)),
                 row![self.add.width(dip(120.0)), self.remove.width(dip(90.0)), self._captions[5].fill(1), self.save.width(dip(110.0)), self.discard.width(dip(90.0)), self.send.width(dip(150.0))]
                     .spacing(dip(8.0))
                     .height(dip(32.0)),

@@ -59,18 +59,20 @@ struct App {
     started: std::time::Instant,
 }
 
-/// A `TreeSource` of fixed fake mailbox names.
+/// A `TreeModel` of fixed fake mailbox names.
 struct Mailboxes;
 
-impl TreeSource for Mailboxes {
-    fn children(&self, parent: Option<i64>) -> Vec<TreeEntry> {
+impl TreeModel for Mailboxes {
+    type Key = i64;
+
+    fn children(&self, parent: Option<&i64>) -> Vec<Node<i64>> {
         if parent.is_some() {
             return Vec::new();
         }
         ["Inbox", "Starred", "Sent", "Drafts", "Archive", "Trash", "Spam"]
             .iter()
             .enumerate()
-            .map(|(i, name)| TreeEntry::leaf(*name, i as i64))
+            .map(|(i, name)| Node::leaf(i as i64, *name))
             .collect()
     }
 }
@@ -133,7 +135,7 @@ pub(crate) fn main() {
             .size(dip(1000.0), dip(640.0))
             .theme(theme),
         |ui| {
-            let tree = TreeView::new(ui, Rect::default(), Box::new(Mailboxes))
+            let tree = TreeView::new(ui, Mailboxes)
                 .expect("mailbox tree")
                 .on_select(|_| None);
             let list = MessageList::new(ui)

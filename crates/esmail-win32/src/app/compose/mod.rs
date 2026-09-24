@@ -400,7 +400,7 @@ impl App for ComposeApp {
             ComposeMsg::Failed(error) => {
                 self.sending = false;
                 self.form.set_locked(false);
-                self.show_status(ui, &format!("Send failed: {error}\nThe message is kept; fix it and send again."));
+                self.show_status(ui, &format!("Send failed: {error}\nThe message is kept, so you can send it again."));
             }
             ComposeMsg::Sent => ui.close(),
             ComposeMsg::DraftSaved => self.show_status(ui, "Draft saved."),

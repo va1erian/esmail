@@ -38,6 +38,7 @@ png = "0.17"
 
 [dev-dependencies]
 env_logger.workspace = true
+mail-mock-server = { path = "../mail-mock-server" }
 
 # `build.rs` only embeds the Common Controls v6 manifest on Windows; the crate
 # itself is plain Rust and builds everywhere.
