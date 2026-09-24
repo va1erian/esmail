@@ -213,7 +213,7 @@ fn derive_smtp_host(imap_host: &str) -> String {
 /// reusing `egui::ThemePreference` — `config.rs` otherwise has no dependency
 /// on egui, and keeping it that way means these variants (and their `serde`
 /// round-trip, tested below) don't depend on egui's own `serde` feature flag
-/// being enabled. `main.rs` converts to/from `egui::ThemePreference` at the
+/// being enabled. `egui_input.rs` converts to `egui::ThemePreference` at the
 /// one call site that needs it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThemeMode {

@@ -4,6 +4,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use esmail::ipc::message::ToGui;
+use esmail::shortcuts::{self, Command};
 use esmail::{auth, compose, config, contacts, db, emoji, icons, imap, oauth, paths, progress, render, search_query, secrets, session, shell, smtp, uninstall};
 use esmail::view_model::{
     RowModel, export_file_name, find_special_use_mailbox, format_size, progress_label,
@@ -14,6 +15,7 @@ mod accounts;
 mod compose_ui;
 mod compose_window;
 mod config_saver;
+mod egui_input;
 mod emoji_paint;
 mod listener;
 mod listener_client;
@@ -693,11 +695,7 @@ impl EsMailApp {
         // Apply the saved theme (B9) once, up front, rather than defaulting
         // to egui's own built-in dark theme for one frame first -- avoids a
         // visible flash on launch for a user who picked Light.
-        egui_ctx.set_theme(match config.theme {
-            config::ThemeMode::Dark => egui::ThemePreference::Dark,
-            config::ThemeMode::Light => egui::ThemePreference::Light,
-            config::ThemeMode::System => egui::ThemePreference::System,
-        });
+        egui_ctx.set_theme(egui_input::theme_preference(config.theme));
 
         // Prefill the login form from the first saved account, if any; its
         // password (if the OS keyring has one) comes along too, so a
@@ -1802,11 +1800,7 @@ impl EsMailApp {
     fn apply_theme(&mut self, ctx: &egui::Context, theme: config::ThemeMode) {
         self.theme = theme;
         self.config.theme = theme;
-        ctx.set_theme(match theme {
-            config::ThemeMode::Dark => egui::ThemePreference::Dark,
-            config::ThemeMode::Light => egui::ThemePreference::Light,
-            config::ThemeMode::System => egui::ThemePreference::System,
-        });
+        ctx.set_theme(egui_input::theme_preference(theme));
         self.config_saver.save(&self.config);
         self.listener.notify_config_changed();
     }
@@ -2354,81 +2348,73 @@ impl EsMailApp {
         let search_focused = self
             .search_box_id
             .is_some_and(|id| ui.memory(|m| m.has_focus(id)));
-        if search_focused {
-            return;
-        }
+        let context = shortcuts::Context { search_focused };
 
-        let (ctrl_f, ctrl_n, next, prev, enter, reply, archive, star, delete) = ui.input(|i| {
-            let ctrl = i.modifiers.ctrl || i.modifiers.command;
-            (
-                ctrl && i.key_pressed(egui::Key::F),
-                ctrl && i.key_pressed(egui::Key::N),
-                !ctrl && i.key_pressed(egui::Key::J),
-                !ctrl && i.key_pressed(egui::Key::K),
-                !ctrl && i.key_pressed(egui::Key::Enter),
-                !ctrl && i.key_pressed(egui::Key::R),
-                !ctrl && i.key_pressed(egui::Key::A),
-                !ctrl && i.key_pressed(egui::Key::F),
-                !ctrl && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)),
-            )
-        });
-
-        if ctrl_f {
-            if let Some(id) = self.search_box_id {
-                ui.memory_mut(|m| m.request_focus(id));
-            }
-        }
-        if ctrl_n {
-            self.open_compose(ComposeState::default().with_account(self.active_account_id()), compose_window::Focus::To);
-        }
-        if next || prev {
-            let is_search = self.search_results.is_some();
-            let list = self.search_results.as_ref().unwrap_or(&self.headers);
-            if !list.is_empty() {
-                // In search results the open message is found by UID within
-                // the open mailbox, since UIDs repeat across accounts.
-                let idx = self.selected_uid.and_then(|uid| {
-                    list.iter().enumerate().position(|(i, h)| h.uid == uid && (!is_search || self.in_open_context(i)))
-                });
-                let new_idx = match idx {
-                    Some(i) if next => (i + 1).min(list.len() - 1),
-                    Some(i) => i.saturating_sub(1), // prev
-                    None => 0,
-                };
-                let uid = list[new_idx].uid;
-                self.selected_uids.clear();
-                self.select_anchor = Some(uid);
-                if is_search {
-                    self.open_search_hit(new_idx);
-                } else {
-                    self.open_message(uid, false);
+        for command in ui.input(|i| egui_input::pressed_commands(i, context)) {
+            match command {
+                Command::FocusSearch => {
+                    if let Some(id) = self.search_box_id {
+                        ui.memory_mut(|m| m.request_focus(id));
+                    }
                 }
+                Command::Compose => {
+                    self.open_compose(ComposeState::default().with_account(self.active_account_id()), compose_window::Focus::To)
+                }
+                Command::NextMessage => self.step_selection(true),
+                Command::PreviousMessage => self.step_selection(false),
+                Command::OpenMessage => self.reopen_selection(),
+                Command::Reply => self.reply_to_selection(),
+                Command::Archive => self.archive_selection(),
+                Command::Delete => self.delete_selection(),
+                Command::ToggleStar => self.toggle_star_on_selection(),
             }
-        }
-        if enter {
-            if let Some(uid) = self.selected_uid {
-                let is_search = self.search_results.is_some();
-                self.open_message(uid, is_search);
-            }
-        }
-        if reply {
-            if let Some(header) = self.selected_header() {
-                self.open_compose(
-                    ComposeState::reply(&header, &self.current_message_html).with_account(self.active_account_id()),
-                    compose_window::Focus::Body,
-                );
-            }
-        }
-        if archive {
-            self.archive_selection();
-        }
-        if delete {
-            self.delete_selection();
-        }
-        if star {
-            self.toggle_star_on_selection();
         }
     }
+
+    /// `j`/`k`: open the next (or previous) message in whichever list is
+    /// showing.
+    fn step_selection(&mut self, next: bool) {
+        let is_search = self.search_results.is_some();
+        let list = self.search_results.as_ref().unwrap_or(&self.headers);
+        if list.is_empty() {
+            return;
+        }
+        // In search results the open message is found by UID within
+        // the open mailbox, since UIDs repeat across accounts.
+        let idx = self.selected_uid.and_then(|uid| {
+            list.iter().enumerate().position(|(i, h)| h.uid == uid && (!is_search || self.in_open_context(i)))
+        });
+        let new_idx = match idx {
+            Some(i) if next => (i + 1).min(list.len() - 1),
+            Some(i) => i.saturating_sub(1), // prev
+            None => 0,
+        };
+        let uid = list[new_idx].uid;
+        self.selected_uids.clear();
+        self.select_anchor = Some(uid);
+        if is_search {
+            self.open_search_hit(new_idx);
+        } else {
+            self.open_message(uid, false);
+        }
+    }
+
+    fn reopen_selection(&mut self) {
+        if let Some(uid) = self.selected_uid {
+            let is_search = self.search_results.is_some();
+            self.open_message(uid, is_search);
+        }
+    }
+
+    fn reply_to_selection(&mut self) {
+        if let Some(header) = self.selected_header() {
+            self.open_compose(
+                ComposeState::reply(&header, &self.current_message_html).with_account(self.active_account_id()),
+                compose_window::Focus::Body,
+            );
+        }
+    }
+
     /// The Drafts window: every autosaved/explicitly-saved draft, click to
     /// reopen it in Compose (which removes it from this list -- the window
     /// carries the same `draft_id` forward, so autosave from then on
