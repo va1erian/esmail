@@ -13,7 +13,7 @@ use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SW_HIDE, SW_RESTORE, SW_
 
 use esmail_win32::core_glue::compose::Kind;
 use esmail_win32::core_glue::FolderRef;
-use esmail_win32::core_glue::resident::tray_tooltip;
+use esmail_win32::core_glue::resident::{account_index, tray_tooltip};
 
 use super::instance::Launch;
 use super::{App, Msg};
@@ -93,7 +93,7 @@ impl App {
             }
             Launch::OpenAccount(id) => {
                 self.show_window(ui);
-                match self.core.accounts().iter().position(|account| account.id == id) {
+                match account_index(self.core.accounts(), &id) {
                     Some(account) => self.open_folder(ui, FolderRef { account, mailbox: "INBOX".to_string() }),
                     None => log::warn!("a toast named the unknown account {id}"),
                 }

@@ -7,11 +7,19 @@
 use std::io;
 use std::path::Path;
 
+use esmail::config::AccountConfig;
+
 const COMPOSE_REQUEST: &str = "compose.request";
 
 /// The tray icon's tooltip for `unread` unread messages over all accounts.
 pub fn tray_tooltip(unread: u32) -> String {
     if unread == 0 { "esMail".to_string() } else { format!("esMail \u{2014} {unread} unread") }
+}
+
+/// The index of the account a clicked toast names, in the order the core was
+/// started with. `None` when the account has since been removed.
+pub fn account_index(accounts: &[AccountConfig], id: &str) -> Option<usize> {
+    accounts.iter().position(|account| account.id == id)
 }
 
 /// Leaves a request in `dir` for the running instance to open a new message.
@@ -44,6 +52,17 @@ mod tests {
     fn the_tooltip_shows_the_unread_total_only_when_there_is_one() {
         assert_eq!(tray_tooltip(0), "esMail");
         assert_eq!(tray_tooltip(12), "esMail \u{2014} 12 unread");
+    }
+
+    #[test]
+    fn a_clicked_toast_finds_its_account_unless_it_was_removed() {
+        let mut work = AccountConfig::new("Work".into(), "imap.work.example".into(), 993, "me@work.example".into());
+        work.id = "work".into();
+        let mut home = work.clone();
+        home.id = "home".into();
+        let accounts = [work, home];
+        assert_eq!(account_index(&accounts, "home"), Some(1));
+        assert_eq!(account_index(&accounts, "gone"), None);
     }
 
     #[test]
