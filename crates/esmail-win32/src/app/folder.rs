@@ -61,7 +61,7 @@ impl App {
         let sent = self.core.send(folder.account, ImapCommand::FetchHeaders { mailbox: folder.mailbox, page: request.page, req_id: request.id });
         if !sent {
             open.page_failed();
-            self.banner("this account is not connected");
+            self.account_unavailable(folder.account);
         }
     }
 
@@ -82,7 +82,7 @@ impl App {
         let Some(id) = open.refresh_request() else { return false };
         let folder = open.folder().clone();
         if !self.core.send(folder.account, ImapCommand::FetchHeaders { mailbox: folder.mailbox, page: 1, req_id: id }) {
-            self.banner("this account is not connected");
+            self.account_unavailable(folder.account);
         }
         true
     }

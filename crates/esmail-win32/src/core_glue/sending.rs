@@ -64,7 +64,7 @@ pub fn smtp_account(account: &AccountConfig, imap_auth: Option<&Auth>) -> Result
             Some(password) => Auth::Password(password),
             None => match std::env::var(PASSWORD_FALLBACK_VAR) {
                 Ok(password) if !password.is_empty() => Auth::password(password),
-                _ => return Err(format!("{} has no saved SMTP password; connect once in the egui esMail first.", account.display_name)),
+                _ => return Err(format!("{} has no saved SMTP password; reconnect it under File > Accounts.", account.display_name)),
             },
         },
     };

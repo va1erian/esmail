@@ -63,7 +63,7 @@ impl App {
     pub(super) fn store_flags(&mut self, folder: FolderRef, uid: u32, add: Vec<String>, remove: Vec<String>) {
         let req_id = self.action_ids.begin();
         if !self.core.send(folder.account, ImapCommand::StoreFlags { mailbox: folder.mailbox, uid, add, remove, req_id }) {
-            self.banner("this account is not connected");
+            self.account_unavailable(folder.account);
         }
     }
 
@@ -86,7 +86,7 @@ impl App {
             let req_id = self.action_ids.begin();
             let command = ImapCommand::MoveMessage { mailbox: folder.mailbox, uid: header.uid, dest, req_id };
             if !self.core.send(folder.account, command) {
-                self.banner("this account is not connected");
+                self.account_unavailable(folder.account);
                 return;
             }
         }
