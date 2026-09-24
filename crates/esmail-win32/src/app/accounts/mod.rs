@@ -60,6 +60,11 @@ impl Accounts {
         self.status = vec![Status::Connecting; accounts];
     }
 
+    /// For each account, why it cannot sign in, if it cannot.
+    pub fn failures(&self) -> Vec<Option<String>> {
+        self.status.iter().map(|status| status.failure().map(str::to_string)).collect()
+    }
+
     /// Tells whichever account windows are open which theme to wear.
     pub fn set_theme(&self, theme: Theme, follow_system: bool) {
         if let Some(form) = &self.form {
