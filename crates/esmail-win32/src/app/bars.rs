@@ -9,6 +9,9 @@
 use esmail::imap::MailHeader;
 use win32ui::prelude::*;
 
+use esmail::oauth::now_unix;
+use esmail_win32::core_glue::{Notice, account_notice, button_name};
+
 use super::reader_bar::{ReaderState, RemoteState};
 use super::toolbar::ActionState;
 use super::{App, Msg};
@@ -33,14 +36,19 @@ impl App {
         } else if self.remote_images {
             RemoteState::Allowed
         } else {
-            RemoteState::Blocked { sender: header.sender_name(), trustable: header.sender_address().is_some() }
+            RemoteState::Blocked { sender: button_name(&header.sender_name()), trustable: header.sender_address().is_some() }
         }
+    }
+
+    /// The account that needs signing in again, if any.
+    pub(super) fn attention(&self) -> Option<Notice> {
+        account_notice(&self.config.accounts, &self.accounts.failures(), now_unix())
     }
 
     /// Pushes the derived state into both bars.
     pub(super) fn sync_bars(&self, ui: &Ui<Msg>) {
         let actions = self.action_state();
         self.toolbar.set_state(actions);
-        self.reader_bar.update(ui, ReaderState { actions, remote: self.remote_state() });
+        self.reader_bar.update(ui, ReaderState { actions, remote: self.remote_state(), notice: self.attention() });
     }
 }
