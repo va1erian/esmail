@@ -5,14 +5,19 @@
 //! path a real scrollbar click or wheel notch takes (not a back-door call into
 //! `MessageList`). It measures the time from the input being handled to the
 //! next `paint_d2d` beginning, plus the paint's own layout/draw split.
+//!
+//! The input cycle walks down, jumps to the top through `SB_THUMBTRACK`, then
+//! overscrolls further up (wheel-up, `SB_LINEUP`, `SB_PAGEUP`, `SB_TOP`). Every
+//! input must leave at least one row painted; [`report`] asserts that and prints
+//! the minimum rows per input kind (#116).
 
 use std::time::Instant;
 
 use win32ui::Hwnd;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    SendMessageW, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBTRACK, WM_MOUSEWHEEL,
-    WM_VSCROLL,
+    SendMessageW, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBTRACK, SB_TOP,
+    WM_MOUSEWHEEL, WM_VSCROLL,
 };
 
 /// How many inputs the bench sends before summarising and exiting.
@@ -28,8 +33,10 @@ pub(crate) enum ScrollKind {
     LineDown,
     PageDown,
     ThumbTrack,
+    WheelUp,
     LineUp,
     PageUp,
+    Top,
 }
 
 impl ScrollKind {
@@ -39,8 +46,10 @@ impl ScrollKind {
             ScrollKind::LineDown => "line-down",
             ScrollKind::PageDown => "page-down",
             ScrollKind::ThumbTrack => "thumb-track",
+            ScrollKind::WheelUp => "wheel-up",
             ScrollKind::LineUp => "line-up",
             ScrollKind::PageUp => "page-up",
+            ScrollKind::Top => "top",
         }
     }
 
@@ -49,9 +58,14 @@ impl ScrollKind {
             ScrollKind::WheelDown => ScrollKind::LineDown,
             ScrollKind::LineDown => ScrollKind::PageDown,
             ScrollKind::PageDown => ScrollKind::ThumbTrack,
-            ScrollKind::ThumbTrack => ScrollKind::LineUp,
+            // `ThumbTrack` reads a track position of 0, so the next four inputs
+            // all land at the top and overscroll past it: the case the
+            // blank-viewport bug showed up in.
+            ScrollKind::ThumbTrack => ScrollKind::WheelUp,
+            ScrollKind::WheelUp => ScrollKind::LineUp,
             ScrollKind::LineUp => ScrollKind::PageUp,
-            ScrollKind::PageUp => ScrollKind::WheelDown,
+            ScrollKind::PageUp => ScrollKind::Top,
+            ScrollKind::Top => ScrollKind::WheelDown,
         }
     }
 
@@ -60,6 +74,11 @@ impl ScrollKind {
         match self {
             ScrollKind::WheelDown => {
                 // A wheel notch down: negative `WHEEL_DELTA` in the high word.
+                let wparam = ((-NOTCH) as u16 as usize) << 16;
+                send(hwnd, WM_MOUSEWHEEL, WPARAM(wparam), 0);
+            }
+            ScrollKind::WheelUp => {
+                // A wheel notch up: positive `WHEEL_DELTA` in the high word.
                 let wparam = (NOTCH as u16 as usize) << 16;
                 send(hwnd, WM_MOUSEWHEEL, WPARAM(wparam), 0);
             }
@@ -72,6 +91,7 @@ impl ScrollKind {
             ScrollKind::ThumbTrack => vscroll(hwnd, SB_THUMBTRACK, 32_000),
             ScrollKind::LineUp => vscroll(hwnd, SB_LINEUP, 0),
             ScrollKind::PageUp => vscroll(hwnd, SB_PAGEUP, 0),
+            ScrollKind::Top => vscroll(hwnd, SB_TOP, 0),
         }
     }
 }
@@ -84,6 +104,8 @@ pub(crate) struct Sample {
     pub(crate) layout_us: f64,
     pub(crate) draw_us: f64,
     pub(crate) paint_us: f64,
+    /// How many rows the paint that followed this input drew.
+    pub(crate) rows: usize,
 }
 
 /// The bench driver, advanced once per tick from `app::App::tick`.
@@ -206,8 +228,10 @@ pub(crate) fn report(samples: &[Sample], paints: u64, started: Instant) {
         ScrollKind::LineDown,
         ScrollKind::PageDown,
         ScrollKind::ThumbTrack,
+        ScrollKind::WheelUp,
         ScrollKind::LineUp,
         ScrollKind::PageUp,
+        ScrollKind::Top,
     ] {
         let per: Vec<u128> = samples
             .iter()
@@ -217,13 +241,31 @@ pub(crate) fn report(samples: &[Sample], paints: u64, started: Instant) {
         if per.is_empty() {
             continue;
         }
+        let min_rows = samples
+            .iter()
+            .filter(|s| s.kind == kind)
+            .map(|s| s.rows)
+            .min()
+            .unwrap_or(0);
         eprintln!(
-            "  {:<11} n={:>3} p50={:>7.1}us p95={:>7.1}us max={:>7.1}us",
+            "  {:<11} n={:>3} p50={:>7.1}us p95={:>7.1}us max={:>7.1}us min-rows={}",
             kind.name(),
             per.len(),
             percentile(&per, 50) as f64 / 1_000.0,
             percentile(&per, 95) as f64 / 1_000.0,
             percentile(&per, 100) as f64 / 1_000.0,
+            min_rows,
+        );
+    }
+
+    // The acceptance condition for #116: every input must leave at least one
+    // row on screen. An empty viewport means the offset/translation pair the
+    // paint used was out of step with the model.
+    for sample in samples {
+        assert!(
+            sample.rows > 0,
+            "bench-scroll: input {:?} painted no rows (blank viewport)",
+            sample.kind,
         );
     }
 }

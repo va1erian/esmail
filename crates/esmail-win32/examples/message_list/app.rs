@@ -283,6 +283,7 @@ impl App {
                     layout_us: timing.phases.layout,
                     draw_us: timing.phases.draw,
                     paint_us: timing.paint_micros,
+                    rows: timing.last_rows,
                 });
                 bench.paints += 1;
                 bench.pending = None;
