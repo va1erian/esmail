@@ -128,6 +128,8 @@ struct App {
     open: Option<OpenFolder>,
     /// The folder to open at start (`--folder`), else the inbox.
     wanted_folder: Option<String>,
+    /// The account whose folder opens at start (`--account`).
+    wanted_account: usize,
     bodies: BodyLoads<message::BodyKey>,
     /// The message whose body is (being) shown, and the folder it is in (a
     /// search result can come from any folder).
@@ -221,12 +223,10 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
     let status = StatusBar::new(ui).expect("status bar");
     status.set_parts(&[-1]);
 
-    ui.set_menu_bar(chrome::menu_bar(args.theme, false, false));
-    ui.accelerator(Shortcut::key(Key::F5), || Some(Msg::Refresh));
+    ui.set_menu_bar(chrome::menu_bar(args.theme, false, args.remote_images));
     ui.accelerator(Shortcut::ctrl(Key::F), || Some(Msg::SearchFocus));
     ui.accelerator(Shortcut::key(Key::ESCAPE), || Some(Msg::SearchClear));
     ui.accelerator(Shortcut::key(Key::RETURN), || Some(Msg::Enter));
-    ui.accelerator(Shortcut::ctrl(Key::Q), || Some(Msg::Quit));
     ui.on_close(|| Some(Msg::Close));
     ui.on_timer(|id| Some(Msg::Timer(id)));
     let capture = args.screenshot.clone().map(|path| (ui.set_timer(50).expect("screenshot timer"), Capture::new(path)));
@@ -246,6 +246,7 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         original_colours: false,
         open: None,
         wanted_folder: args.folder.clone(),
+        wanted_account: args.account,
         bodies: BodyLoads::default(),
         selected: None,
         selected_in: None,
@@ -258,7 +259,7 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         window_path,
         startup: Startup::new(began),
         composes: Composes::default(),
-        remote_images: false,
+        remote_images: args.remote_images,
         theme_poll: None,
         outbox_poll: ui.set_timer(composes::OUTBOX_POLL_MILLIS).ok(),
         acrylic: args.acrylic,
@@ -266,6 +267,7 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         start_compose: args.compose,
     };
     app.layout(ui);
+    app.reader.set_remote_images(args.remote_images);
     ui.follow_system_theme(args.theme == ThemeChoice::System);
     if args.theme == ThemeChoice::System {
         app.theme_poll = ui.set_timer(theme::POLL_MILLIS).ok();
@@ -359,7 +361,7 @@ impl App {
         ui.set_layout(column![panes, self.status].margins(below_strip));
     }
 
-    /// Opens the wanted folder of the first account straight away, and asks the
+    /// Opens the wanted folder of the wanted account straight away, and asks the
     /// cache which folders exist: both show what the last run cached while the
     /// IMAP session is still connecting.
     fn open_from_cache(&mut self, ui: &Ui<Msg>) {
@@ -368,7 +370,7 @@ impl App {
         }
         if !self.core.accounts().is_empty() {
             let mailbox = self.wanted_folder.clone().unwrap_or_else(|| "INBOX".to_string());
-            self.open_folder(ui, FolderRef { account: 0, mailbox });
+            self.open_folder(ui, FolderRef { account: self.wanted_account.min(self.core.accounts().len() - 1), mailbox });
         }
     }
 

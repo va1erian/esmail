@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use esmail_win32::core_glue::compose::Kind;
 
 const USAGE: &str = "usage: esmail-win32 [--theme light|dark|system] [--profile NAME] \
-[--screenshot OUT.png] [--select ROW] [--folder NAME] \n[--compose new|reply|reply-all|forward] [--acrylic]";
+[--screenshot OUT.png] [--select ROW] [--folder NAME] \n[--compose new|reply|reply-all|forward] [--acrylic] [--account N] [--remote-images]";
 
 /// How the window is themed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +26,8 @@ pub struct Args {
     pub screenshot: Option<PathBuf>,
     /// Open this folder instead of the first account's inbox.
     pub folder: Option<String>,
+    /// Open the folder of this account (0-based) instead of the first one's.
+    pub account: usize,
     /// Select this list row once the folder loads (for screenshots).
     pub select: Option<usize>,
     /// Open a compose window of this kind once the folder (and the message chosen
@@ -34,6 +36,8 @@ pub struct Args {
     /// `--acrylic`: an acrylic extended title strip with the menu on it (off by
     /// default).
     pub acrylic: bool,
+    /// `--remote-images`: start with View > Load remote images on.
+    pub remote_images: bool,
 }
 
 impl Args {
@@ -43,7 +47,7 @@ impl Args {
     }
 
     fn parse_from(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
-        let mut parsed = Args { theme: ThemeChoice::System, profile: None, screenshot: None, folder: None, select: None, compose: None, acrylic: false };
+        let mut parsed = Args { theme: ThemeChoice::System, profile: None, screenshot: None, folder: None, account: 0, select: None, compose: None, acrylic: false, remote_images: false };
         while let Some(flag) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
             match flag.as_str() {
@@ -58,8 +62,11 @@ impl Args {
                 "--profile" => parsed.profile = Some(value()?),
                 "--screenshot" => parsed.screenshot = Some(PathBuf::from(value()?)),
                 "--folder" => parsed.folder = Some(value()?),
+                "--account" => parsed.account = value()?.parse().map_err(|_| format!("--account needs an account number
+{USAGE}"))?,
                 "--select" => parsed.select = Some(value()?.parse().map_err(|_| format!("--select needs a row number\n{USAGE}"))?),
                 "--acrylic" => parsed.acrylic = true,
+                "--remote-images" => parsed.remote_images = true,
                 "--compose" => {
                     parsed.compose = Some(match value()?.as_str() {
                         "new" => Kind::New,
@@ -99,6 +106,7 @@ mod tests {
         assert_eq!(args.profile.as_deref(), Some("mock"));
         assert_eq!(args.screenshot, Some(PathBuf::from("a.png")));
         assert_eq!((args.folder.as_deref(), args.select), (Some("INBOX"), Some(2)));
+        assert_eq!(parse(&["--account", "1"]).unwrap().account, 1);
     }
 
     #[test]
