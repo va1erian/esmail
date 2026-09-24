@@ -52,3 +52,10 @@ pub fn menu_bar(current: ThemeChoice, original_colours: bool, remote_images: boo
         .checked_item("Load remote &images", None, remote_images, move || Msg::RemoteImages(!remote_images));
     Menu::new().submenu("&File", file).submenu("&Message", message_menu()).submenu("&View", view)
 }
+
+/// `--acrylic`: the window's title strip is an extended acrylic one that carries
+/// the menu, as in Windows Terminal. Falls back to the normal frame by itself
+/// where the material is unavailable.
+pub fn acrylic(spec: WindowSpec, on: bool) -> WindowSpec {
+    if on { spec.backdrop(Backdrop::Acrylic).title_bar(TitleBar::Extended).menu_in_strip(true) } else { spec }
+}

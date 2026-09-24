@@ -153,6 +153,8 @@ struct App {
     theme_poll: Option<TimerId>,
     /// Asks the outbox for messages due another send attempt.
     outbox_poll: Option<TimerId>,
+    /// `--acrylic`: compose windows get the same look.
+    acrylic: bool,
     /// Accounts whose tree node was opened once their folders arrived.
     opened_accounts: std::collections::HashSet<usize>,
     /// `--compose`: the window to open once the folder (and the selected message) is up.
@@ -177,7 +179,8 @@ pub(crate) fn main() {
     };
 
     let theme = chrome::theme(args.theme);
-    let result = win32ui::run_app(WindowSpec::new("esMail").size(dip(1200.0), dip(760.0)).theme(theme), |ui| {
+    let spec = chrome::acrylic(WindowSpec::new("esMail").size(dip(1200.0), dip(760.0)).theme(theme), args.acrylic);
+    let result = win32ui::run_app(spec, |ui| {
         build(ui, &args, &config, began)
     });
     if let Err(error) = result {
@@ -262,6 +265,7 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         remote_images: false,
         theme_poll: None,
         outbox_poll: ui.set_timer(composes::OUTBOX_POLL_MILLIS).ok(),
+        acrylic: args.acrylic,
         opened_accounts: Default::default(),
         start_compose: args.compose,
     };
@@ -350,13 +354,13 @@ impl App {
             .position(dip(self.window.list_width.unwrap_or(DEFAULT_LIST_WIDTH)))
             .min(dip(280.0), dip(320.0))
             .on_moved(|width| Some(Msg::ListMoved(width.value())));
-        ui.set_layout(column![
-            split_row![self.tree, list_and_reader]
-                .position(dip(self.window.folders_width.unwrap_or(DEFAULT_FOLDERS_WIDTH)))
-                .min(dip(140.0), dip(600.0))
-                .on_moved(|width| Some(Msg::FoldersMoved(width.value()))),
-            self.status,
-        ]);
+        let panes = split_row![self.tree, list_and_reader]
+            .position(dip(self.window.folders_width.unwrap_or(DEFAULT_FOLDERS_WIDTH)))
+            .min(dip(140.0), dip(600.0))
+            .on_moved(|width| Some(Msg::FoldersMoved(width.value())));
+        // An extended (acrylic) title strip is not part of the frame: start below it.
+        let below_strip = Insets::new(dip(0.0), ui.title_bar_height(), dip(0.0), dip(0.0));
+        ui.set_layout(column![panes, self.status].margins(below_strip));
     }
 
     /// Opens the wanted folder of the first account straight away, and asks the
@@ -414,8 +418,10 @@ impl App {
     /// `--compose`: opens that window as soon as its message is on screen.
     fn open_requested_compose(&mut self, ui: &Ui<Msg>) {
         let loaded = self.open.as_ref().is_some_and(|o| o.loaded() > 0);
-        let expects_message = self.select_after_load.is_some() || self.selected.is_some();
-        if let Some(kind) = self.start_compose.filter(|_| loaded && (!expects_message || self.message_shown)) {
+        let message_up = self.reader.current_message().is_some();
+        let waiting_for_message = self.select_after_load.is_some() || self.selected.is_some() && !self.message_shown;
+        let ready = |kind: Kind| loaded && if kind.needs_original() { message_up } else { !waiting_for_message };
+        if let Some(kind) = self.start_compose.filter(|kind| ready(*kind)) {
             self.start_compose = None;
             self.open_compose(ui, kind);
         }

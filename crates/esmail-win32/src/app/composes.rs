@@ -105,6 +105,7 @@ impl App {
             host: ui.proxy(),
             body_first,
             follow_system_theme: self.theme == super::args::ThemeChoice::System,
+            acrylic: self.acrylic,
         };
         match compose::open(ui, init) {
             Ok(window) => {
