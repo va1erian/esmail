@@ -29,6 +29,7 @@ mod message;
 mod notifications;
 mod placement;
 mod preferences;
+mod queue;
 mod reader;
 mod reader_bar;
 mod screenshot;
@@ -58,6 +59,7 @@ use setup::waker;
 pub(crate) use setup::main;
 use esmail_win32::core_glue::{Settings, ThemeChoice};
 use instance::Launch;
+use queue::{QueueKind, Queues};
 use tray::Tray;
 use message::SeenTimer;
 use reader::Reader;
@@ -128,6 +130,10 @@ enum Msg {
     FoldersMoved(f32),
     /// The divider between the list and the reading pane moved.
     ListMoved(f32),
+    /// File > Drafts... and File > Outbox...
+    ShowQueue(QueueKind),
+    /// A Drafts or Outbox window asks for something.
+    QueueRequest(QueueKind, queue::Request),
     /// File > Add account..., and the first-run form.
     AddAccount,
     /// File > Accounts...
@@ -208,6 +214,11 @@ struct App {
     opened_accounts: std::collections::HashSet<usize>,
     /// `--compose`: the window to open once the folder (and the selected message) is up.
     start_compose: Option<Kind>,
+    /// `--show`: the Drafts or Outbox window to open once the folder is up, and
+    /// whether one was opened and is still waiting for its rows.
+    start_queue: Option<QueueKind>,
+    queue_pending: bool,
+    queues: Queues,
     /// The saved View choices, and the file that keeps them (none for
     /// `--screenshot` runs, which must not change it).
     settings: Settings,
@@ -235,9 +246,10 @@ impl win32ui::App for App {
         let sync_bars = !matches!(&msg, Msg::Frame);
         match msg {
             Msg::Wake => {
-                self.drain();
+                self.drain(ui);
                 self.sync_unread(ui);
                 self.open_requested_compose(ui);
+                self.open_requested_queue(ui);
             }
             Msg::Frame => self.reader.invalidate(),
             Msg::Folder(id) => {
@@ -285,6 +297,8 @@ impl win32ui::App for App {
             Msg::Export => self.export_selected(),
             Msg::FoldersMoved(width) => self.window.folders_width = Some(width),
             Msg::ListMoved(width) => self.window.list_width = Some(width),
+            Msg::ShowQueue(kind) => self.show_queue(ui, kind),
+            Msg::QueueRequest(kind, request) => self.queue_request(ui, kind, request),
             Msg::AddAccount => self.add_account(ui),
             Msg::ManageAccounts => self.manage_accounts(ui),
             Msg::AccountRequest(request) => self.form_request(ui, request),
@@ -390,14 +404,25 @@ impl App {
         }
     }
 
+    /// `--show`: opens that window as soon as the folder is up.
+    fn open_requested_queue(&mut self, ui: &Ui<Msg>) {
+        let loaded = self.open.as_ref().is_some_and(|o| o.loaded() > 0);
+        if let Some(kind) = self.start_queue.filter(|_| loaded) {
+            self.start_queue = None;
+            self.queue_pending = true;
+            self.show_queue(ui, kind);
+        }
+    }
+
     /// Screenshot mode: check whether the window is ready to capture.
     fn tick(&mut self, ui: &mut Ui<Msg>) {
         let message_ready = self.message_shown && self.reader.is_ready();
         let loaded = self.open.as_ref().is_some_and(|o| o.loaded() > 0);
         let expects_message = self.select_after_load.is_some() || self.selected.is_some();
         let ready = loaded && (!expects_message || message_ready);
-        let composed = self.start_compose.is_none();
+        let composed = self.start_compose.is_none() && self.start_queue.is_none() && !self.queue_pending;
         let compose_window = self.composes.any_window().cloned();
+        let queue_window = self.queues.any_window().cloned();
         let Some((_, capture)) = self.capture.as_mut() else { return };
         match capture.step(ui, ready && composed) {
             Step::Wait => {}
@@ -407,7 +432,8 @@ impl App {
             }
             Step::Capture => {
                 eprintln!("esmail-win32: {}", self.startup.report(self.list.first_content_paint()));
-                capture.finish(ui, compose_window.as_ref());
+                let secondary = compose_window.map(|window| ("compose", window.capture())).or_else(|| queue_window.map(|window| ("window", window.capture())));
+                capture.finish(ui, secondary);
             }
         }
     }

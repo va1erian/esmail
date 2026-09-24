@@ -18,6 +18,7 @@ use esmail_win32::core_glue::{Delivered, Deliveries, Failure};
 use win32ui::prelude::*;
 
 use super::compose::{self, ComposeMsg, Init, Request};
+use super::queue::QueueKind;
 use super::{App, Msg};
 
 /// Where a sent message is filed when the account names no Sent folder.
@@ -238,6 +239,7 @@ impl App {
         self.settle(id);
         self.composes.tell(id, ComposeMsg::Sent);
         self.set_status("Message sent");
+        self.refresh_queue(QueueKind::Outbox);
     }
 
     fn outcome_failed(&mut self, id: ComposeId, error: String) {
@@ -256,6 +258,7 @@ impl App {
         } else {
             self.banner(&format!("A message could not be sent and stays in the outbox for another try: {error}"));
         }
+        self.refresh_queue(QueueKind::Outbox);
     }
 }
 

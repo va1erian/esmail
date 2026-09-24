@@ -4,10 +4,9 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
 
-use win32ui::{Ui, WindowHandle};
+use win32ui::Ui;
 
 use super::Msg;
-use super::compose::ComposeMsg;
 
 /// Ticks (50 ms each) to keep waiting after the window looks ready, so the
 /// last paint lands before the capture.
@@ -56,18 +55,19 @@ impl Capture {
         }
     }
 
-    /// Where a compose window is captured: next to the main window's file, with
-    /// `-compose` before the extension.
-    fn compose_path(&self) -> PathBuf {
+    /// Where a secondary window is captured: next to the main window's file,
+    /// with `-compose` or `-window` before the extension.
+    fn secondary_path(&self, kind: &str) -> PathBuf {
         let stem = self.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        self.path.with_file_name(format!("{stem}-compose.png"))
+        self.path.with_file_name(format!("{stem}-{kind}.png"))
     }
 
     /// Writes the PNG and quits (with a failure code if it could not).
-    pub fn finish(&self, ui: &mut Ui<Msg>, compose: Option<&WindowHandle<ComposeMsg>>) {
+    /// `secondary` is a compose or queue window's capture, with which of the two.
+    pub fn finish(&self, ui: &mut Ui<Msg>, secondary: Option<(&str, win32ui::Result<win32ui::RgbaImage>)>) {
         let result = ui.capture().map_err(|e| e.to_string()).and_then(|image| write_png(&image, &self.path).map_err(|e| e.to_string()));
-        let result = result.and_then(|()| match compose {
-            Some(window) => window.capture().map_err(|e| e.to_string()).and_then(|image| write_png(&image, &self.compose_path()).map_err(|e| e.to_string())),
+        let result = result.and_then(|()| match secondary {
+            Some((kind, image)) => image.map_err(|e| e.to_string()).and_then(|image| write_png(&image, &self.secondary_path(kind)).map_err(|e| e.to_string())),
             None => Ok(()),
         });
         match result {

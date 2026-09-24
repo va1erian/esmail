@@ -10,8 +10,8 @@
 
 use std::sync::mpsc as std_mpsc;
 
-use esmail::compose::ComposeId;
-use esmail::db::{CacheReader, DbActor, DbCommand, DbEvent, OutboxItem, SearchHit};
+use esmail::compose::{ComposeId, ComposeState};
+use esmail::db::{CacheReader, DbActor, DbCommand, DbEvent, DraftSummary, OutboxItem, SearchHit};
 use esmail::imap::MailHeader;
 use esmail::render::Attachment;
 use esmail::search_query::ParsedQuery;
@@ -62,6 +62,17 @@ pub enum CacheEvent {
     },
     /// The answer to [`Cache::due_outbox`]: messages to send again.
     OutboxDue(Vec<OutboxItem>),
+    /// The answer to [`Cache::list_drafts`], newest first.
+    Drafts(Vec<DraftSummary>),
+    /// The answer to [`Cache::list_outbox`], oldest first.
+    Outbox(Vec<OutboxItem>),
+    /// The answer to [`Cache::load_draft`].
+    DraftLoaded {
+        /// The `drafts` row, which the reopened window keeps saving into.
+        id: i64,
+        /// The message.
+        compose: ComposeState,
+    },
     /// A cache read or write failed. The cache only speeds things up, so the
     /// app reports this without stopping.
     Failed(String),
@@ -95,6 +106,9 @@ impl Cache {
                     DbEvent::DraftSaved { id, compose_id } => CacheEvent::DraftSaved { id, compose_id },
                     DbEvent::OutboxEnqueued { id, compose_id } => CacheEvent::OutboxEnqueued { id, compose_id },
                     DbEvent::OutboxDue { items } => CacheEvent::OutboxDue(items),
+                    DbEvent::DraftList { items } => CacheEvent::Drafts(items),
+                    DbEvent::OutboxList { items } => CacheEvent::Outbox(items),
+                    DbEvent::DraftLoaded { id, compose } => CacheEvent::DraftLoaded { id, compose },
                     DbEvent::Error(message) => CacheEvent::Failed(message),
                     _ => continue,
                 };

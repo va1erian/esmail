@@ -28,6 +28,7 @@ impl App {
         self.refresh_menu(ui);
         self.composes.set_theme(ui.theme(), following);
         self.accounts.set_theme(ui.theme(), following);
+        self.queues.set_theme(ui.theme(), following);
         if following {
             self.resume_theme_poll(ui);
         } else {

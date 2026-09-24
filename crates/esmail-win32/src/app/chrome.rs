@@ -3,6 +3,7 @@
 use win32ui::prelude::*;
 
 use super::Msg;
+use super::queue::QueueKind;
 use esmail_win32::core_glue::compose::Kind;
 
 use esmail_win32::core_glue::ThemeChoice;
@@ -50,6 +51,9 @@ pub fn menu_bar(view: ViewState) -> Menu<Msg> {
         .item("&New message", Shortcut::ctrl(Key::N), || Msg::Compose(Kind::New))
         .item("&Add account...", None, || Msg::AddAccount)
         .item("A&ccounts...", None, || Msg::ManageAccounts)
+        .separator()
+        .item("&Drafts...", None, || Msg::ShowQueue(QueueKind::Drafts))
+        .item("&Outbox...", None, || Msg::ShowQueue(QueueKind::Outbox))
         .separator()
         .item("&Refresh folder", Shortcut::key(Key::F5), || Msg::Refresh)
         .separator()
