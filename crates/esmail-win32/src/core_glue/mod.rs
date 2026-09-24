@@ -16,6 +16,7 @@
 
 mod cache;
 mod deliveries;
+pub mod files;
 mod folders;
 mod loads;
 pub mod mailbox;
