@@ -1321,6 +1321,7 @@ dependencies = [
  "esmail",
  "litehtml-view-d2d",
  "log",
+ "mail-mock-server",
  "opener",
  "png 0.17.16",
  "rfd",
