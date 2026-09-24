@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use esmail_win32::core_glue::compose::Kind;
 
 const USAGE: &str = "usage: esmail-win32 [--theme light|dark|system] [--profile NAME] \
-[--screenshot OUT.png] [--select ROW] [--folder NAME] \n[--compose new|reply|reply-all|forward]";
+[--screenshot OUT.png] [--select ROW] [--folder NAME] \n[--compose new|reply|reply-all|forward] [--acrylic]";
 
 /// How the window is themed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +31,9 @@ pub struct Args {
     /// Open a compose window of this kind once the folder (and the message chosen
     /// with `--select`) is up; screenshots then include it.
     pub compose: Option<Kind>,
+    /// `--acrylic`: an acrylic extended title strip with the menu on it (off by
+    /// default).
+    pub acrylic: bool,
 }
 
 impl Args {
@@ -40,7 +43,7 @@ impl Args {
     }
 
     fn parse_from(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
-        let mut parsed = Args { theme: ThemeChoice::System, profile: None, screenshot: None, folder: None, select: None, compose: None };
+        let mut parsed = Args { theme: ThemeChoice::System, profile: None, screenshot: None, folder: None, select: None, compose: None, acrylic: false };
         while let Some(flag) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
             match flag.as_str() {
@@ -56,6 +59,7 @@ impl Args {
                 "--screenshot" => parsed.screenshot = Some(PathBuf::from(value()?)),
                 "--folder" => parsed.folder = Some(value()?),
                 "--select" => parsed.select = Some(value()?.parse().map_err(|_| format!("--select needs a row number\n{USAGE}"))?),
+                "--acrylic" => parsed.acrylic = true,
                 "--compose" => {
                     parsed.compose = Some(match value()?.as_str() {
                         "new" => Kind::New,

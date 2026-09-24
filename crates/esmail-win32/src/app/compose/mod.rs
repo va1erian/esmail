@@ -17,7 +17,7 @@ use esmail::contacts::Contacts;
 use esmail_win32::core_glue::compose::{has_content, window_title};
 use win32ui::prelude::*;
 
-use super::Msg;
+use super::{Msg, chrome};
 use attachments::{FileRead, pick_and_read};
 use form::Form;
 use recipients::{Suggester, Typing, accept};
@@ -108,6 +108,8 @@ pub struct Init {
     /// Start in the text (a reply) rather than at the recipient.
     pub body_first: bool,
     pub follow_system_theme: bool,
+    /// `--acrylic`.
+    pub acrylic: bool,
 }
 
 /// What the user typed, for telling whether there is anything to save.
@@ -142,7 +144,7 @@ struct ComposeApp {
 /// Opens a compose window owned by `ui`'s window.
 pub fn open(ui: &Ui<Msg>, init: Init) -> win32ui::Result<WindowHandle<ComposeMsg>> {
     let title = window_title(&init.state.subject);
-    let spec = WindowSpec::new(title).size(dip(760.0), dip(640.0));
+    let spec = chrome::acrylic(WindowSpec::new(title).size(dip(760.0), dip(640.0)), init.acrylic);
     ui.open_window::<ComposeApp, _>(spec, move |ui| ComposeApp::new(ui, init))
 }
 

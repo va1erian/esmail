@@ -100,7 +100,7 @@ impl Form {
                     .height(dip(32.0)),
             ]
             .spacing(dip(6.0))
-            .margins(Insets::all(dip(12.0))),
+            .margins(Insets::new(dip(12.0), dip(12.0) + ui.title_bar_height(), dip(12.0), dip(12.0))),
         );
     }
 
