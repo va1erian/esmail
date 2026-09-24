@@ -268,6 +268,18 @@ impl App {
         self.refresh_manage_window();
     }
 
+    /// A command could not be sent because the account has no session: says why,
+    /// with the reconnect link when the account failed to sign in.
+    pub(in crate::app) fn account_unavailable(&mut self, account: usize) {
+        match self.accounts.status.as_slice().get(account) {
+            Some(Status::Failed(error)) => {
+                let error = error.clone();
+                self.account_failed(account, error);
+            }
+            _ => self.banner("this account is not connected"),
+        }
+    }
+
     fn refresh_manage_window(&self) {
         if let Some(manage) = &self.accounts.manage {
             let _ = manage.send(ManageMsg::Show(status::rows(&self.config.accounts, &self.accounts.status)));

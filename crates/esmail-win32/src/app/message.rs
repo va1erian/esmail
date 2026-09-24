@@ -81,7 +81,7 @@ impl App {
 
     fn fetch_body(&mut self, (account, mailbox, uid): BodyKey, req_id: u64) {
         if !self.core.send(account, ImapCommand::FetchBody { mailbox, uid, req_id }) {
-            self.banner("this account is not connected");
+            self.account_unavailable(account);
         }
     }
 

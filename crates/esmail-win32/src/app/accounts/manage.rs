@@ -90,8 +90,8 @@ impl ManageApp {
     fn new(ui: &mut Ui<ManageMsg>, init: Init) -> ManageApp {
         let list = ListView::new(ui)
             .expect("accounts list")
-            .column("Account", dip(190.0), |row: &AccountRow| row.name.as_str())
-            .column("Address", dip(200.0), |row: &AccountRow| row.address.as_str())
+            .column("Account", dip(150.0), |row: &AccountRow| row.name.as_str())
+            .column("Address", dip(170.0), |row: &AccountRow| row.address.as_str())
             .column("Sign in", dip(80.0), |row: &AccountRow| if row.google { "Google" } else { "Password" })
             .column("Status", Fill, |row: &AccountRow| row.status.as_str())
             .row_style(|row| if row.failed { RowStyle::new().text(FAILED) } else { RowStyle::new() })
