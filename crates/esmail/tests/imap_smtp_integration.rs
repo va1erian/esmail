@@ -62,7 +62,7 @@ async fn start_harness(inbox_count: u32) -> Harness {
 
     let (imap_cmd_tx, imap_cmd_rx) = mpsc::channel(32);
     let (imap_evt_tx, mut imap_evt_rx) = mpsc::channel(32);
-    ImapActor::spawn(imap_cmd_rx, imap_evt_tx);
+    ImapActor::spawn(&tokio::runtime::Handle::current(), imap_cmd_rx, imap_evt_tx);
 
     imap_cmd_tx
         .send(ImapCommand::Connect {
@@ -544,7 +544,7 @@ async fn send_via_smtp_then_see_it_over_imap() {
 
     let (smtp_cmd_tx, smtp_cmd_rx) = mpsc::channel(8);
     let (smtp_evt_tx, mut smtp_evt_rx) = mpsc::channel(8);
-    SmtpActor::spawn(smtp_cmd_rx, smtp_evt_tx);
+    SmtpActor::spawn(&tokio::runtime::Handle::current(), smtp_cmd_rx, smtp_evt_tx);
 
     let account = SmtpAccount {
         host: "127.0.0.1".to_string(),
@@ -588,7 +588,7 @@ async fn smtp_results_carry_the_id_of_the_compose_window_that_sent() {
 
     let (smtp_cmd_tx, smtp_cmd_rx) = mpsc::channel(8);
     let (smtp_evt_tx, mut smtp_evt_rx) = mpsc::channel(8);
-    SmtpActor::spawn(smtp_cmd_rx, smtp_evt_tx);
+    SmtpActor::spawn(&tokio::runtime::Handle::current(), smtp_cmd_rx, smtp_evt_tx);
 
     let account = |password: &str| SmtpAccount {
         host: "127.0.0.1".to_string(),
@@ -633,7 +633,7 @@ async fn append_saves_a_sent_copy_that_fetch_headers_can_then_see() {
 
     let (smtp_cmd_tx, smtp_cmd_rx) = mpsc::channel(8);
     let (smtp_evt_tx, mut smtp_evt_rx) = mpsc::channel(8);
-    SmtpActor::spawn(smtp_cmd_rx, smtp_evt_tx);
+    SmtpActor::spawn(&tokio::runtime::Handle::current(), smtp_cmd_rx, smtp_evt_tx);
 
     let account = SmtpAccount {
         host: "127.0.0.1".to_string(),
@@ -846,7 +846,7 @@ mod stress {
             async move {
                 let (cmd_tx, cmd_rx) = mpsc::channel(1);
                 let (evt_tx, mut evt_rx) = mpsc::channel(1);
-                SmtpActor::spawn(cmd_rx, evt_tx);
+                SmtpActor::spawn(&tokio::runtime::Handle::current(), cmd_rx, evt_tx);
                 let account = SmtpAccount {
                     host: "127.0.0.1".to_string(),
                     port: smtp_addr.port(),
@@ -883,7 +883,7 @@ mod stress {
         // count alone so a wrong delivery target would still be caught.
         let (imap_cmd_tx, imap_cmd_rx) = mpsc::channel(32);
         let (imap_evt_tx, mut imap_evt_rx) = mpsc::channel(32);
-        ImapActor::spawn(imap_cmd_rx, imap_evt_tx);
+        ImapActor::spawn(&tokio::runtime::Handle::current(), imap_cmd_rx, imap_evt_tx);
         imap_cmd_tx
             .send(ImapCommand::Connect {
                 host: "localhost".to_string(),

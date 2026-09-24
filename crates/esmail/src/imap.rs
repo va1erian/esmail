@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsStream;
@@ -564,6 +565,7 @@ pub struct ImapActor {
 
 impl ImapActor {
     pub fn spawn(
+        runtime: &Handle,
         cmd_rx: mpsc::Receiver<ImapCommand>,
         event_tx: mpsc::Sender<ImapEvent>,
     ) {
@@ -575,7 +577,7 @@ impl ImapActor {
             worker_tx: None,
         };
 
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             actor.run().await;
         });
     }

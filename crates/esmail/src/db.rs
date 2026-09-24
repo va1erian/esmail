@@ -12,6 +12,7 @@
 //! mailbox every time. See PLAN.md §B3 for why that part waited.
 
 use rusqlite::{params, Connection};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use crate::compose::{ComposeId, ComposeState};
 use crate::imap::MailHeader;
@@ -218,10 +219,11 @@ pub struct DbActor {
 
 impl DbActor {
     pub fn spawn(
+        runtime: &Handle,
         cmd_rx: mpsc::Receiver<DbCommand>,
         event_tx: mpsc::Sender<DbEvent>,
     ) {
-        tokio::task::spawn_blocking(move || {
+        runtime.spawn_blocking(move || {
             let conn = match open_cache() {
                 Ok(c) => c,
                 Err(e) => {

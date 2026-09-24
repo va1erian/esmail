@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use crate::auth::{self, Auth};
@@ -69,14 +70,22 @@ pub struct Watcher {
     events_tx: mpsc::Sender<AccountEvent>,
     events_rx: mpsc::Receiver<AccountEvent>,
     hooks: Hooks,
+    runtime: Handle,
 }
 
 impl Watcher {
-    /// A watcher with no accounts yet. `notify` is called with
-    /// `(account id, title, body)` for each batch of new mail.
-    pub fn new(notify: NotifyFn) -> Self {
+    /// A watcher with no accounts yet, whose sessions run on `runtime`.
+    /// `notify` is called with `(account id, title, body)` for each batch of
+    /// new mail.
+    pub fn new(runtime: Handle, notify: NotifyFn) -> Self {
         let (events_tx, events_rx) = mpsc::channel(64);
-        Self { accounts: BTreeMap::new(), events_tx, events_rx, hooks: Hooks { notify, repaint: Arc::new(|| {}) } }
+        Self {
+            accounts: BTreeMap::new(),
+            events_tx,
+            events_rx,
+            hooks: Hooks { notify, repaint: Arc::new(|| {}) },
+            runtime,
+        }
     }
 
     /// Make the watched accounts exactly `desired`: sessions for accounts that
@@ -101,6 +110,7 @@ impl Watcher {
         self.accounts.remove(&config.id);
         let watch_mailbox = config.watch_mailbox.clone().unwrap_or_else(|| DEFAULT_WATCH_MAILBOX.to_string());
         let session = AccountSession::spawn(
+            &self.runtime,
             SessionParams {
                 id: config.id.clone(),
                 label: config.display_name.clone(),
@@ -239,7 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_accounts_starts_and_stops_sessions() {
-        let mut watcher = Watcher::new(silent());
+        let mut watcher = Watcher::new(Handle::current(), silent());
         assert!(watcher.account_ids().is_empty());
 
         watcher.apply_accounts(vec![dead_account("a"), dead_account("b")]);
@@ -254,7 +264,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unchanged_account_keeps_its_session_and_a_changed_one_is_replaced() {
-        let mut watcher = Watcher::new(silent());
+        let mut watcher = Watcher::new(Handle::current(), silent());
         watcher.apply_accounts(vec![dead_account("a")]);
         // Pretend the session had got somewhere: a restart would reset it.
         watcher.accounts.get_mut("a").unwrap().state = AccountState::Connected;
@@ -270,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_server_is_reported_as_failed() {
-        let mut watcher = Watcher::new(silent());
+        let mut watcher = Watcher::new(Handle::current(), silent());
         watcher.apply_accounts(vec![dead_account("a")]);
         let change = tokio::time::timeout(Duration::from_secs(30), watcher.next_change())
             .await
@@ -287,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_of_a_removed_account_are_ignored() {
-        let mut watcher = Watcher::new(silent());
+        let mut watcher = Watcher::new(Handle::current(), silent());
         watcher.apply_accounts(vec![dead_account("a")]);
         watcher.apply_accounts(Vec::new());
         assert_eq!(watcher.handle("a".to_string(), ImapEvent::Connected), None);

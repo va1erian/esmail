@@ -132,11 +132,9 @@ impl EsMailApp {
     /// With `persist`, the account and credential are saved once it connects
     /// (see [`Self::persist_pending`]).
     pub(super) fn connect_account(&mut self, account: AccountConfig, auth: auth::Auth, persist: bool) {
-        self.accounts.retain(|v| v.id() != account.id);
-        self.status = format!("Connecting {}...", account.display_name);
+        self.core.status = format!("Connecting {}...", account.display_name);
         let pending = persist.then(|| (account.clone(), auth.clone()));
-        let view = spawn_account_view(&account, auth, pending, &self.imap_events_tx, &self.session_hooks);
-        self.accounts.push(view);
+        self.core.open_session(&account, auth, pending);
     }
 
     /// Reconnect a saved account from its saved credential.
@@ -144,7 +142,7 @@ impl EsMailApp {
         let Some(account) = self.config.accounts.iter().find(|a| a.id == account_id).cloned() else { return };
         match saved_auth(&self.config, &account) {
             Ok(auth) => self.connect_account(account, auth, false),
-            Err(reason) => self.push_banner(format!("{}: {reason}", account.display_name)),
+            Err(reason) => self.core.push_banner(format!("{}: {reason}", account.display_name)),
         }
     }
 
@@ -155,7 +153,7 @@ impl EsMailApp {
     pub(super) fn google_client_or_explain(&mut self) -> Option<oauth::OAuthClient> {
         let client = oauth::google_client(self.config.google_oauth.as_ref());
         if client.is_none() {
-            self.push_banner(
+            self.core.push_banner(
                 "Google sign-in needs an OAuth client id: enter it under Settings > Google, or \
                  set ESMAIL_GOOGLE_CLIENT_ID and ESMAIL_GOOGLE_CLIENT_SECRET. See the esmail README."
                     .to_string(),
@@ -171,7 +169,7 @@ impl EsMailApp {
     /// own local redirect port).
     pub(super) fn begin_google_sign_in(&mut self, account: AccountConfig) {
         if account.username.trim().is_empty() {
-            self.push_banner("Enter your Gmail address in the Username field first.".to_string());
+            self.core.push_banner("Enter your Gmail address in the Username field first.".to_string());
             return;
         }
         let Some(client) = self.google_client_or_explain() else { return };
@@ -180,9 +178,9 @@ impl EsMailApp {
         }
         let tx = self.oauth_tx.clone();
         let waker = Arc::clone(&self.waker);
-        self.status = format!("Waiting for Google sign-in of {} in your browser...", account.display_name);
+        self.core.status = format!("Waiting for Google sign-in of {} in your browser...", account.display_name);
         let id = account.id.clone();
-        let task = tokio::spawn(async move {
+        let task = self.core.runtime().spawn(async move {
             let message = match run_google_sign_in(&client, &account.username, &tx, &waker).await {
                 Ok(source) => OAuthMessage::Authorized { auth: auth::Auth::OAuth(source), account },
                 Err(e) => OAuthMessage::Failed { account_id: account.id.clone(), error: format!("{e:#}") },
@@ -206,7 +204,7 @@ impl EsMailApp {
     pub(super) fn cancel_google_sign_in(&mut self, account_id: &str) {
         if let Some(task) = self.oauth_tasks.remove(account_id) {
             task.abort();
-            self.status = "Ready".to_string();
+            self.core.status = "Ready".to_string();
         }
     }
 
@@ -214,7 +212,7 @@ impl EsMailApp {
         while let Ok(message) = self.oauth_rx.try_recv() {
             match message {
                 OAuthMessage::BrowserUnavailable { url } => {
-                    self.push_banner(format!("Could not open your browser. Open this address to sign in: {url}"));
+                    self.core.push_banner(format!("Could not open your browser. Open this address to sign in: {url}"));
                 }
                 OAuthMessage::Authorized { account, auth } => {
                     self.oauth_tasks.remove(&account.id);
@@ -224,9 +222,9 @@ impl EsMailApp {
                 }
                 OAuthMessage::Failed { account_id, error } => {
                     self.oauth_tasks.remove(&account_id);
-                    self.status = "Ready".to_string();
-                    let label = self.account_label(&account_id);
-                    self.push_banner(format!("Google sign-in for {label} failed: {error}"));
+                    self.core.status = "Ready".to_string();
+                    let label = self.core.account_label(&account_id);
+                    self.core.push_banner(format!("Google sign-in for {label} failed: {error}"));
                 }
             }
         }
@@ -236,10 +234,10 @@ impl EsMailApp {
     /// `config.toml` and its credential into the OS keyring -- so a wrong
     /// password is never saved, and nothing is saved on every click. What the
     /// connection that succeeded actually used decides what is stored. A
-    /// no-op for an account that came from the saved list.
-    pub(super) fn persist_pending(&mut self, account_id: &str) {
-        let Some((mut account, auth)) = self.view_mut(account_id).and_then(|v| v.pending_persist.take()) else {
-            return;
+    /// no-op (returning `false`) for an account that came from the saved list.
+    pub(super) fn persist_pending(&mut self, account_id: &str) -> bool {
+        let Some((mut account, auth)) = self.core.take_pending_persist(account_id) else {
+            return false;
         };
         match &auth {
             // No password anywhere: the refresh token is the credential, and
@@ -282,6 +280,7 @@ impl EsMailApp {
         if let Err(e) = self.config.save() {
             log::warn!("could not persist account config: {e}");
         }
+        true
     }
 
     /// Forget a saved account for good: stop its session if it has one
@@ -289,7 +288,7 @@ impl EsMailApp {
     /// delete its config entry and every keyring secret.
     pub(super) fn remove_account(&mut self, id: &str) {
         self.cancel_google_sign_in(id);
-        if self.view(id).is_some() {
+        if self.core.view(id).is_some() {
             self.disconnect_account(id);
         }
         for kind in ["imap", "smtp", "oauth"] {
@@ -297,10 +296,10 @@ impl EsMailApp {
         }
         // Its cached mail goes with it: otherwise it stays on disk and keeps
         // turning up in search across accounts.
-        let _ = self.db_tx.try_send(DbCommand::RemoveAccount { account_id: id.to_string() });
-        if self.search_origins.iter().any(|(account, _)| account == id) {
-            self.search_results = None;
-            self.search_origins.clear();
+        let _ = self.core.db_tx.try_send(DbCommand::RemoveAccount { account_id: id.to_string() });
+        if self.core.search_origins.iter().any(|(account, _)| account == id) {
+            self.core.search_results = None;
+            self.core.search_origins.clear();
         }
         self.config.remove_account(id);
         if let Err(e) = self.config.save() {
@@ -315,7 +314,7 @@ impl EsMailApp {
     /// first connection has not succeeded) or has no SMTP password on file.
     pub(super) fn smtp_account_for(&self, account_id: &str) -> Option<smtp::SmtpAccount> {
         let account = self.config.accounts.iter().find(|a| a.id == account_id)?;
-        let auth = match self.view(account_id).map(|v| &v.auth) {
+        let auth = match self.core.view(account_id).map(|v| &v.auth) {
             Some(auth) if auth.is_oauth() => auth.clone(),
             _ => auth::Auth::Password(secrets::get_password(account_id, "smtp")?),
         };

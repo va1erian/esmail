@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -101,15 +102,15 @@ impl AccountSession {
     /// connecting. Events come out on `ui_events`, tagged with this
     /// account's id; the connection outcome arrives there as
     /// [`ImapEvent::Connected`] or [`ImapEvent::Error`].
-    pub fn spawn(params: SessionParams, ui_events: mpsc::Sender<AccountEvent>, hooks: Hooks) -> Self {
+    pub fn spawn(runtime: &Handle, params: SessionParams, ui_events: mpsc::Sender<AccountEvent>, hooks: Hooks) -> Self {
         let SessionParams { id, label, host, port, username, auth, watch_mailbox } = params;
 
         let (imap_tx, imap_rx) = mpsc::channel(32);
         let (actor_tx, actor_rx) = mpsc::channel(32);
-        ImapActor::spawn(imap_rx, actor_tx);
+        ImapActor::spawn(runtime, imap_rx, actor_tx);
 
         let idle = IdleParams { host: host.clone(), port, username: username.clone(), auth: auth.clone() };
-        let forwarder = tokio::spawn(forward_and_watch(
+        let forwarder = runtime.spawn(forward_and_watch(
             id.clone(),
             label.clone(),
             watch_mailbox,

@@ -320,7 +320,7 @@ async fn oauth_setup(handed_out: &'static str) -> (mail_mock_server::RunningServ
 async fn imap_connect(server: &mail_mock_server::RunningServer, auth: Auth) -> (mpsc::Sender<ImapCommand>, mpsc::Receiver<ImapEvent>, ImapEvent) {
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let (evt_tx, mut evt_rx) = mpsc::channel(32);
-    ImapActor::spawn(cmd_rx, evt_tx);
+    ImapActor::spawn(&tokio::runtime::Handle::current(), cmd_rx, evt_tx);
     cmd_tx
         .send(ImapCommand::Connect {
             host: "localhost".to_string(),
@@ -379,7 +379,7 @@ async fn imap_surfaces_a_revoked_sign_in_instead_of_connecting() {
 async fn smtp_send(server: &mail_mock_server::RunningServer, auth: Auth) -> SmtpEvent {
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
     let (evt_tx, mut evt_rx) = mpsc::channel(8);
-    SmtpActor::spawn(cmd_rx, evt_tx);
+    SmtpActor::spawn(&tokio::runtime::Handle::current(), cmd_rx, evt_tx);
     let account = SmtpAccount {
         host: "127.0.0.1".to_string(),
         port: server.smtp_addr.port(),
@@ -506,7 +506,7 @@ async fn several_google_accounts_and_a_password_account_run_side_by_side() {
     let mut sessions = Vec::new();
     for (i, label) in labels.iter().enumerate() {
         let (user, server) = &servers[i];
-        sessions.push(AccountSession::spawn(
+        sessions.push(AccountSession::spawn(&tokio::runtime::Handle::current(),
             SessionParams {
                 id: format!("id-{label}"),
                 label: label.to_string(),

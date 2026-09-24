@@ -153,8 +153,8 @@ async fn each_account_is_notified_of_its_own_mail_and_only_its_own() {
     let b = server("bob@home.example", "pw-b").await;
     let (tx, hooks, seen) = wiring();
 
-    let _work = AccountSession::spawn(a.params("alice@work", "Work", a.password), tx.clone(), hooks.clone());
-    let _home = AccountSession::spawn(b.params("bob@home", "Home", b.password), tx, hooks);
+    let _work = AccountSession::spawn(&tokio::runtime::Handle::current(), a.params("alice@work", "Work", a.password), tx.clone(), hooks.clone());
+    let _home = AccountSession::spawn(&tokio::runtime::Handle::current(), b.params("bob@home", "Home", b.password), tx, hooks);
 
     // Both connect independently, and the first poll each session makes after
     // connecting has set its watermark: mail delivered from here on is new.
@@ -198,8 +198,8 @@ async fn a_bad_password_on_one_account_does_not_stop_the_other() {
     let b = server("bob@home.example", "pw-b").await;
     let (tx, hooks, seen) = wiring();
 
-    let _bad = AccountSession::spawn(a.params("alice@work", "Work", "not-the-password"), tx.clone(), hooks.clone());
-    let _good = AccountSession::spawn(b.params("bob@home", "Home", b.password), tx, hooks);
+    let _bad = AccountSession::spawn(&tokio::runtime::Handle::current(), a.params("alice@work", "Work", "not-the-password"), tx.clone(), hooks.clone());
+    let _good = AccountSession::spawn(&tokio::runtime::Handle::current(), b.params("bob@home", "Home", b.password), tx, hooks);
 
     seen.wait_for_event("alice@work", "Error").await;
     seen.wait_for_event("bob@home", "Connected").await;
@@ -218,8 +218,8 @@ async fn dropping_a_session_stops_its_watching_and_leaves_the_other_untouched() 
     let b = server("bob@home.example", "pw-b").await;
     let (tx, hooks, seen) = wiring();
 
-    let work = AccountSession::spawn(a.params("alice@work", "Work", a.password), tx.clone(), hooks.clone());
-    let _home = AccountSession::spawn(b.params("bob@home", "Home", b.password), tx, hooks);
+    let work = AccountSession::spawn(&tokio::runtime::Handle::current(), a.params("alice@work", "Work", a.password), tx.clone(), hooks.clone());
+    let _home = AccountSession::spawn(&tokio::runtime::Handle::current(), b.params("bob@home", "Home", b.password), tx, hooks);
     for account in ["alice@work", "bob@home"] {
         seen.wait_for_event(account, "Connected").await;
         seen.wait_for_event(account, "MailboxPolled").await;
@@ -268,7 +268,7 @@ async fn four_accounts_each_get_only_their_own_notifications() {
     for name in NAMES {
         let user: &'static str = Box::leak(format!("user@{}.example", name.to_lowercase()).into_boxed_str());
         let server = server(user, "pw").await;
-        sessions.push(AccountSession::spawn(
+        sessions.push(AccountSession::spawn(&tokio::runtime::Handle::current(),
             server.params(&format!("id-{name}"), name, "pw"),
             tx.clone(),
             hooks.clone(),

@@ -63,7 +63,7 @@ type Toasts = Arc<Mutex<Vec<(String, String)>>>;
 fn watcher() -> (Watcher, Toasts) {
     let toasts: Toasts = Arc::default();
     let sink = toasts.clone();
-    let watcher = Watcher::new(Arc::new(move |account, title, _body| {
+    let watcher = Watcher::new(tokio::runtime::Handle::current(), Arc::new(move |account, title, _body| {
         sink.lock().unwrap().push((account.to_string(), title.to_string()));
     }));
     (watcher, toasts)
