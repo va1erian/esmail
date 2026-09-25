@@ -149,8 +149,8 @@ impl MainBar {
                 ToolbarItem::new("Settings")
                     .id(id::SETTINGS)
                     .with_icon(ToolbarIcon::Settings)
-                    .tooltip("Manage accounts (File > Accounts...)")
-                    .on_click(|| Some(Msg::ManageAccounts)),
+                    .tooltip("Settings: Google sign-in and shortcuts (File > Settings...)")
+                    .on_click(|| Some(Msg::OpenSettings)),
             ],
         )?;
         Ok(MainBar { toolbar })

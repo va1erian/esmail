@@ -51,6 +51,7 @@ pub fn menu_bar(view: ViewState) -> Menu<Msg> {
         .item("&New message", Shortcut::ctrl(Key::N), || Msg::Compose(Kind::New))
         .item("&Add account...", None, || Msg::AddAccount)
         .item("A&ccounts...", None, || Msg::ManageAccounts)
+        .item("&Settings...", None, || Msg::OpenSettings)
         .separator()
         .item("&Drafts...", None, || Msg::ShowQueue(QueueKind::Drafts))
         .item("&Outbox...", None, || Msg::ShowQueue(QueueKind::Outbox))

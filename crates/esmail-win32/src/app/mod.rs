@@ -34,6 +34,7 @@ mod reader;
 mod reader_bar;
 mod screenshot;
 mod search;
+mod settings;
 mod setup;
 mod startup;
 mod theme;
@@ -67,6 +68,7 @@ use reader_bar::ReaderBar;
 use screenshot::{Capture, Step};
 use composes::Composes;
 use search::SearchState;
+use settings::{SettingsMsg, Request as SettingsRequest};
 use startup::Startup;
 use toolbar::MainBar;
 use tree::{FolderView, SharedFolders};
@@ -139,6 +141,10 @@ enum Msg {
     AddAccount,
     /// File > Accounts...
     ManageAccounts,
+    /// File > Settings..., and the Settings button.
+    OpenSettings,
+    /// The Settings window asks for something.
+    SettingsRequest(SettingsRequest),
     /// The account form asks for something.
     AccountRequest(FormRequest),
     /// The Accounts window asks for something.
@@ -220,6 +226,8 @@ struct App {
     start_queue: Option<QueueKind>,
     queue_pending: bool,
     queues: Queues,
+    /// The Settings window while it is open.
+    settings_window: Option<WindowHandle<SettingsMsg>>,
     /// The saved View choices, and the file that keeps them (none for
     /// `--screenshot` runs, which must not change it).
     settings: Settings,
@@ -305,6 +313,8 @@ impl win32ui::App for App {
             Msg::QueueRequest(kind, request) => self.queue_request(ui, kind, request),
             Msg::AddAccount => self.add_account(ui),
             Msg::ManageAccounts => self.manage_accounts(ui),
+            Msg::OpenSettings => self.open_settings(ui),
+            Msg::SettingsRequest(request) => self.settings_request(ui, request),
             Msg::AccountRequest(request) => self.form_request(ui, request),
             Msg::ManageRequest(request) => self.manage_request(ui, request),
             Msg::AccountOutcome(outcome) => self.account_outcome(ui, outcome),
@@ -427,6 +437,7 @@ impl App {
         let composed = self.start_compose.is_none() && self.start_queue.is_none() && !self.queue_pending;
         let compose_window = self.composes.any_window().cloned();
         let queue_window = self.queues.any_window().cloned();
+        let settings_window = self.settings_window.as_ref().filter(|window| window.is_alive()).cloned();
         let Some((_, capture)) = self.capture.as_mut() else { return };
         match capture.step(ui, ready && composed) {
             Step::Wait => {}
@@ -436,7 +447,10 @@ impl App {
             }
             Step::Capture => {
                 eprintln!("esmail-win32: {}", self.startup.report(self.list.first_content_paint()));
-                let secondary = compose_window.map(|window| ("compose", window.capture())).or_else(|| queue_window.map(|window| ("window", window.capture())));
+                let secondary = compose_window
+                    .map(|window| ("compose", window.capture()))
+                    .or_else(|| queue_window.map(|window| ("window", window.capture())))
+                    .or_else(|| settings_window.map(|window| ("settings", window.capture())));
                 capture.finish(ui, secondary);
             }
         }
