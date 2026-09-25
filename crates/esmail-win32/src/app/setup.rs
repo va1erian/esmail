@@ -175,6 +175,7 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         start_queue: args.show,
         queue_pending: false,
         queues: Queues::default(),
+        settings_window: None,
         settings,
         settings_path,
         tray,
@@ -199,6 +200,9 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
     }
     if args.accounts {
         ui.emit(Msg::ManageAccounts);
+    }
+    if args.settings {
+        ui.emit(Msg::OpenSettings);
     }
     for issue in issues {
         app.account_failed(issue.account, issue.message);
