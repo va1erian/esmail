@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use esmail::auth::Auth;
-use esmail::config::{AccountConfig, AuthKind, Config};
+use esmail::config::{AccountConfig, AuthKind, Config, OAuthClientConfig};
 use esmail::oauth::{self, OAuthClient, SignInExpired};
 use esmail::smtp::{self, SmtpAccount};
 use esmail::{imap, secrets};
@@ -27,10 +27,21 @@ const SECRET_KINDS: [&str; 3] = ["imap", "smtp", "oauth"];
 pub fn google_client_or_explain(config: &Config) -> Result<OAuthClient, String> {
     oauth::google_client(config.google_oauth.as_ref()).ok_or_else(|| {
         "Google sign-in needs an OAuth client id. Set ESMAIL_GOOGLE_CLIENT_ID and \
-         ESMAIL_GOOGLE_CLIENT_SECRET, or enter them under Settings > Google in the egui esMail. \
+         ESMAIL_GOOGLE_CLIENT_SECRET, or enter them under File > Settings.... \
          See the esMail README."
             .to_string()
     })
+}
+
+/// The `[google_oauth]` config entry for typed Settings fields: `None` when the
+/// id is blank (sign-in off), and no secret when the secret is blank.
+pub fn google_client_config(client_id: &str, client_secret: &str) -> Option<OAuthClientConfig> {
+    let id = client_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let secret = client_secret.trim();
+    Some(OAuthClientConfig { client_id: id.to_string(), client_secret: (!secret.is_empty()).then(|| secret.to_string()) })
 }
 
 /// Google credentials for `account`: the refresh token saved from an earlier
@@ -256,5 +267,19 @@ mod tests {
         let error = anyhow::Error::new(SignInExpired("Google revoked the token".into()));
         let text = explain(Server::Imap, &account(AuthKind::GoogleOAuth), &error);
         assert!(text.starts_with("Google sign-in has expired: Google revoked the token"), "{text}");
+    }
+
+    #[test]
+    fn a_blank_client_id_turns_google_sign_in_off() {
+        assert_eq!(google_client_config("  ", "secret"), None);
+        assert_eq!(google_client_config("", ""), None);
+    }
+
+    #[test]
+    fn a_typed_client_is_trimmed_and_keeps_a_blank_secret_unset() {
+        let client = google_client_config("  id.apps.googleusercontent.com  ", " ").unwrap();
+        assert_eq!(client, OAuthClientConfig { client_id: "id.apps.googleusercontent.com".into(), client_secret: None });
+        let with_secret = google_client_config("id", " s3cret ").unwrap();
+        assert_eq!(with_secret.client_secret.as_deref(), Some("s3cret"));
     }
 }

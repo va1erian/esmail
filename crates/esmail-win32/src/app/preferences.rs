@@ -2,11 +2,14 @@
 //! shows them.
 
 use esmail::imap::MailHeader;
-use esmail_win32::core_glue::{sender_trusted, set_sender_trusted};
+use esmail::oauth;
+use esmail_win32::core_glue::account_setup::google_client_config;
+use esmail_win32::core_glue::{ThemeChoice, sender_trusted, set_sender_trusted};
 use win32ui::prelude::*;
 
 use super::chrome::{self, ViewState};
-use super::{App, Msg};
+use super::settings::{self, Request, SettingsMsg};
+use super::{App, Msg, placement};
 
 impl App {
     /// Rebuilds the menu bar to show the current View choices.
@@ -66,5 +69,51 @@ impl App {
         self.settings.close_to_tray = on;
         self.save_settings();
         self.refresh_menu(ui);
+    }
+
+    /// File > Settings... and the Settings button: opens the window, or brings
+    /// the open one forward, with the saved Google OAuth client.
+    pub(super) fn open_settings(&mut self, ui: &Ui<Msg>) {
+        if let Some(window) = self.settings_window.as_ref().filter(|window| window.is_alive()) {
+            placement::bring_forward(window.hwnd());
+            return;
+        }
+        let saved = self.config.google_oauth.as_ref();
+        let init = settings::Init {
+            client_id: saved.map(|client| client.client_id.clone()).unwrap_or_default(),
+            client_secret: saved.and_then(|client| client.client_secret.clone()).unwrap_or_default(),
+            source: oauth::google_client_with_source(saved).map(|(_, source)| source),
+            host: ui.proxy(),
+            follow_system_theme: self.theme == ThemeChoice::System,
+            acrylic: self.acrylic,
+            editable: self.editable,
+        };
+        match settings::open(ui, init) {
+            Ok(window) => self.settings_window = Some(window),
+            Err(error) => self.banner(&format!("Could not open Settings: {error}")),
+        }
+    }
+
+    /// The Settings window asked for something.
+    pub(super) fn settings_request(&mut self, _ui: &Ui<Msg>, request: Request) {
+        match request {
+            Request::Save { client_id, client_secret } => {
+                self.config.google_oauth = google_client_config(&client_id, &client_secret);
+                if self.editable {
+                    self.config_saver.save(&self.config);
+                }
+                let configured = oauth::google_client(self.config.google_oauth.as_ref()).is_some();
+                let source = oauth::google_client_with_source(self.config.google_oauth.as_ref()).map(|(_, source)| source);
+                if let Some(window) = self.settings_window.as_ref().filter(|window| window.is_alive()) {
+                    let _ = window.send(SettingsMsg::Saved { configured, source });
+                }
+                self.set_status(if configured {
+                    "Google sign-in settings saved."
+                } else {
+                    "Google sign-in settings saved; no client id, so sign-in is off."
+                });
+            }
+            Request::Closed => self.settings_window = None,
+        }
     }
 }

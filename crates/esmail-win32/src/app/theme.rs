@@ -9,6 +9,7 @@
 use win32ui::prelude::*;
 
 use esmail_win32::core_glue::ThemeChoice;
+use super::settings::SettingsMsg;
 use super::{App, Msg, chrome};
 
 /// How often the followed system theme is compared with the reading pane.
@@ -28,6 +29,9 @@ impl App {
         self.composes.set_theme(ui.theme(), following);
         self.accounts.set_theme(ui.theme(), following);
         self.queues.set_theme(ui.theme(), following);
+        if let Some(window) = self.settings_window.as_ref().filter(|window| window.is_alive()) {
+            let _ = window.send(SettingsMsg::SetTheme(ui.theme(), following));
+        }
         if following {
             self.resume_theme_poll(ui);
         } else {
