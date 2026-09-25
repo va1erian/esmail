@@ -24,7 +24,8 @@ pub(super) struct MessageListWidget {
     pub(super) fonts: Fonts,
     pub(super) rows: RefCell<Arc<[RowModel]>>,
     pub(super) view: RefCell<ViewState>,
-    /// The window scale from device to independent pixels (dpi / 96).
+    /// The window scale from independent to device pixels (dpi / 96), refreshed
+    /// on every paint so a move to a monitor with another DPI is followed.
     scale: Cell<f32>,
     /// The viewport height in device-independent pixels, from the last paint.
     pub(super) viewport: Cell<f32>,
@@ -206,6 +207,7 @@ impl CustomWidget for MessageListWidget {
     fn paint_d2d(&self, canvas: &mut D2dCanvas<'_>, bounds: RectF, theme: &Theme) {
         let viewport = bounds.height();
         let row_height = self.fonts.row_height;
+        self.scale.set(canvas.scale());
         self.viewport.set(viewport);
         self.width.set(bounds.width());
         let started = Instant::now();
