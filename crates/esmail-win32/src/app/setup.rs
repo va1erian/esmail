@@ -153,7 +153,7 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         progress_bar,
         progress: None,
         theme: settings.theme,
-        original_colours: false,
+        original_colours: settings.original_colours,
         open: None,
         wanted_folder: args.folder.clone(),
         wanted_account: args.account,
@@ -190,6 +190,7 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
     app.layout(ui);
     app.refresh_menu(ui);
     app.reader.set_remote_images(app.remote_images);
+    app.reader.set_original_colours(app.original_colours);
     ui.follow_system_theme(app.theme == ThemeChoice::System);
     if app.theme == ThemeChoice::System {
         app.theme_poll = ui.set_timer(theme::POLL_MILLIS).ok();

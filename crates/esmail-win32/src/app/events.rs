@@ -2,7 +2,7 @@
 
 use esmail::imap::{ImapCommand, ImapEvent};
 use esmail::progress::{Progress, ProgressKind};
-use esmail_win32::core_glue::CacheEvent;
+use esmail_win32::core_glue::{CacheEvent, NodeId};
 
 use win32ui::prelude::*;
 
@@ -29,11 +29,49 @@ impl App {
     /// the first time its folders are known (after that it is the user's to fold).
     fn sync_tree(&mut self) {
         self.tree.refresh();
-        let folders = self.folders.borrow();
-        for (account, node) in folders.children(None).into_iter().enumerate() {
-            if folders.has_folders(account) && self.opened_accounts.insert(account) {
-                self.tree.expand(&node.id, true);
+        let accounts: Vec<(usize, NodeId, bool)> = {
+            let folders = self.folders.borrow();
+            folders.children(None).into_iter().enumerate().map(|(account, node)| (account, node.id, folders.has_folders(account))).collect()
+        };
+        for (account, id, has_folders) in accounts {
+            if has_folders && self.opened_accounts.insert(account) {
+                self.tree.expand(&id, true);
+                self.restore_folds(account);
             }
+        }
+    }
+
+    /// Re-applies the saved fold state the first time an account's folders are
+    /// known. Walks the rows in tree order so a node inside a collapsed parent
+    /// is left alone.
+    fn restore_folds(&self, account: usize) {
+        let Some(account_id) = self.config.accounts.as_slice().get(account).map(|account| account.id.as_str()) else { return };
+        let prefix = format!("{account_id}\t");
+        let collapsed: std::collections::HashSet<&str> = self.settings.collapsed_folders.iter().filter_map(|entry| entry.strip_prefix(&prefix)).collect();
+        let mut collapsed_ancestor: Option<usize> = None;
+        for (id, key, has_children, depth) in self.folders.borrow().rows_with_ids(account) {
+            if collapsed_ancestor.is_some_and(|blocked| depth > blocked) {
+                continue;
+            }
+            collapsed_ancestor = None;
+            if !has_children {
+                continue;
+            }
+            let expand = !collapsed.contains(key.as_str());
+            self.tree.expand(&id, expand);
+            if !expand {
+                collapsed_ancestor = Some(depth);
+            }
+        }
+    }
+
+    /// A folder node was folded or unfolded by the user: remember it, so the
+    /// next run opens the tree the same way.
+    pub(super) fn folder_toggled(&mut self, id: NodeId, expanded: bool) {
+        let Some((account, key)) = self.folders.borrow().row_key(id) else { return };
+        let Some(account_id) = self.config.accounts.as_slice().get(account).map(|account| account.id.clone()) else { return };
+        if self.settings.set_folder_collapsed(&account_id, &key, !expanded) {
+            self.save_settings();
         }
     }
 

@@ -64,6 +64,16 @@ impl App {
         }
     }
 
+    /// View > Original colours: show mail as authored even in the dark theme,
+    /// and remember the choice.
+    pub(super) fn set_original_colours(&mut self, ui: &Ui<Msg>, original: bool) {
+        self.original_colours = original;
+        self.settings.original_colours = original;
+        self.save_settings();
+        self.reader.set_original_colours(original);
+        self.refresh_menu(ui);
+    }
+
     /// View > Close to tray.
     pub(super) fn set_close_to_tray(&mut self, ui: &Ui<Msg>, on: bool) {
         self.settings.close_to_tray = on;
