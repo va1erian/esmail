@@ -53,6 +53,8 @@ pub fn menu_bar(view: ViewState) -> Menu<Msg> {
         .item("A&ccounts...", None, || Msg::ManageAccounts)
         .item("&Settings...", None, || Msg::OpenSettings)
         .separator()
+        .item("&Download All (This Mailbox)", None, || Msg::DownloadAll)
+        .separator()
         .item("&Drafts...", None, || Msg::ShowQueue(QueueKind::Drafts))
         .item("&Outbox...", None, || Msg::ShowQueue(QueueKind::Outbox))
         .separator()

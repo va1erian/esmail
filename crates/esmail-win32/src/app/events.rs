@@ -1,6 +1,7 @@
 //! What the accounts' IMAP sessions report, applied to the window.
 
 use esmail::imap::{ImapCommand, ImapEvent};
+use esmail::progress::{Progress, ProgressKind};
 use esmail_win32::core_glue::CacheEvent;
 
 use win32ui::prelude::*;
@@ -16,7 +17,7 @@ impl App {
             tree_changed |= self.handle_cache(ui, event);
         }
         for (account, event) in self.core.pump() {
-            tree_changed |= self.handle(account, event);
+            tree_changed |= self.handle(ui, account, event);
         }
         self.smtp_events();
         if tree_changed {
@@ -60,7 +61,7 @@ impl App {
     }
 
     /// Applies one event. Returns whether the folder tree needs syncing.
-    fn handle(&mut self, account: usize, event: ImapEvent) -> bool {
+    fn handle(&mut self, ui: &Ui<Msg>, account: usize, event: ImapEvent) -> bool {
         self.track_status(account, &event);
         match event {
             ImapEvent::Connected => {
@@ -74,6 +75,9 @@ impl App {
             ImapEvent::Error(error) => {
                 if let Some(open) = self.open.as_mut() {
                     open.page_failed();
+                }
+                if self.progress == Some(ProgressKind::Index) {
+                    self.clear_progress(ui);
                 }
                 self.banner(&error);
             }
@@ -115,9 +119,24 @@ impl App {
             }
             ImapEvent::Exported { path } => self.export_done(path),
             ImapEvent::ExportFailed { error } => self.export_failed(&error),
+            ImapEvent::Progress { kind, progress } => self.apply_progress(ui, kind, progress),
+            ImapEvent::MailData { mailbox, header, body, attachments } => {
+                self.core.cache().index_mail(account, &mailbox, header, body, attachments);
+            }
             _ => {}
         }
         false
+    }
+
+    /// A middle-to-long operation reported: show it, or, when indexing reached
+    /// the last message, hide the bar and say it finished.
+    fn apply_progress(&mut self, ui: &Ui<Msg>, kind: ProgressKind, progress: Progress) {
+        if super::progress::index_finished(kind, progress) {
+            self.clear_progress(ui);
+            self.set_status("Download complete");
+        } else {
+            self.set_progress(ui, kind, progress);
+        }
     }
 
     /// Asks for unread counts: of `only`, or of every folder of `account`. A
