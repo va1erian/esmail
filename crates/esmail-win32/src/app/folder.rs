@@ -69,6 +69,20 @@ impl App {
         }
     }
 
+    /// File > Download All (This Mailbox): fetches every message of the open
+    /// folder into the local cache, so search and reading work offline. Progress
+    /// arrives as `ImapEvent::Progress`; each message's body as `MailData`.
+    pub(super) fn download_all(&mut self) {
+        let Some(folder) = self.open.as_ref().map(|open| open.folder().clone()) else {
+            return self.set_status("Open a folder before downloading it.");
+        };
+        if self.core.send(folder.account, ImapCommand::BulkDownload { mailbox: folder.mailbox.clone() }) {
+            self.set_status(&format!("Downloading {}...", folder.mailbox));
+        } else {
+            self.account_unavailable(folder.account);
+        }
+    }
+
     /// Re-reads the newest page and every folder's unread count (F5). Falls
     /// back to opening the folder afresh when its first page never arrived.
     pub(super) fn refresh(&mut self, ui: &Ui<Msg>) {

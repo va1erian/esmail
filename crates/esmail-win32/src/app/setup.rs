@@ -123,6 +123,8 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
     let reader_bar = ReaderBar::new(ui).expect("reader action bar");
     let status = StatusBar::new(ui).expect("status bar");
     status.set_parts(&[-1]);
+    let progress_bar = ProgressBar::new(ui).expect("progress bar");
+    progress_bar.set_visible(false);
 
     ui.accelerator(Shortcut::ctrl(Key::F), || Some(Msg::SearchFocus));
     ui.accelerator(Shortcut::key(Key::ESCAPE), || Some(Msg::SearchClear));
@@ -148,6 +150,8 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         toolbar,
         reader_bar,
         status,
+        progress_bar,
+        progress: None,
         theme: settings.theme,
         original_colours: false,
         open: None,

@@ -29,6 +29,7 @@ mod message;
 mod notifications;
 mod placement;
 mod preferences;
+mod progress;
 mod queue;
 mod reader;
 mod reader_bar;
@@ -133,6 +134,8 @@ enum Msg {
     FoldersMoved(f32),
     /// The divider between the list and the reading pane moved.
     ListMoved(f32),
+    /// File > Download All (This Mailbox).
+    DownloadAll,
     /// File > Drafts... and File > Outbox...
     ShowQueue(QueueKind),
     /// A Drafts or Outbox window asks for something.
@@ -179,6 +182,10 @@ struct App {
     toolbar: MainBar,
     reader_bar: ReaderBar,
     status: StatusBar<Msg>,
+    /// The bar beside the status text, hidden until an operation reports.
+    progress_bar: ProgressBar,
+    /// The kind of operation on screen, if any.
+    progress: Option<esmail::progress::ProgressKind>,
     theme: ThemeChoice,
     original_colours: bool,
     /// The folder shown in the list, once one has been opened.
@@ -307,6 +314,7 @@ impl win32ui::App for App {
             Msg::SearchClear => self.clear_search(ui),
             Msg::CycleTheme => self.choose_theme(ui, self.theme.next()),
             Msg::Export => self.export_selected(),
+            Msg::DownloadAll => self.download_all(),
             Msg::FoldersMoved(width) => self.window.folders_width = Some(width),
             Msg::ListMoved(width) => self.window.list_width = Some(width),
             Msg::ShowQueue(kind) => self.show_queue(ui, kind),
@@ -347,10 +355,16 @@ impl App {
             .on_moved(|width| Some(Msg::FoldersMoved(width.value())));
         // An extended (acrylic) title strip is not part of the frame: start below it.
         let below_strip = Insets::new(dip(0.0), ui.title_bar_height(), dip(0.0), dip(0.0));
+        let status = Layout::row()
+            .spacing(dip(4.0))
+            .margins(Insets::symmetric(dip(4.0), dip(0.0)))
+            .item(self.progress_bar.width(dip(220.0)))
+            .item(self.status.fill(1))
+            .height(dip(22.0));
         let main = Layout::column()
             .item(self.toolbar.bar_layout(ui.dpi()))
             .item(panes)
-            .item(&self.status);
+            .item(status);
         ui.set_layout(main.margins(below_strip));
     }
 
