@@ -20,7 +20,6 @@ impl App {
         self.theme = choice;
         self.settings.theme = choice;
         self.save_settings();
-        self.toolbar.set_theme_label(choice);
         let following = choice == ThemeChoice::System;
         ui.follow_system_theme(following);
         ui.set_theme(chrome::theme(choice));
