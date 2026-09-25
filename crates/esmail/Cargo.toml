@@ -1,6 +1,6 @@
 [package]
 name = "esmail"
-description = "IMAP mail client with HTML rendering via an embedded litehtml webview."
+description = "The egui-free mail core behind the esMail frontends: IMAP/SMTP actors, the SQLite cache and HTML sanitizing."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -10,34 +10,8 @@ license.workspace = true
 name = "esmail"
 path = "src/lib.rs"
 
-[[bin]]
-name = "esmail"
-path = "src/main.rs"
-required-features = ["egui-frontend"]
-
-[features]
-# The GUI frontend's toolkit. On by default so `cargo build`/`cargo test` and
-# the shipped binary are unchanged; a non-egui consumer of the library (the
-# future esmail-win32 crate) turns default-features off and links none of
-# these. The library itself has no egui left after the emoji/screenshot/icons
-# split -- this only decides whether the binary and the egui deps exist.
-default = ["egui-frontend"]
-egui-frontend = [
-    "dep:egui-litehtml-webview",
-    "dep:eframe",
-    "dep:egui",
-    "dep:egui_glow",
-    "dep:winit",
-]
-
 [dependencies]
-egui-litehtml-webview = { path = "../egui-litehtml-webview", optional = true }
 ureq.workspace = true
-
-eframe = { workspace = true, optional = true }
-egui = { workspace = true, optional = true }
-egui_glow = { workspace = true, optional = true }
-winit = { workspace = true, optional = true }
 
 tokio.workspace = true
 tokio-native-tls.workspace = true
@@ -52,8 +26,6 @@ lettre.workspace = true
 ammonia.workspace = true
 cssparser.workspace = true
 base64.workspace = true
-rfd.workspace = true
-opener.workspace = true
 
 rusqlite.workspace = true
 keyring.workspace = true
@@ -65,7 +37,6 @@ anyhow.workspace = true
 serde.workspace = true
 url.workspace = true
 log.workspace = true
-env_logger.workspace = true
 image.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
@@ -111,8 +82,5 @@ keyring = { workspace = true, features = ["apple-native"] }
 
 [dev-dependencies]
 mail-mock-server = { path = "../mail-mock-server" }
-
-# `build.rs` only calls into this when targeting Windows; the crate itself is
-# plain Rust and builds everywhere.
-[build-dependencies]
-winresource.workspace = true
+# The `toast` example initializes logging.
+env_logger.workspace = true

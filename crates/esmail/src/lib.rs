@@ -1,10 +1,9 @@
-//! Library half of the `esmail` crate: `main.rs` (the binary) builds the
-//! eframe/egui app on top of these modules -- as the default `egui-frontend`
-//! feature, so a non-egui consumer can turn it off and link the library
-//! without egui. Split out as a library purely so
-//! `tests/imap_smtp_integration.rs` (an external test crate) can drive
-//! `ImapActor`/`SmtpActor` directly against `mail-mock-server` — nothing
-//! about the app's own structure or module boundaries changes.
+//! The esMail core: IMAP/SMTP actors, the SQLite cache, HTML sanitizing and
+//! the shared models, with **no UI toolkit**. The native Windows frontend
+//! (`crates/esmail-win32`) uses it today; the egui frontend lives in its own
+//! repository (`va1erian/esmail-egui`) and depends on this crate. The actors
+//! are also driven directly by `crates/esmail/tests` against
+//! `mail-mock-server`.
 
 pub mod app;
 pub mod auth;

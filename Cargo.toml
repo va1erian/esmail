@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/egui-litehtml-webview", "crates/litehtml-view-d2d", "crates/esmail", "crates/esmail-win32", "crates/mail-mock-server"]
+members = ["crates/litehtml-view-d2d", "crates/esmail", "crates/esmail-win32", "crates/mail-mock-server"]
 resolver = "3"
 
 [workspace.package]
@@ -9,17 +9,6 @@ publish = false
 license = "GPL-3.0-only"
 
 [workspace.dependencies]
-# GUI
-eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "links", "x11", "wayland"] }
-egui = "0.36.2"
-egui_glow = "0.36.2"
-# Enumerating monitors for off-screen window recovery (window_fit.rs). Must
-# match the winit eframe builds against so `Frame::winit_window()`'s handle
-# type is the same crate instance; it is already in the tree via eframe. No
-# default features, or it would pull winit's Wayland CSD backend on top of
-# eframe's own configuration.
-winit = { version = "0.30", default-features = false }
-
 # HTML/CSS rendering engine for message bodies (litehtml migration -- see
 # PLAN.md). JS-less by design: no legitimate mail client executes JS in HTML
 # email anyway, and having no JS engine is what keeps the binary small. `va1erian/litehtml-rs` carries a Windows/MSVC build
@@ -35,9 +24,9 @@ winit = { version = "0.30", default-features = false }
 # `href` off the laid-out document. Go back to `master` once it is merged.
 #
 # Deliberately without litehtml's `pixbuf` feature: that is its own tiny-skia +
-# cosmic-text rasterizer, which this workspace no longer uses (messages are
-# painted with egui's own painter -- see egui-litehtml-webview's painter.rs).
-# Leaving it out removes about 1.3 MiB from the release binary.
+# cosmic-text rasterizer, which this workspace does not use (the message body is
+# painted with Direct2D/DirectWrite by litehtml-view-d2d). Leaving it out keeps
+# the release binary smaller.
 litehtml = { git = "https://github.com/va1erian/litehtml-rs.git", branch = "element-tag-attr", features = ["email"] }
 
 # Async / IO
@@ -100,11 +89,9 @@ base64 = "0.22"
 # narrower than the formats attachments and inline images commonly use
 # (jpeg/gif too).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
-# Synchronous HTTP client. litehtml has no network layer of its own by
-# design (see the `litehtml` dependency above) -- this is what main.rs uses
-# to fetch a dev-only ESMAIL_PREVIEW=<http url> page, and what
-# MessageViewHandler uses to fetch a remote image once the user has opted
-# in via "Load remote images" (B5 in PLAN.md).
+# Synchronous HTTP client. The webviews fetch remote images with it once the
+# user has opted in via "Load remote images" (B5 in PLAN.md), and `oauth.rs`
+# posts to the token endpoint with it.
 ureq = "3"
 # OAuth2 sign-in (oauth.rs): PKCE needs a SHA-256 and OS randomness, and the
 # token endpoint answers in JSON. Deliberately small pieces rather than an
@@ -124,7 +111,8 @@ windows-registry = "0.6"
 interprocess = { version = "2.4", features = ["tokio"] }
 # UTF-16 strings for that security descriptor (an SDDL string). Windows-only.
 widestring = "1"
-# Embeds the application icon and version info in `esmail.exe` (`build.rs`).
+# Embeds the application icon, version info and manifest in `esmail-win32.exe`
+# (`crates/esmail-win32/build.rs`).
 winresource = "0.1"
 
 [profile.release]

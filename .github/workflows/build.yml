@@ -13,30 +13,9 @@ permissions:
   contents: read
 
 jobs:
-  build-linux:
-    name: Build Linux
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      # See ci.yml's build-linux job for why this list is short.
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev libdbus-1-dev
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build
-        run: cargo build --release
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: esmail-linux
-          path: target/release/esmail
-
+  # The Linux/macOS GUI lives in va1erian/esmail-egui now; this repository
+  # ships the native Windows frontend. The core library and its tests are still
+  # built on Linux by ci.yml.
   build-windows:
     name: Build Windows
     runs-on: windows-latest
@@ -47,7 +26,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release -p esmail-win32
         env:
           RUST_BACKTRACE: 1
 
@@ -55,7 +34,6 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path esmail-windows
-          Copy-Item "target/release/esmail.exe" -Destination "esmail-windows/"
           Copy-Item "target/release/esmail-win32.exe" -Destination "esmail-windows/"
           Get-ChildItem "target/release/*.dll" | Copy-Item -Destination "esmail-windows/" -ErrorAction SilentlyContinue
           Compress-Archive -Path "esmail-windows/*" -DestinationPath "esmail-windows.zip"
@@ -106,7 +84,6 @@ jobs:
           $setup = (Get-ChildItem dist\esmail-*-setup.exe).FullName
           $dir = Join-Path $env:RUNNER_TEMP 'esmail-installed'
           Start-Process -Wait -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', '/NORESTART', "/DIR=$dir"
-          if (-not (Test-Path "$dir\esmail.exe")) { throw 'installer did not install esmail.exe' }
           if (-not (Test-Path "$dir\esmail-win32.exe")) { throw 'installer did not install esmail-win32.exe' }
 
           $config = "$env:APPDATA\esmail\config"
@@ -119,7 +96,6 @@ jobs:
           # copying itself to %TEMP% and returning at once.
           Start-Process -Wait -FilePath "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/PURGE', "_?=$dir"
 
-          if (Test-Path "$dir\esmail.exe") { throw 'uninstall left esmail.exe behind' }
           if (Test-Path "$dir\esmail-win32.exe") { throw 'uninstall left esmail-win32.exe behind' }
           if (Test-Path "$env:APPDATA\esmail") { throw 'uninstall left the config directory behind' }
           if (Test-Path "$env:LOCALAPPDATA\esmail") { throw 'uninstall left the data directory behind' }
@@ -132,18 +108,12 @@ jobs:
 
   create-release:
     name: Create Release
-    needs: [build-linux, build-windows]
+    needs: [build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
     steps:
-      - name: Download Linux Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: esmail-linux
-          path: ./artifacts/linux
-          
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
         with:
@@ -160,7 +130,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ./artifacts/linux/esmail
             ./artifacts/windows/esmail-windows.zip
             ./artifacts/windows-installer/*.exe
         env:

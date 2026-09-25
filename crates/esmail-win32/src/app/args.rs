@@ -8,7 +8,7 @@ use esmail_win32::core_glue::compose::Kind;
 use super::queue::QueueKind;
 
 const USAGE: &str = "usage: esmail-win32 [--theme light|dark|system] [--profile NAME] \
-[--screenshot OUT.png] [--select ROW] [--folder NAME] \n[--compose new|reply|reply-all|forward] [--acrylic] [--account N] [--remote-images] [--accounts] [--settings] [--show drafts|outbox] [--quit]";
+[--screenshot OUT.png] [--select ROW] [--folder NAME] \n[--compose new|reply|reply-all|forward] [--acrylic] [--account N] [--remote-images] [--accounts] [--settings] [--show drafts|outbox] [--quit] [--purge-data]";
 
 /// What the flags asked for.
 #[derive(Debug)]
@@ -39,6 +39,9 @@ pub struct Args {
     pub settings: bool,
     /// `--quit`: ask a running instance (either frontend) to exit and stop.
     pub quit: bool,
+    /// `--purge-data`: remove esMail's per-user state and stop; the installer
+    /// runs this when the user asks to remove their data at uninstall.
+    pub purge_data: bool,
     /// `--show`: open the Drafts or Outbox window at start (for screenshots).
     pub show: Option<QueueKind>,
 }
@@ -50,7 +53,7 @@ impl Args {
     }
 
     fn parse_from(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
-        let mut parsed = Args { theme: None, profile: None, screenshot: None, folder: None, account: 0, select: None, compose: None, acrylic: false, remote_images: false, accounts: false, settings: false, quit: false, show: None };
+        let mut parsed = Args { theme: None, profile: None, screenshot: None, folder: None, account: 0, select: None, compose: None, acrylic: false, remote_images: false, accounts: false, settings: false, quit: false, purge_data: false, show: None };
         while let Some(flag) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
             match flag.as_str() {
@@ -73,6 +76,7 @@ impl Args {
                 "--accounts" => parsed.accounts = true,
                 "--settings" => parsed.settings = true,
                 "--quit" => parsed.quit = true,
+                "--purge-data" => parsed.purge_data = true,
                 "--show" => {
                     parsed.show = Some(match value()?.as_str() {
                         "drafts" => QueueKind::Drafts,

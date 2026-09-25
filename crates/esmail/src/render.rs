@@ -16,8 +16,8 @@
 //! markup would mean there's no URL left for a later "load remote images"
 //! action to use. So this module leaves `http(s)` URLs exactly as the
 //! message had them, and blocking happens at the network layer instead, via
-//! `egui_litehtml_webview`'s `WebViewHandler::intercept` — see `main.rs`'s
-//! `MessageViewHandler`.
+//! the webview's `WebViewHandler::intercept`, which each frontend's handler
+//! implements.
 //!
 //! **CSS:** inline `style="..."` attributes survive sanitization, filtered
 //! through an allowlist of property names (`allowed_style_properties`) via
@@ -196,8 +196,8 @@ fn content_id(part: &ParsedMail) -> Option<String> {
 /// `list-style-image`) stay in-scope for the property allowlist below
 /// because they're already safe: litehtml routes every CSS-triggered image
 /// load through the exact same `load_image` callback as `<img src>`, which
-/// `egui_litehtml_webview`'s `WebViewHandler::intercept` — the same
-/// block-by-default gate B5 already built — governs regardless of whether
+/// the webview's `WebViewHandler::intercept` — the same block-by-default
+/// gate B5 already built — governs regardless of whether
 /// the URL came from an attribute or a CSS property.
 fn allowed_style_properties() -> std::collections::HashSet<&'static str> {
     [

@@ -39,6 +39,15 @@ pub(crate) fn main() {
         instance::request_quit();
         return;
     }
+    // The installer's "remove my data" step, forwarded here so the code that
+    // knows where esMail stores things is the code that deletes them.
+    if args.purge_data {
+        let problems = esmail::uninstall::purge_user_data();
+        for problem in &problems {
+            eprintln!("esmail-win32: could not purge {problem}");
+        }
+        std::process::exit(if problems.is_empty() { 0 } else { 1 });
+    }
     // Screenshot and profile runs are throwaway views: they neither hand over to a
     // running window nor keep one from starting, and have no tray.
     let resident = args.screenshot.is_none() && args.profile.is_none();

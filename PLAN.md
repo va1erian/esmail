@@ -1,28 +1,31 @@
 # Plan
 
-Current design and roadmap for esmail, an IMAP/SMTP mail client built on
-`egui`. [HANDOFF.md](HANDOFF.md) is the how-to-work guide; this file is what
-exists, why, and what is left. Open work is tracked as GitHub issues
+Current design and roadmap for esmail, an IMAP/SMTP mail client with a native
+Windows frontend (the egui frontend moved to
+[va1erian/esmail-egui](https://github.com/va1erian/esmail-egui)).
+[HANDOFF.md](HANDOFF.md) is the how-to-work guide; this file is what exists,
+why, and what is left. Open work is tracked as GitHub issues
 (`va1erian/esmail`).
 
 ## Architecture
 
-Three crates in one workspace:
+Four crates in one workspace:
 
-- **`crates/egui-litehtml-webview`** — an egui widget that renders HTML/CSS
-  with [litehtml](https://github.com/va1erian/litehtml-rs) (layout painted with
-  egui's own painter, pure CPU). JS-less by design: no legitimate mail client
-  executes JS in email, and skipping a JS engine keeps the release binary small
-  (~11.5 MiB).
-  One `WebViewHost`, any number of `WebView`s.
-- **`crates/esmail`** — the app: `main.rs` (UI), `imap.rs` (IMAP actor plus a
+- **`crates/esmail`** — the egui-free core: `imap.rs` (IMAP actor plus a
   second body-worker connection), `idle_watch.rs` (IMAP IDLE push), `smtp.rs`,
   `compose.rs`, `db.rs` (SQLite cache + FTS5), `search_query.rs`, `render.rs`
   (parse -> sanitize with `ammonia` -> resolve `cid:`), `config.rs`/`secrets.rs`
-  (TOML config, passwords in the OS keyring), `notify.rs` + `platform/` (Windows
-  toasts + tray), `emoji.rs` (coloured Twemoji in the message list; the
-  embedded artwork adds about 4.4 MiB to the release binary, and the message
-  body webview does not use it).
+  (TOML config, passwords in the OS keyring), `app/` (the frontend-agnostic
+  `AppCore` model), `notify.rs` + `platform/` (Windows toasts + tray),
+  `uninstall.rs` (the installer's `--purge-data`), and `emoji.rs` (Twemoji
+  segmentation; the artwork is decoded in the frontend).
+- **`crates/esmail-win32`** — the native Windows frontend on
+  [win32ui](https://github.com/va1erian/win32ui): a 3-pane window, compose,
+  Drafts/Outbox, accounts/settings, tray + notifications, in `src/app/` over
+  the reusable widgets and `core_glue/` adapters.
+- **`crates/litehtml-view-d2d`** — the message-body webview: [litehtml](https://github.com/va1erian/litehtml-rs)
+  layout painted with Direct2D/DirectWrite through win32ui. JS-less by design:
+  no legitimate mail client executes JS in email.
 - **`crates/mail-mock-server`** — an in-process IMAP + SMTP server with a
   throwaway TLS CA, used by `crates/esmail/tests/imap_smtp_integration.rs`.
 
@@ -37,8 +40,8 @@ The UI thread sends render jobs and paints the finished display lists.
 - Remote images are fetched up to eight at a time, each with a timeout; a
   text-only frame is sent first when images are involved.
 - `WebViewHandler` is `Send + Sync` with `&self` methods.
-- A frame is a display list replayed by egui's painter every frame, culled to
-  the visible region, so tall messages cost only what is on screen.
+- A frame is a display list replayed with Direct2D/DirectWrite through win32ui,
+  culled to the visible region, so tall messages cost only what is on screen.
 - A litehtml `Document` borrows the container and cannot be stored, so it is
   built, used and dropped inside one worker call. Text selection works from a
   `TextRunTable` recorded during the render pass and sent with each frame (word
@@ -65,10 +68,10 @@ The UI thread sends render jobs and paints the finished display lists.
   images" (or "Always load from <sender>", kept in `config.toml`), attachment
   chips (save/open), inline `style=` via a property allowlist, Export... to
   `.eml`, flags, delete/archive, collapsible mailbox tree with special-use
-  folders (fold state kept in `config.toml`), multi-select, keyboard
-  shortcuts. The message list draws each row by hand (`message_row` in
-  `main.rs`): unread rows get an accent bar and a strong sender, read rows are
-  dimmed.
+  folders (fold state kept in `esmail-win32`'s `win32-settings.toml`),
+  multi-select, keyboard shortcuts. The message list draws each row by hand
+  (`message_list/` in `esmail-win32`): unread rows get an accent bar and a
+  strong sender, read rows are dimmed.
 - **Composing:** plain-text compose with Reply/Reply All/Forward, attachments,
   SMTP via `lettre`, `APPEND` to the server's Sent folder.
 - **Polish:** error banners, dark/light/system theme, window geometry
@@ -88,20 +91,18 @@ The UI thread sends render jobs and paints the finished display lists.
 | # | What |
 |---|---|
 | #32 | Umbrella: render-time breakdown and the path to sub-second |
-| #39 | Integrate egui_mcp for agent-driven UI prototyping and app verification |
 | #50 | Google sign-in follow-ups: client secret storage, revoke on forget, other providers (7-day expiry warning landed as #71) |
 | #54 | Sign the Windows executable and installer to avoid the SmartScreen warning |
 | #60 | Sync/search: offline mode, UID paging, indexing, server-side `UID SEARCH` (unapplied filters landed as #69) |
 | #61 | Reading: partial (`BODYSTRUCTURE`) fetch, batched flag/move; IDLE staying INBOX-only is a deliberate choice for now (search-cache attachments landed as #68) |
-| #62 | Compose: rich text and recipient autocomplete — deferred, not required for basic use |
-| #64 | Polish: per-operation progress, first-run wizard, off-screen window recovery, theme toggle off the UI thread — deferred |
+| #63 | Notifications: real AUMID, settings, verification on a real machine (click-to-open landed) |
+| #83-#89 | Rich-text compose series — deferred, not required for basic use |
 
-Landed since the table above was last trimmed: #65 (webview image-cache
-eviction), #68 (search-cache attachments), #69 (search filters), #71 (OAuth
-expiry warning). #63's toast click-to-open was already implemented (see the
-issue) and closed without new work. #62/#64 are open but deliberately not
-being pursued — they aren't required for basic real use on the target Gmail
-mailboxes.
+Landed since the table was last trimmed: the native Windows frontend reached
+parity with the egui one across iterations 1-7 (toolbar, login/accounts,
+compose, system theme, attachments, links, multi-account, tray/notifications,
+trusted senders, Drafts/Outbox, auth banners, Settings, Download All, folder
+folds), and the egui frontend moved to its own repository.
 
 ## Risks
 
