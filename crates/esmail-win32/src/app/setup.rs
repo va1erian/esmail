@@ -87,6 +87,11 @@ struct Session {
 }
 
 fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: Instant, session: Session) -> App {
+    // The icon `build.rs` embeds (resource id 1): win32ui's window class has no
+    // icon, so without this the title bar and taskbar show the generic one.
+    if let Ok(icon) = win32ui::Icon::from_resource(1) {
+        ui.set_icon(icon);
+    }
     let Session { settings, settings_path, waiting } = session;
     let notify = if settings_path.is_some() {
         notifications::install(ui.proxy());

@@ -1318,7 +1318,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "embed-resource",
  "env_logger",
  "esmail",
  "litehtml-view-d2d",
@@ -1335,6 +1334,7 @@ dependencies = [
  "ureq",
  "win32ui",
  "windows",
+ "winresource",
 ]
 
 [[package]]
@@ -5095,7 +5095,7 @@ checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 [[package]]
 name = "win32ui"
 version = "0.1.0"
-source = "git+https://github.com/va1erian/win32ui.git?branch=main#b39869058bc476e8e062559c401b219b3268fdf0"
+source = "git+https://github.com/va1erian/win32ui.git?branch=main#23f91ce8da87680e09e9f875478a475ac16b20ad"
 dependencies = [
  "embed-resource",
  "glow 0.16.0",
