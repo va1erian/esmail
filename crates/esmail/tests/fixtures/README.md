@@ -1,8 +1,12 @@
 # Message fixtures
 
 Real-world messages kept as test cases for rendering conformance and
-performance. `tests/render_fixtures.rs` runs every `*.eml` here through
-`render::render_message` and the litehtml webview.
+performance. The egui frontend's render test
+(`tests/render_fixtures.rs`, now in the
+[esmail-egui](https://github.com/va1erian/esmail-egui) repository) runs every
+`*.eml` here through `render::render_message` and its webview;
+`litehtml-view-d2d` (the native frontend's webview) can render the same files
+with its `view` example.
 
 | File | Why it is here |
 |---|---|
@@ -11,8 +15,8 @@ performance. `tests/render_fixtures.rs` runs every `*.eml` here through
 ## Adding one
 
 1. In esMail, open the message and click **Export...** to save the raw `.eml`.
-2. `ESMAIL_PREVIEW=path/to/message.eml cargo run -p esmail` renders it with no
-   account (add `ESMAIL_SCREENSHOT=out.png` for a PNG).
+2. Render it with the `litehtml-view-d2d` `view` example, or with esmail-egui's
+   preview mode, to check the layout before committing.
 3. **Redact it before committing.** These files live in a public repository.
    Real newsletters carry the recipient in several places:
    - the recipient address (`To`, `Delivered-To`, and the `Received ... for <addr>` line);
@@ -33,13 +37,7 @@ performance. `tests/render_fixtures.rs` runs every `*.eml` here through
 
 ## Measuring
 
-(Full guide, including the stack-level profiler: `docs/PERFORMANCE.md`.)
-
-```text
-RUST_LOG=egui_litehtml_webview=debug \
-  cargo test -p esmail --test render_fixtures --release -- --nocapture --include-ignored
-```
-
-prints wall-clock time per fixture and width, and (with `RUST_LOG`) the
-parse / layout / paint split for each pass. Debug builds are 5-10x slower
+The egui frontend's `render_fixtures` test (in esmail-egui) prints wall-clock
+time per fixture and width and, with `RUST_LOG=egui_litehtml_webview=debug`,
+the parse / layout / record split for each pass. Debug builds are 5-10x slower
 because the C++ layout engine is built unoptimized.

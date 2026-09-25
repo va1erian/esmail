@@ -11,12 +11,12 @@
 ;  * Per-user install by default (no UAC prompt): esMail keeps everything in the
 ;    user's profile, so it needs nothing outside it. The wizard offers "all
 ;    users" for whoever wants it.
-;  * A running esMail (it sits in the tray) is asked to exit with `esmail.exe --quit`
-;    before files are replaced or removed.
+;  * A running esMail (it sits in the tray) is asked to exit with
+;    `esmail-win32.exe --quit` before files are replaced or removed.
 ;  * Everything is compressed as one solid LZMA2 stream at the highest setting.
 ;  * Uninstalling asks whether to remove the user's data as well. That work is
-;    done by `esmail.exe --purge-data` (see crates/esmail/src/uninstall.rs), so
-;    the program that knows where its files are is the one that deletes them.
+;    done by `esmail-win32.exe --purge-data` (see crates/esmail/src/uninstall.rs),
+;    so the program that knows where its files are is the one that deletes them.
 ;    A silent uninstall keeps the data unless /PURGE is passed:
 ;        unins000.exe /VERYSILENT /PURGE
 
@@ -24,15 +24,11 @@
   #define AppVersion "0.1.0"
 #endif
 #ifndef SourceExe
-  #define SourceExe "..\target\release\esmail.exe"
-#endif
-#ifndef SourceWin32Exe
-  #define SourceWin32Exe "..\target\release\esmail-win32.exe"
+  #define SourceExe "..\target\release\esmail-win32.exe"
 #endif
 
 #define AppName "esMail"
-#define AppExeName "esmail.exe"
-#define Win32ExeName "esmail-win32.exe"
+#define AppExeName "esmail-win32.exe"
 
 [Setup]
 ; Never change this GUID: it is how upgrades and the uninstaller find the
@@ -70,11 +66,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceWin32Exe}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
-Name: "{autoprograms}\{#AppName} (native)"; Filename: "{app}\{#Win32ExeName}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
@@ -86,24 +80,16 @@ var
 
 // Ask a running esMail in Dir to exit cleanly (it hides to the tray rather than
 // closing, so the installer cannot just close its window), and give it a moment.
-// Either frontend may be the one running, so both are asked; `--quit` sends the
-// shared request and the native build also wakes its own instance.
-procedure QuitOneApp(const Exe: string);
+// `--quit` sends the shared request and wakes the instance.
+procedure QuitRunningApp(const Dir: string);
 var
   ResultCode: Integer;
 begin
-  if FileExists(Exe) then
+  if FileExists(Dir + '\{#AppExeName}') then
   begin
-    Exec(Exe, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    Sleep(1000);
+    Exec(Dir + '\{#AppExeName}', '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(2000);
   end;
-end;
-
-procedure QuitRunningApp(const Dir: string);
-begin
-  QuitOneApp(Dir + '\{#AppExeName}');
-  QuitOneApp(Dir + '\{#Win32ExeName}');
-  Sleep(1000);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -145,7 +131,7 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ResultCode: Integer;
 begin
-  // usUninstall: about to delete the program files, so esmail.exe is still here.
+  // usUninstall: about to delete the program files, so the exe is still here.
   if (CurUninstallStep = usUninstall) and PurgeUserData then
     Exec(ExpandConstant('{app}\{#AppExeName}'), '--purge-data', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;

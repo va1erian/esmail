@@ -1,15 +1,17 @@
-//! Colour emoji in single-line labels (the message list): the egui-free half.
+//! Colour emoji in single-line labels (the message list): segmentation and
+//! placeholder layout, frontend-agnostic.
 //!
-//! egui draws text from monochrome outline fonts only, so an emoji comes out
-//! as a black-and-white glyph, and only as many of them as its bundled font
-//! happens to cover. The frontend draws the real coloured artwork instead,
-//! without giving up egui's own text layout (measuring, ellipsis truncation):
+//! A frontend whose text stack draws only monochrome outline fonts uses this to
+//! swap each emoji for a fixed-width placeholder, lay the text out as usual,
+//! then paint the Twemoji artwork over the placeholder's slot in the laid-out
+//! row — without giving up the frontend's own text measuring and ellipsis
+//! truncation. The native win32 frontend draws colour emoji directly with
+//! DirectWrite and does not need it.
 //!
 //! 1. [`prepare`] replaces every emoji in a string with one fixed-width
 //!    placeholder character and remembers where they were;
 //! 2. the caller lays that text out as usual;
-//! 3. the caller paints each emoji's artwork over the placeholder's slot in the
-//!    laid-out row (the egui half lives in the binary's `emoji_paint` module).
+//! 3. the caller paints each emoji's artwork over the placeholder's slot.
 //!
 //! An emoji is a whole grapheme cluster (`👨‍👩‍👧`, `🇫🇷`, `👍🏽`, `1️⃣` are one each),
 //! looked up as a unit; a cluster the artwork set does not know stays text.

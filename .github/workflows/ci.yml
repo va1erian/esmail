@@ -10,20 +10,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # litehtml's `cc`-crate build only needs a C/C++ compiler
-      # (build-essential) and pkg-config (probed by openssl-sys and
-      # wayland-sys); nothing here needs bindgen/libclang since the crate
-      # ships pre-generated FFI bindings by default. libssl-dev is for
-      # native-tls (async-imap/lettre), and libdbus-1-dev is for keyring's
-      # Linux secret-service backend. libwayland-dev is for rfd's portal
-      # backend, which links wayland-sys once winit's dlopen feature is gone
-      # (egui-frontend off). Verified by a clean `cargo build
-      # --workspace` / `cargo test --workspace --no-run` against exactly this
-      # package set in a bare rust:slim-bookworm container.
+      # The core library's C/C++ dependencies only need a compiler
+      # (build-essential), pkg-config (probed by openssl-sys) and libssl-dev
+      # (native-tls for async-imap/lettre). libdbus-1-dev is for keyring's
+      # Linux secret-service backend.
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev libdbus-1-dev libwayland-dev
+          sudo apt-get install -y build-essential pkg-config libssl-dev libdbus-1-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -31,26 +25,14 @@ jobs:
       - name: Build
         run: cargo build
 
-      # The library must not drag in a frontend toolkit: a non-egui consumer
-      # (the future esmail-win32 crate) turns `egui-frontend` off. Fails the
-      # job if egui, eframe, glow or epaint show up in the normal dependency
-      # tree without the feature.
-      - name: Check the library without the egui frontend
-        run: |
-          cargo check --lib -p esmail --no-default-features
-          if cargo tree -p esmail --no-default-features -e normal | grep -i -E "egui|eframe|glow|epaint"; then
-            echo "::error::the esmail library still depends on egui with egui-frontend off"
-            exit 1
-          fi
-
       - name: Run unit tests
         run: cargo test --workspace
 
       # esmail-win32 is the egui-free frontend; a dependency that drags egui
-      # (or winit, which only the egui frontend needs) back in defeats it.
+      # (or winit) back in defeats it.
       - name: esmail-win32 stays egui-free
         run: |
-          if cargo tree -p esmail-win32 -e normal --prefix none | grep -E '^(egui|eframe|egui_glow|egui-litehtml-webview|winit|epaint) '; then
+          if cargo tree -p esmail-win32 -e normal --prefix none | grep -E '^(egui|eframe|egui_glow|winit|epaint) '; then
             echo "esmail-win32 must not depend on egui"; exit 1
           fi
 
@@ -92,20 +74,9 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
-      # See build-linux: the library has no egui once `egui-frontend` is off.
-      - name: Check the library without the egui frontend
-        shell: pwsh
-        run: |
-          cargo check --lib -p esmail --no-default-features
-          $tree = cargo tree -p esmail --no-default-features -e normal
-          $matches = $tree | Select-String -Pattern 'egui|eframe|glow|epaint'
-          if ($matches) {
-            Write-Error "the esmail library still depends on egui with egui-frontend off:`n$($matches -join "`n")"
-            exit 1
-          }
       - name: esmail-win32 stays egui-free
         shell: bash
         run: |
-          if cargo tree -p esmail-win32 -e normal --prefix none | grep -E '^(egui|eframe|egui_glow|egui-litehtml-webview|winit|epaint) '; then
+          if cargo tree -p esmail-win32 -e normal --prefix none | grep -E '^(egui|eframe|egui_glow|winit|epaint) '; then
             echo "esmail-win32 must not depend on egui"; exit 1
           fi

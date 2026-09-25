@@ -1,11 +1,15 @@
 # esmail
 
-An IMAP/SMTP mail client built on `egui` and litehtml (via
-`egui-litehtml-webview`, this workspace's other crate). See `../../PLAN.md` for
-the design and open work, and `../../HANDOFF.md` for how to build, run, and
-verify changes.
+The egui-free mail core of esMail: IMAP/SMTP actors, the SQLite cache, HTML
+sanitizing and the shared models. The native Windows frontend is
+`esmail-win32` (a sibling crate); the egui/eframe frontend lives in
+[va1erian/esmail-egui](https://github.com/va1erian/esmail-egui). See
+`../../PLAN.md` for the design and open work, and `../../HANDOFF.md` for how to
+build, run, and verify changes.
 
 **Internal to this workspace.** Not published to crates.io.
+
+The screen descriptions below use the native Windows frontend's wording.
 
 ## Signing in
 
@@ -91,18 +95,18 @@ app password needed.
 
 ## Settings
 
-The **Settings** button in the top bar opens a window with three tabs:
+**File > Accounts…** opens the Accounts window: every saved account with its
+connection state, and Add / Edit / Remove. **Edit…** opens that account's own
+dialog: display name, ports, SMTP host and security, the mailbox watched for
+new mail, and how it signs in (a new password, or Google). **Remove** there
+disconnects it and deletes its saved passwords and token. Username and IMAP
+host are the account's identity and are not editable; add the account again to
+change them.
 
-- **General**: the theme, a summary of connected accounts, and the keyboard
-  shortcuts.
-- **Accounts**: every saved account with its connection state, and Connect /
-  Disconnect / Sign in again. **Edit…** opens that account's own dialog:
-  display name, ports, SMTP host and security, the mailbox watched for new
-  mail, and how it signs in (a new password, or Google). **Remove account…**
-  there disconnects it and deletes its saved passwords and token. Username and
-  IMAP host are the account's identity and are not editable; add the account
-  again to change them.
-- **Google**: the OAuth client ID and secret.
+**File > Settings…** (the **Settings** button) opens a window with the OAuth
+client ID and secret and a keyboard-shortcut reference. The theme, remote-image
+toggle and close-to-tray choices are under the View menu and are remembered in
+`win32-settings.toml` next to `config.toml`.
 
 ## Windows: installing, where things live, uninstalling
 
@@ -133,21 +137,20 @@ its own name. Starting it while it is already running (for example from the
 Start menu while it sits in the tray) brings the existing window forward
 instead of starting a second copy. (The running copy holds a lock file in
 the data directory; a later launch leaves a request file beside it, which the
-running copy picks up within a quarter of a second. `esmail.exe --quit` uses the
-same route to make it exit, which is what the installer does before replacing
-or removing the program files.) All of this is safe Rust: `shell.rs` is
-`forbid(unsafe_code)`.
+running copy is woken at once. `esmail-win32.exe --quit` uses the same route to
+make it exit, which is what the installer does before replacing or removing the
+program files.) All of this is safe Rust: `shell.rs` is `forbid(unsafe_code)`.
 
 **Uninstalling.** The uninstaller asks whether to remove esmail's data as well
 (settings, cached mail, saved passwords). It does that by running
-`esmail.exe --purge-data`, which you can also run yourself. A silent uninstall
-keeps the data unless told otherwise:
+`esmail-win32.exe --purge-data`, which you can also run yourself. A silent
+uninstall keeps the data unless told otherwise:
 
 ```
 unins000.exe /VERYSILENT /PURGE
 ```
 
-To try the installer locally: `cargo build --release`, then
+To try the installer locally: `cargo build --release -p esmail-win32`, then
 `iscc /DAppVersion=0.0.0 installer\esmail.iss` (Inno Setup 6); the result is in
 `dist\`. That folder is git-ignored.
 

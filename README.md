@@ -5,9 +5,14 @@ A small, fast desktop and 100% vibe-coded mail client for IMAP and SMTP, written
 - Reads and sends mail over IMAP/SMTP, with several accounts side by side.
 - Renders HTML mail with [litehtml](https://github.com/litehtml/litehtml) instead of an embedded browser: no JavaScript engine, a small binary, and message HTML is sanitised before it is shown.
 - Signs in with a password or, for Gmail, with Sign in with Google (OAuth2, no app password).
-- On Windows, lives in the system tray, shows new-mail notifications and comes with an installer that uninstalls cleanly. A Linux build is also provided.
+- On Windows, lives in the system tray, shows new-mail notifications and comes with an installer that uninstalls cleanly. The frontend is native Win32 (via [win32ui](https://github.com/va1erian/win32ui)), not egui.
 
-Prebuilt Windows and Linux binaries are attached to each
+This repository is the mail core plus the native Windows frontend. The
+egui/eframe desktop frontend for Linux and macOS lives in
+[va1erian/esmail-egui](https://github.com/va1erian/esmail-egui) and builds on
+this core.
+
+A prebuilt Windows installer and portable zip are attached to each
 [release](https://github.com/va1erian/esmail/releases). How to sign in, where
 esMail keeps its files and how to uninstall are described in
 [crates/esmail/README.md](crates/esmail/README.md).
@@ -27,9 +32,9 @@ because litehtml is compiled from source.
 Then:
 
 ```
-cargo build --release     # target/release/esmail (esmail.exe on Windows)
-cargo run --release       # build and start it
-cargo test --workspace    # unit tests
+cargo build --release --bin esmail-win32   # target/release/esmail-win32.exe
+cargo run --release -p esmail-win32        # build and start it (Windows)
+cargo test --workspace                     # unit tests
 ```
 
 The IMAP/SMTP tests run esMail's real network code against an in-process
@@ -67,9 +72,5 @@ license, listed in its crate; the ones that ask for a mention are:
   through the Rust bindings [`litehtml-rs`](https://github.com/franzos/litehtml-rs)
   by franzos, in [a fork](https://github.com/va1erian/litehtml-rs) with a
   Windows build fix and a few additions.
-- **[egui](https://github.com/emilk/egui)** and **eframe** by Emil Ernerfeldt
-  and contributors (MIT or Apache-2.0) provide the user interface. The fonts
-  bundled with egui (Ubuntu-Light, Hack, Noto Emoji and emoji-icon-font, under
-  the Ubuntu Font Licence, OFL-1.1 and MIT/Apache-2.0) are used as-is.
 - **[SQLite](https://sqlite.org)** (public domain), through
   [`rusqlite`](https://github.com/rusqlite/rusqlite), caches mail on disk.

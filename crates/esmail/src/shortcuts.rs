@@ -2,8 +2,9 @@
 //!
 //! A frontend translates its own key events into a [`Shortcut`] and asks
 //! [`lookup`] which [`Command`] it means, or feeds a whole frame's key state
-//! to [`pressed_commands`]. The egui adapter lives in `egui_input.rs`; a
-//! Win32 accelerator table can be built straight from [`BINDINGS`].
+//! to [`pressed_commands`]. The egui frontend (its own repository) has an
+//! adapter; a Win32 accelerator table can be built straight from
+//! [`BINDINGS`].
 
 /// The keys that carry a binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
