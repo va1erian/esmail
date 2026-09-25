@@ -119,7 +119,7 @@ fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: 
         .on_change(|text| Some(Msg::SearchChanged(text.to_string())))
         .on_focus(|focused| Some(Msg::SearchFocused(focused)));
     let reader = Reader::new(ui, palette_for(&ui.theme())).expect("reading pane");
-    let toolbar = MainBar::new(ui, settings.theme).expect("main toolbar");
+    let toolbar = MainBar::new(ui).expect("main toolbar");
     let reader_bar = ReaderBar::new(ui).expect("reader action bar");
     let status = StatusBar::new(ui).expect("status bar");
     status.set_parts(&[-1]);

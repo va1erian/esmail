@@ -1,22 +1,32 @@
-//! The window's top bar: the main toolbar under the menu, plus the theme-cycle
-//! and Settings buttons at its right end.
+//! The window's top bar: the main toolbar under the menu.
 //!
-//! win32ui's [`Toolbar`] maps a click to an app message but has no per-button
-//! enabled flag, so a button that does not apply — nothing selected, or an
-//! action already on its way to the server — emits nothing: its `on_click`
-//! closure reads the shared [`ActionState`]. The reading pane's bar
-//! (`reader_bar.rs`) uses native `Button`s, which do grey out, for the actions
-//! that need a visible disabled state.
-
-use std::cell::Cell;
-use std::rc::Rc;
+//! Each button has a typed id, so [`Toolbar::set_enabled`] and
+//! [`Toolbar::set_checked`] keep its state right without rebuilding anything:
+//! buttons that do not apply dim (and emit nothing when clicked), and the star
+//! button's checked state follows the open message's flag. The reader's own bar
+//! (`reader_bar.rs`) uses native `Button`s, which also grey out in place.
 
 use win32ui::prelude::*;
 
 use esmail_win32::core_glue::compose::Kind;
 
 use super::Msg;
-use esmail_win32::core_glue::ThemeChoice;
+
+/// The typed ids of the toolbar's buttons, so `set_state` can address them.
+mod id {
+    pub const NEW: u64 = 1;
+    pub const REFRESH: u64 = 2;
+    pub const REPLY: u64 = 3;
+    pub const REPLY_ALL: u64 = 4;
+    pub const FORWARD: u64 = 5;
+    pub const MARK_READ: u64 = 6;
+    pub const MARK_UNREAD: u64 = 7;
+    pub const STAR: u64 = 8;
+    pub const ARCHIVE: u64 = 9;
+    pub const DELETE: u64 = 10;
+    pub const THEME: u64 = 11;
+    pub const SETTINGS: u64 = 12;
+}
 
 /// The selection/action state the main toolbar's buttons derive their
 /// availability from. Pure, so it is unit-tested without a window.
@@ -51,119 +61,117 @@ impl ActionState {
     }
 }
 
-/// The main toolbar and the two buttons at its right end.
+/// The main toolbar.
 pub struct MainBar {
     toolbar: Toolbar<Msg>,
-    theme: Button<Msg>,
-    settings: Button<Msg>,
-    state: Rc<Cell<ActionState>>,
-    /// The theme button's last label, so a message that does not change the
-    /// theme does not re-set the button text.
-    theme_label: Cell<Option<ThemeChoice>>,
 }
 
 impl MainBar {
-    /// Builds the toolbar. All buttons are created once; their availability is
-    /// read from the shared state at click time, so nothing here is rebuilt.
-    pub fn new(ui: &mut Ui<Msg>, theme: ThemeChoice) -> win32ui::Result<MainBar> {
-        let state = Rc::new(Cell::new(ActionState::default()));
-        // A bulk button builds its message afresh on each click, so the closure
-        // stays `Fn` and can grey itself out by returning `None` when no action
-        // applies.
-        let bulk = |msg: fn() -> Msg| {
-            let state = Rc::clone(&state);
-            move || state.get().bulk_enabled().then(|| msg())
-        };
-
+    /// Builds the toolbar once. Button availability is set from the shared
+    /// state in [`MainBar::set_state`], never by rebuilding.
+    pub fn new(ui: &mut Ui<Msg>) -> win32ui::Result<MainBar> {
         let toolbar = Toolbar::new(
             ui,
             vec![
                 ToolbarItem::new("New message")
-                    .with_icon(ToolbarIcon::Circle)
+                    .id(id::NEW)
+                    .with_icon(ToolbarIcon::Compose)
                     .shortcut(Shortcut::ctrl(Key::N))
                     .tooltip("Write a new message")
                     .on_click(|| Some(Msg::Compose(Kind::New))),
                 ToolbarItem::new("Refresh")
-                    .with_icon(ToolbarIcon::Arrow)
+                    .id(id::REFRESH)
+                    .with_icon(ToolbarIcon::Refresh)
                     .shortcut(Shortcut::key(Key::F5))
                     .tooltip("Fetch this folder again")
                     .on_click(|| Some(Msg::Refresh)),
+                ToolbarItem::separator(),
                 ToolbarItem::new("Reply")
-                    .with_icon(ToolbarIcon::Arrow)
+                    .id(id::REPLY)
+                    .with_icon(ToolbarIcon::Reply)
                     .shortcut(Shortcut::ctrl(Key::R))
                     .tooltip("Reply to the selected message")
-                    .on_click(bulk(|| Msg::Compose(Kind::Reply))),
+                    .enabled(false)
+                    .on_click(|| Some(Msg::Compose(Kind::Reply))),
                 ToolbarItem::new("Reply all")
-                    .with_icon(ToolbarIcon::Arrow)
+                    .id(id::REPLY_ALL)
+                    .with_icon(ToolbarIcon::Reply)
                     .shortcut(Shortcut::ctrl(Key::R).with_shift())
                     .tooltip("Reply to everyone")
-                    .on_click(bulk(|| Msg::Compose(Kind::ReplyAll))),
+                    .enabled(false)
+                    .on_click(|| Some(Msg::Compose(Kind::ReplyAll))),
                 ToolbarItem::new("Forward")
-                    .with_icon(ToolbarIcon::Arrow)
+                    .id(id::FORWARD)
+                    .with_icon(ToolbarIcon::Forward)
                     .shortcut(Shortcut::ctrl(Key::L))
                     .tooltip("Forward the selected message")
-                    .on_click(bulk(|| Msg::Compose(Kind::Forward))),
+                    .enabled(false)
+                    .on_click(|| Some(Msg::Compose(Kind::Forward))),
+                ToolbarItem::separator(),
                 ToolbarItem::new("Mark read")
-                    .with_icon(ToolbarIcon::Check)
+                    .id(id::MARK_READ)
+                    .with_icon(ToolbarIcon::MarkRead)
                     .tooltip("Mark the selection as read")
-                    .on_click(bulk(|| Msg::SetSeen(true))),
+                    .enabled(false)
+                    .on_click(|| Some(Msg::SetSeen(true))),
                 ToolbarItem::new("Mark unread")
-                    .with_icon(ToolbarIcon::Circle)
+                    .id(id::MARK_UNREAD)
+                    .with_icon(ToolbarIcon::MarkUnread)
                     .tooltip("Mark the selection as unread")
-                    .on_click(bulk(|| Msg::SetSeen(false))),
+                    .enabled(false)
+                    .on_click(|| Some(Msg::SetSeen(false))),
+                ToolbarItem::separator(),
                 ToolbarItem::new("Star")
-                    .with_icon(ToolbarIcon::Check)
+                    .id(id::STAR)
+                    .with_icon(ToolbarIcon::Star)
                     .tooltip("Flag or unflag the selection")
-                    .on_click(bulk(|| Msg::ToggleFlag)),
+                    .toggle()
+                    .enabled(false)
+                    .on_toggle(|_| Some(Msg::ToggleFlag)),
                 ToolbarItem::new("Archive")
-                    .with_icon(ToolbarIcon::Arrow)
+                    .id(id::ARCHIVE)
+                    .with_icon(ToolbarIcon::Archive)
                     .tooltip("Move the selection to the archive folder")
-                    .on_click(bulk(|| Msg::Archive)),
+                    .enabled(false)
+                    .on_click(|| Some(Msg::Archive)),
                 ToolbarItem::new("Delete")
-                    .with_icon(ToolbarIcon::Close)
+                    .id(id::DELETE)
+                    .with_icon(ToolbarIcon::Delete)
                     .tooltip("Move the selection to the trash folder")
-                    .on_click(bulk(|| Msg::Delete)),
+                    .enabled(false)
+                    .on_click(|| Some(Msg::Delete)),
+                ToolbarItem::flexible_spacer(),
+                ToolbarItem::new("Theme")
+                    .id(id::THEME)
+                    .with_icon(ToolbarIcon::glyph('\u{E706}'))
+                    .tooltip("Cycle Dark / Light / System (View > Theme)")
+                    .on_click(|| Some(Msg::CycleTheme)),
+                ToolbarItem::new("Settings")
+                    .id(id::SETTINGS)
+                    .with_icon(ToolbarIcon::Settings)
+                    .tooltip("Manage accounts (File > Accounts...)")
+                    .on_click(|| Some(Msg::ManageAccounts)),
             ],
         )?;
-
-        let theme_button = Button::new(ui, "Theme")?
-            .on_click(|| Some(Msg::CycleTheme));
-        let theme_label = Cell::new(None);
-        theme_button.set_tooltip("Cycle Dark / Light / System");
-        let settings = Button::new(ui, "Settings")?
-            .on_click(|| Some(Msg::ManageAccounts));
-        settings.set_tooltip("Manage accounts (File > Accounts...)");
-
-        let bar = MainBar { toolbar, theme: theme_button, settings, state, theme_label };
-        bar.set_theme_label(theme);
-        Ok(bar)
+        Ok(MainBar { toolbar })
     }
 
-    /// Updates the availability the toolbar buttons read.
+    /// Updates which buttons apply and whether the star is on.
     pub fn set_state(&self, state: ActionState) {
-        self.state.set(state);
-    }
-
-    /// Labels the theme button with the current choice, once per change.
-    pub fn set_theme_label(&self, theme: ThemeChoice) {
-        if self.theme_label.get() == Some(theme) {
-            return;
+        let actions = state.bulk_enabled();
+        for id in [id::REPLY, id::REPLY_ALL, id::FORWARD, id::MARK_READ, id::MARK_UNREAD, id::STAR, id::ARCHIVE, id::DELETE] {
+            self.toolbar.set_enabled(id, actions);
         }
-        self.theme_label.set(Some(theme));
-        self.theme.set_text(&format!("Theme: {}", theme.label()));
+        self.toolbar.set_checked(id::STAR, state.flagged);
     }
 
     /// The toolbar row, sized to the toolbar's own height so the parent column
-    /// gives it only the strip it needs. The theme/settings widths are fixed:
-    /// the theme button's label changes, and an auto-width button would clip it.
+    /// gives it only the strip it needs.
     pub fn bar_layout(&self, dpi: u32) -> LayoutItem {
         let row_height = Px(self.toolbar.height()).to_dip(dpi) + dip(6.0);
         Layout::row()
-            .spacing(dip(4.0))
             .margins(Insets::symmetric(dip(4.0), dip(3.0)))
             .item(self.toolbar.fill(1))
-            .item(self.theme.width(dip(104.0)))
-            .item(self.settings.width(dip(76.0)))
             .height(row_height)
     }
 }
