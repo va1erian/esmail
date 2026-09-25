@@ -48,10 +48,10 @@ png = "0.17"
 env_logger.workspace = true
 mail-mock-server = { path = "../mail-mock-server" }
 
-# `build.rs` only embeds the Common Controls v6 manifest on Windows; the crate
-# itself is plain Rust and builds everywhere.
+# `build.rs` only embeds the icon, version info and Common Controls v6 manifest
+# on Windows; the crate itself is plain Rust and builds everywhere.
 [build-dependencies]
-embed-resource = "3"
+winresource.workspace = true
 
 [[bin]]
 name = "esmail-win32"
