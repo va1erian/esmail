@@ -79,6 +79,26 @@ pub fn claim(compose: bool) -> io::Result<Claim> {
     Ok(Claim::HandedOver)
 }
 
+/// `--quit`: ask a running instance to exit. Used by the installer before it
+/// replaces or removes the program files. Either frontend may hold the lock;
+/// the egui one polls the request file, this one waits on its own event, so
+/// both are woken.
+pub fn request_quit() {
+    if shell::acquire_single_instance() != Instance::AlreadyRunning {
+        return;
+    }
+    let _ = shell::send_request(&Request::Quit);
+    let Some(dir) = esmail::paths::data_dir() else { return };
+    // SAFETY: plain FFI; the event is only opened to be signalled, then closed,
+    // and it is absent when the running instance is the egui frontend.
+    unsafe {
+        if let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, &event_name(&dir)) {
+            let _ = SetEvent(event);
+            let _ = CloseHandle(event);
+        }
+    }
+}
+
 impl Waiting {
     /// Forwards what later launches leave to the window: everything already left
     /// (a launch that raced the startup), then whatever each wake brings.

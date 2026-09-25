@@ -26,9 +26,13 @@
 #ifndef SourceExe
   #define SourceExe "..\target\release\esmail.exe"
 #endif
+#ifndef SourceWin32Exe
+  #define SourceWin32Exe "..\target\release\esmail-win32.exe"
+#endif
 
 #define AppName "esMail"
 #define AppExeName "esmail.exe"
+#define Win32ExeName "esmail-win32.exe"
 
 [Setup]
 ; Never change this GUID: it is how upgrades and the uninstaller find the
@@ -66,9 +70,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceWin32Exe}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
+Name: "{autoprograms}\{#AppName} (native)"; Filename: "{app}\{#Win32ExeName}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
@@ -80,15 +86,24 @@ var
 
 // Ask a running esMail in Dir to exit cleanly (it hides to the tray rather than
 // closing, so the installer cannot just close its window), and give it a moment.
-procedure QuitRunningApp(const Dir: string);
+// Either frontend may be the one running, so both are asked; `--quit` sends the
+// shared request and the native build also wakes its own instance.
+procedure QuitOneApp(const Exe: string);
 var
   ResultCode: Integer;
 begin
-  if FileExists(Dir + '\{#AppExeName}') then
+  if FileExists(Exe) then
   begin
-    Exec(Dir + '\{#AppExeName}', '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    Sleep(2000);
+    Exec(Exe, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(1000);
   end;
+end;
+
+procedure QuitRunningApp(const Dir: string);
+begin
+  QuitOneApp(Dir + '\{#AppExeName}');
+  QuitOneApp(Dir + '\{#Win32ExeName}');
+  Sleep(1000);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
