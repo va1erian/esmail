@@ -325,7 +325,7 @@ impl CustomWidget for HtmlWidget {
                 self.scroll_by(-delta as f32 / 120.0 * WHEEL_LINE_DIP);
                 cx.invalidate();
             }
-            Input::MouseDown { x, y, button: MouseButton::Left } => {
+            Input::MouseDown { x, y, button: MouseButton::Left, .. } => {
                 let p = self.scale_point(x, y);
                 self.register_click(p);
                 self.press.set(Some(p));
@@ -347,7 +347,7 @@ impl CustomWidget for HtmlWidget {
                 }
                 cx.invalidate();
             }
-            Input::MouseMove { x, y } => {
+            Input::MouseMove { x, y, .. } => {
                 let p = self.scale_point(x, y);
                 if self.dragging.get() {
                     if let Some(press) = self.press.get() {
@@ -380,7 +380,7 @@ impl CustomWidget for HtmlWidget {
                     cx.cursor(cursor);
                 }
             }
-            Input::MouseDoubleClick { x, y, button: MouseButton::Left } => {
+            Input::MouseDoubleClick { x, y, button: MouseButton::Left, .. } => {
                 let p = self.scale_point(x, y);
                 let count = self.register_click(p);
                 self.dragging.set(false);
@@ -400,7 +400,7 @@ impl CustomWidget for HtmlWidget {
                 }
                 cx.invalidate();
             }
-            Input::MouseUp { x, y, button: MouseButton::Left } => {
+            Input::MouseUp { x, y, button: MouseButton::Left, .. } => {
                 self.dragging.set(false);
                 cx.release_capture();
                 let p = self.scale_point(x, y);
