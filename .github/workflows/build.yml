@@ -56,6 +56,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path esmail-windows
           Copy-Item "target/release/esmail.exe" -Destination "esmail-windows/"
+          Copy-Item "target/release/esmail-win32.exe" -Destination "esmail-windows/"
           Get-ChildItem "target/release/*.dll" | Copy-Item -Destination "esmail-windows/" -ErrorAction SilentlyContinue
           Compress-Archive -Path "esmail-windows/*" -DestinationPath "esmail-windows.zip"
 
@@ -106,6 +107,7 @@ jobs:
           $dir = Join-Path $env:RUNNER_TEMP 'esmail-installed'
           Start-Process -Wait -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', '/NORESTART', "/DIR=$dir"
           if (-not (Test-Path "$dir\esmail.exe")) { throw 'installer did not install esmail.exe' }
+          if (-not (Test-Path "$dir\esmail-win32.exe")) { throw 'installer did not install esmail-win32.exe' }
 
           $config = "$env:APPDATA\esmail\config"
           $data = "$env:LOCALAPPDATA\esmail\data"
@@ -118,6 +120,7 @@ jobs:
           Start-Process -Wait -FilePath "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/PURGE', "_?=$dir"
 
           if (Test-Path "$dir\esmail.exe") { throw 'uninstall left esmail.exe behind' }
+          if (Test-Path "$dir\esmail-win32.exe") { throw 'uninstall left esmail-win32.exe behind' }
           if (Test-Path "$env:APPDATA\esmail") { throw 'uninstall left the config directory behind' }
           if (Test-Path "$env:LOCALAPPDATA\esmail") { throw 'uninstall left the data directory behind' }
 

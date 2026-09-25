@@ -35,6 +35,10 @@ pub(crate) fn main() {
             std::process::exit(2);
         }
     };
+    if args.quit {
+        instance::request_quit();
+        return;
+    }
     // Screenshot and profile runs are throwaway views: they neither hand over to a
     // running window nor keep one from starting, and have no tray.
     let resident = args.screenshot.is_none() && args.profile.is_none();
