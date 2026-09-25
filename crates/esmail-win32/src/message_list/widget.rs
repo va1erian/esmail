@@ -271,14 +271,14 @@ impl CustomWidget for MessageListWidget {
 
     fn input(&self, input: Input, cx: &mut WidgetCx<MessageListEvent>) {
         match input {
-            Input::MouseDown { x, y, button: MouseButton::Left } => self.mouse_down(x, y, cx),
-            Input::MouseDown { x, y, button: MouseButton::Right } => self.context_menu(x, y, cx),
-            Input::MouseDoubleClick { x, y, button: MouseButton::Left } => {
+            Input::MouseDown { x, y, button: MouseButton::Left, .. } => self.mouse_down(x, y, cx),
+            Input::MouseDown { x, y, button: MouseButton::Right, .. } => self.context_menu(x, y, cx),
+            Input::MouseDoubleClick { x, y, button: MouseButton::Left, .. } => {
                 if let Some((index, false)) = self.hit(x, y) {
                     cx.emit(MessageListEvent::Open(index));
                 }
             }
-            Input::MouseMove { x, y } => self.mouse_move(x, y, cx),
+            Input::MouseMove { x, y, .. } => self.mouse_move(x, y, cx),
             Input::MouseLeave => {
                 self.hover.set(None);
                 self.star_hover.set(false);
