@@ -86,6 +86,8 @@ enum Msg {
     /// The HTML view finished a frame.
     Frame,
     Folder(i64),
+    /// A folder node was folded or unfolded in the tree.
+    FolderToggled(i64, bool),
     Selected(Vec<usize>),
     /// Enter or a double-click on a row.
     Open(usize),
@@ -274,6 +276,7 @@ impl win32ui::App for App {
                     self.open_folder(ui, folder);
                 }
             }
+            Msg::FolderToggled(id, expanded) => self.folder_toggled(id, expanded),
             Msg::Selected(rows) => self.select(ui, &rows),
             Msg::Open(row) => {
                 self.select(ui, &[row]);
@@ -287,11 +290,7 @@ impl win32ui::App for App {
             Msg::Link(href) => self.link_clicked(ui, href),
             Msg::AttachmentDone(result) => self.attachment_done(result),
             Msg::SetTheme(choice) => self.choose_theme(ui, choice),
-            Msg::OriginalColours(original) => {
-                self.original_colours = original;
-                self.reader.set_original_colours(original);
-                self.refresh_menu(ui);
-            }
+            Msg::OriginalColours(original) => self.set_original_colours(ui, original),
             Msg::StopRemoteImages => self.stop_remote_images(ui),
             Msg::BannerAction => match self.attention() {
                 Some(notice) => self.reconnect_account(ui, notice.account),
