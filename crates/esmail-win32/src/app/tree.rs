@@ -35,7 +35,9 @@ impl TreeModel for Source {
 /// folder model reach it through `TreeView::refresh`, which keeps the selection
 /// and expansion.
 pub fn build(ui: &mut Ui<Msg>, folders: &SharedFolders) -> win32ui::Result<FolderView> {
-    let tree = TreeView::new(ui, Source(folders.clone()))?.on_select(|id| Some(Msg::Folder(*id)));
+    let tree = TreeView::new(ui, Source(folders.clone()))?
+        .on_select(|id| Some(Msg::Folder(*id)))
+        .on_toggle(|id, expanded| Some(Msg::FolderToggled(*id, expanded)));
     for account in folders.borrow().children(None) {
         tree.expand(&account.id, true);
     }

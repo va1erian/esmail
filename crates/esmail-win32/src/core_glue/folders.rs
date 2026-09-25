@@ -133,6 +133,27 @@ impl FolderTree {
         Some(FolderRef { account, mailbox: row.full_name.clone()? })
     }
 
+    /// `(node id, key, has_children, depth)` for every folder of `account`, in
+    /// the order the tree shows them (a parent before its children), for
+    /// restoring fold state.
+    pub fn rows_with_ids(&self, account: usize) -> Vec<(NodeId, String, bool, usize)> {
+        self.accounts
+            .get(account)
+            .map(|entry| entry.rows.iter().map(|row| (make_id(account, folder_hash(&row.key)), row.key.clone(), row.has_children, row.depth)).collect())
+            .unwrap_or_default()
+    }
+
+    /// The `(account, folder key)` a folder node stands for, for persisting its
+    /// fold state. `None` for an account node.
+    pub fn row_key(&self, id: NodeId) -> Option<(usize, String)> {
+        let (account, folder) = split_id(id);
+        if folder == 0 {
+            return None;
+        }
+        let row = self.accounts.get(account)?.rows.iter().find(|row| folder_hash(&row.key) == folder)?;
+        Some((account, row.key.clone()))
+    }
+
     /// The name of `account`'s folder of kind `want` (Trash, Archive), or
     /// `default` when the server names none.
     pub fn special_folder(&self, account: usize, want: SpecialUse, default: &str) -> String {
@@ -243,6 +264,26 @@ mod tests {
         let account = tree.children(None)[0].id;
         let projects = tree.children(Some(account))[2].id;
         assert_eq!(texts(&tree.children(Some(projects))), ["Alpha", "Beta"]);
+    }
+
+    #[test]
+    fn a_row_key_names_the_account_and_folder_for_persisting_folds() {
+        let tree = tree();
+        let account = tree.children(None)[0].id;
+        let projects = tree.children(Some(account))[2].id;
+        assert_eq!(tree.row_key(account), None, "an account node has no folder key");
+        assert_eq!(tree.row_key(projects), Some((0, "Projects".to_string())));
+    }
+
+    #[test]
+    fn rows_with_ids_are_in_tree_order_with_depth_and_children() {
+        let rows = tree().rows_with_ids(0);
+        let keys: Vec<&str> = rows.iter().map(|(_, key, _, _)| key.as_str()).collect();
+        assert_eq!(keys, ["INBOX", "[Gmail]", "Projects", "Projects/Alpha", "Projects/Beta"]);
+        let projects = rows.iter().find(|(_, key, _, _)| key == "Projects").unwrap();
+        assert!(projects.2, "Projects has children");
+        assert_eq!(projects.3, 0, "Projects is a top-level row");
+        assert_eq!(rows.iter().find(|(_, key, _, _)| key == "Projects/Alpha").unwrap().3, 1);
     }
 
     #[test]
