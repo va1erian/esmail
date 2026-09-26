@@ -7,7 +7,7 @@
 
 use esmail::progress::{Progress, ProgressKind};
 use esmail::view_model::progress_label;
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use super::{App, Msg};
 

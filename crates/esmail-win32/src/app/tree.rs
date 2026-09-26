@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use win32ui::{Node, TreeModel, TreeView, Ui};
+use xui_win32::{Node, TreeModel, TreeView, Ui};
 
 use esmail_win32::core_glue::{FolderTree, NodeId};
 
@@ -34,7 +34,7 @@ impl TreeModel for Source {
 /// A tree showing `folders`, with every account expanded. Later changes to the
 /// folder model reach it through `TreeView::refresh`, which keeps the selection
 /// and expansion.
-pub fn build(ui: &mut Ui<Msg>, folders: &SharedFolders) -> win32ui::Result<FolderView> {
+pub fn build(ui: &mut Ui<Msg>, folders: &SharedFolders) -> xui_win32::Result<FolderView> {
     let tree = TreeView::new(ui, Source(folders.clone()))?
         .on_select(|id| Some(Msg::Folder(*id)))
         .on_toggle(|id, expanded| Some(Msg::FolderToggled(*id, expanded)));

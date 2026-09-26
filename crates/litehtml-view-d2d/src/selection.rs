@@ -303,7 +303,7 @@ fn separator(prev: &TextRun, next: &TextRun, saw_space: bool) -> &'static str {
 mod tests {
     use super::*;
     use crate::text_runs::TextRunTable;
-    use win32ui::d2d::TextSystem;
+    use xui_win32::d2d::TextSystem;
 
     /// The engine lays pages out under the email master stylesheet, which zeroes
     /// paragraph margins and cell padding; these tests are about the gaps

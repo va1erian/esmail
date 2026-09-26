@@ -6,7 +6,7 @@ use esmail::render::Attachment;
 use std::sync::Arc;
 
 use litehtml_view_d2d::{HtmlView, HtmlViewEvent, ImageFetcher};
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use esmail_win32::core_glue::images;
 use esmail_win32::core_glue::reading::{self, Appearance, Palette};
@@ -31,7 +31,7 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn new(ui: &mut Ui<Msg>, palette: Palette) -> win32ui::Result<Reader> {
+    pub fn new(ui: &mut Ui<Msg>, palette: Palette) -> xui_win32::Result<Reader> {
         let appearance = Appearance { palette, original_colours: false };
         let view = HtmlView::new(
             ui,

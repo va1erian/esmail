@@ -7,7 +7,7 @@ use esmail::view_model::safe_attachment_filename;
 use esmail_win32::core_glue::compose::{Kind, initial_state};
 use esmail_win32::core_glue::files;
 use esmail_win32::core_glue::links::{LinkAction, classify};
-use win32ui::Ui;
+use xui_win32::Ui;
 
 use super::{App, Msg};
 

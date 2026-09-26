@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use esmail::view_model::format_size;
 use esmail_win32::core_glue::files;
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use super::ComposeMsg;
 
@@ -23,7 +23,7 @@ pub struct AttachmentList {
 }
 
 impl AttachmentList {
-    pub fn new(ui: &mut Ui<ComposeMsg>) -> win32ui::Result<AttachmentList> {
+    pub fn new(ui: &mut Ui<ComposeMsg>) -> xui_win32::Result<AttachmentList> {
         let list = ListView::new(ui)?
             .column("Attachment", Fill, |row: &Row| row.name.as_str())
             .column_right("Size", dip(90.0), |row: &Row| row.size.as_str())

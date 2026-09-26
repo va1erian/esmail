@@ -7,8 +7,8 @@
 //! fakes it by drawing the text twice), and colour emoji come from the system
 //! emoji font through DirectWrite's glyph fallback — no Twemoji assets.
 
-use win32ui::d2d::{D2dCanvas, Font, PointF, RectF, Stroke, TextSystem};
-use win32ui::Theme;
+use xui_win32::d2d::{D2dCanvas, Font, PointF, RectF, Stroke, TextSystem};
+use xui_win32::Theme;
 
 use esmail::view_model::RowModel;
 
@@ -62,13 +62,13 @@ pub struct Fonts {
 
 impl Fonts {
     /// Resolves the four fonts and computes the fixed row height.
-    pub fn new(text: &TextSystem) -> win32ui::Result<Fonts> {
+    pub fn new(text: &TextSystem) -> xui_win32::Result<Fonts> {
         let family = "Segoe UI, sans-serif";
-        let sender = text.font(&win32ui::d2d::FontSpec::new(family, SENDER_SIZE))?;
+        let sender = text.font(&xui_win32::d2d::FontSpec::new(family, SENDER_SIZE))?;
         let sender_bold =
-            text.font(&win32ui::d2d::FontSpec::new(family, SENDER_SIZE).weight(700))?;
-        let subject = text.font(&win32ui::d2d::FontSpec::new(family, SUBJECT_SIZE))?;
-        let timestamp = text.font(&win32ui::d2d::FontSpec::new(family, TIMESTAMP_SIZE))?;
+            text.font(&xui_win32::d2d::FontSpec::new(family, SENDER_SIZE).weight(700))?;
+        let subject = text.font(&xui_win32::d2d::FontSpec::new(family, SUBJECT_SIZE))?;
+        let timestamp = text.font(&xui_win32::d2d::FontSpec::new(family, TIMESTAMP_SIZE))?;
         let row_height =
             PAD_Y * 2.0 + sender.metrics().line_height() + LINE_GAP + subject.metrics().line_height();
         let star_width = sender.width(STAR_FILLED).max(sender.width(STAR_OUTLINE));

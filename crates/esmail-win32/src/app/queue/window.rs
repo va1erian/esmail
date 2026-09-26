@@ -2,8 +2,8 @@
 //! and the commands that act on the selected one. Like the Accounts window each
 //! runs its own `App` and asks the main window to do the work.
 
-use win32ui::prelude::*;
-use win32ui::{column, row};
+use xui_win32::prelude::*;
+use xui_win32::{column, row};
 
 use esmail_win32::core_glue::QueueRow;
 
@@ -52,7 +52,7 @@ struct QueueApp {
 }
 
 /// Opens the window owned by `ui`'s window.
-pub fn open(ui: &Ui<Msg>, init: Init) -> win32ui::Result<WindowHandle<QueueMsg>> {
+pub fn open(ui: &Ui<Msg>, init: Init) -> xui_win32::Result<WindowHandle<QueueMsg>> {
     let (title, size) = match init.kind {
         QueueKind::Drafts => ("Drafts", (dip(640.0), dip(380.0))),
         QueueKind::Outbox => ("Outbox", (dip(900.0), dip(380.0))),
@@ -61,7 +61,7 @@ pub fn open(ui: &Ui<Msg>, init: Init) -> win32ui::Result<WindowHandle<QueueMsg>>
     ui.open_window::<QueueApp, _>(spec, move |ui| QueueApp::new(ui, init))
 }
 
-fn button(ui: &mut Ui<QueueMsg>, text: &str, msg: fn() -> QueueMsg) -> win32ui::Result<Button<QueueMsg>> {
+fn button(ui: &mut Ui<QueueMsg>, text: &str, msg: fn() -> QueueMsg) -> xui_win32::Result<Button<QueueMsg>> {
     Ok(Button::new(ui, text)?.on_click(move || Some(msg())))
 }
 

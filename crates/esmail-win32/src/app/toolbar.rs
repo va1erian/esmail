@@ -6,7 +6,7 @@
 //! button's checked state follows the open message's flag. The reader's own bar
 //! (`reader_bar.rs`) uses native `Button`s, which also grey out in place.
 
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use esmail_win32::core_glue::compose::Kind;
 
@@ -69,7 +69,7 @@ pub struct MainBar {
 impl MainBar {
     /// Builds the toolbar once. Button availability is set from the shared
     /// state in [`MainBar::set_state`], never by rebuilding.
-    pub fn new(ui: &mut Ui<Msg>) -> win32ui::Result<MainBar> {
+    pub fn new(ui: &mut Ui<Msg>) -> xui_win32::Result<MainBar> {
         let toolbar = Toolbar::new(
             ui,
             vec![

@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
 
-use win32ui::Ui;
+use xui_win32::Ui;
 
 use super::Msg;
 
@@ -64,7 +64,7 @@ impl Capture {
 
     /// Writes the PNG and quits (with a failure code if it could not).
     /// `secondary` is a compose or queue window's capture, with which of the two.
-    pub fn finish(&self, ui: &mut Ui<Msg>, secondary: Option<(&str, win32ui::Result<win32ui::RgbaImage>)>) {
+    pub fn finish(&self, ui: &mut Ui<Msg>, secondary: Option<(&str, xui_win32::Result<xui_win32::RgbaImage>)>) {
         let result = ui.capture().map_err(|e| e.to_string()).and_then(|image| write_png(&image, &self.path).map_err(|e| e.to_string()));
         let result = result.and_then(|()| match secondary {
             Some((kind, image)) => image.map_err(|e| e.to_string()).and_then(|image| write_png(&image, &self.secondary_path(kind)).map_err(|e| e.to_string())),
@@ -87,7 +87,7 @@ impl Capture {
     }
 }
 
-fn write_png(image: &win32ui::RgbaImage, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn write_png(image: &xui_win32::RgbaImage, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut encoder = png::Encoder::new(BufWriter::new(File::create(path)?), image.width, image.height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);

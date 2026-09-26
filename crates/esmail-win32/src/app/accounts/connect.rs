@@ -8,7 +8,7 @@ use esmail_win32::core_glue::account_form::AccountForm;
 use esmail_win32::core_glue::account_setup::{google_auth, google_client_or_explain, remove_account, save_account, test_connection};
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::AbortHandle;
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use super::Outcome;
 use crate::app::{App, Msg};

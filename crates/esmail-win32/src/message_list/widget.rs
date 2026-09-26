@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use esmail::view_model::RowModel;
-use win32ui::d2d::{D2dCanvas, RectF};
-use win32ui::gdi::Canvas;
-use win32ui::{CustomWidget, Input, Key, KeyResult, Modifiers, MouseButton, Point, Rect, Renderer, Theme, WidgetCx};
+use xui_win32::d2d::{D2dCanvas, RectF};
+use xui_win32::gdi::Canvas;
+use xui_win32::{CustomWidget, Input, Key, KeyResult, Modifiers, MouseButton, Point, Rect, Renderer, Theme, WidgetCx};
 
 use crate::core_glue::compose::Kind;
 use super::dirty;
@@ -38,7 +38,7 @@ pub(super) struct MessageListWidget {
     /// Whether the list has the keyboard focus.
     pub(super) focused: Cell<bool>,
     /// Ctrl/Shift are tracked from key events because mouse events do not carry
-    /// modifier state (see the win32ui gap in the PR).
+    /// modifier state (see the xui-win32 gap in the PR).
     ctrl: Cell<bool>,
     shift: Cell<bool>,
     /// How long the last `paint_d2d` took, in microseconds (diagnostic).

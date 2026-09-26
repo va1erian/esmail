@@ -1,7 +1,7 @@
 //! `litehtml-view-d2d` — a prototype HTML view that lays a page out with
 //! [litehtml](https://github.com/litehtml/litehtml) (through
 //! `va1erian/litehtml-rs`) and paints it with Direct2D/DirectWrite through
-//! [win32ui](https://github.com/va1erian/win32ui).
+//! [xui-win32](https://github.com/va1erian/xui).
 //!
 //! This is the native-Win32 frontend prototype: **render, scroll, resize, DPI,
 //! links, text selection, copy, keyboard**. It exists to judge quality and
@@ -15,7 +15,7 @@
 //! jobs (HTML + a layout width in DIPs + a job id); superseded jobs are dropped
 //! and the UI ignores frames that are not the newest.
 //!
-//! The container measures text with win32ui's `TextSystem` (DirectWrite) and
+//! The container measures text with xui-win32's `TextSystem` (DirectWrite) and
 //! turns every draw callback into a backend-neutral [`Cmd`] — a display list of
 //! rects, rounded rects, border edges, gradients, images and text runs — with
 //! its own `Point`/`Rect`/`Rgba` types (`geom.rs`). The [`DisplayList`] crosses

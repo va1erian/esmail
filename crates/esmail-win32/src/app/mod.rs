@@ -46,8 +46,8 @@ mod tree;
 use std::path::PathBuf;
 
 use esmail::imap::MailHeader;
-use win32ui::prelude::*;
-use win32ui::{column, split_row};
+use xui_win32::prelude::*;
+use xui_win32::{column, split_row};
 
 use esmail_win32::MessageList;
 use esmail_win32::core_glue::mailbox::OpenFolder;
@@ -257,7 +257,7 @@ fn palette_for(theme: &Theme) -> Palette {
     if theme.is_dark { Palette::DARK } else { Palette::LIGHT }
 }
 
-impl win32ui::App for App {
+impl xui_win32::App for App {
     type Msg = Msg;
 
     fn update(&mut self, msg: Msg, ui: &mut Ui<Msg>) {

@@ -15,7 +15,7 @@ use esmail::imap::{ImapCommand, SpecialUse};
 use esmail::smtp::SmtpEvent;
 use esmail_win32::core_glue::compose::{Kind, has_content, initial_state};
 use esmail_win32::core_glue::{Delivered, Deliveries, Failure};
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use super::compose::{self, ComposeMsg, Init, Request};
 use super::queue::QueueKind;

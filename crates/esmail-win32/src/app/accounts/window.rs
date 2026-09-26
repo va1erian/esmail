@@ -6,7 +6,7 @@
 
 use esmail::config::AuthKind;
 use esmail_win32::core_glue::account_form::{AccountForm, Detection, Field, GMAIL_IMAP_HOST, detect, security_for_smtp_port};
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use super::form::{View, Widgets};
 use crate::app::{Msg, chrome};
@@ -113,7 +113,7 @@ struct FormApp {
 }
 
 /// Opens the form owned by `ui`'s window.
-pub fn open(ui: &Ui<Msg>, init: Init) -> win32ui::Result<WindowHandle<FormMsg>> {
+pub fn open(ui: &Ui<Msg>, init: Init) -> xui_win32::Result<WindowHandle<FormMsg>> {
     let title = match &init.mode {
         Mode::New { first_run: true } => "Welcome to esMail",
         Mode::New { first_run: false } => "Add account",
@@ -384,7 +384,7 @@ impl App for FormApp {
                 self.show_status(ui, "Finish signing in with Google in your browser...");
             }
             FormMsg::BrowserUnavailable(url) => {
-                let copied = win32ui::clipboard::set_text(ui.hwnd(), &url).is_ok();
+                let copied = xui_win32::clipboard::set_text(ui.hwnd(), &url).is_ok();
                 let hint = if copied { "The address is on the clipboard: paste it into a browser." } else { url.as_str() };
                 self.show_status(ui, &format!("Could not open your browser. {hint}"));
             }

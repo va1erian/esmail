@@ -1,10 +1,10 @@
 //! Reading and restoring the top-level window's placement, so it reopens where
-//! and how it was left. win32ui has this on `Window` but not on `Ui`, so the
+//! and how it was left. xui-win32 has this on `Window` but not on `Ui`, so the
 //! two Win32 calls are made here on the window's handle.
 
 use core::mem::size_of;
 
-use win32ui::{Hwnd, Placement, Rect, ShowState};
+use xui_win32::{Hwnd, Placement, Rect, ShowState};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowPlacement, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SetForegroundWindow, SetWindowPlacement, WINDOWPLACEMENT, WINDOWPLACEMENT_FLAGS,

@@ -19,7 +19,7 @@ use esmail::secrets;
 use esmail_win32::core_glue::account_form::AccountForm;
 use esmail_win32::core_glue::links::reconnect_href;
 use esmail_win32::core_glue::{Core, FolderTree};
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use super::{App, Msg};
 use manage::ManageMsg;

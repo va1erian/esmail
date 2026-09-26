@@ -13,7 +13,7 @@
 
 use std::time::Instant;
 
-use win32ui::Hwnd;
+use xui_win32::Hwnd;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBTRACK, SB_TOP,
@@ -84,7 +84,7 @@ impl ScrollKind {
             }
             ScrollKind::LineDown => vscroll(hwnd, SB_LINEDOWN, 0),
             ScrollKind::PageDown => vscroll(hwnd, SB_PAGEDOWN, 0),
-            // The high word position is only 16 bits and is ignored by win32ui
+            // The high word position is only 16 bits and is ignored by xui-win32
             // in favour of `GetScrollInfo(SIF_TRACKPOS)`; without a real drag
             // that reads 0, so this input measures the track path's latency
             // rather than a meaningful destination.

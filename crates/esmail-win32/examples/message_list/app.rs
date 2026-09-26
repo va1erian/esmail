@@ -1,4 +1,4 @@
-//! A win32ui window showing the [`MessageList`] fed by generated mock headers,
+//! an xui-win32 window showing the [`MessageList`] fed by generated mock headers,
 //! with a fake mailbox tree on the left.
 //!
 //! ```text
@@ -25,8 +25,8 @@ use std::sync::Arc;
 use esmail::imap::MailHeader;
 use esmail::view_model::RowModel;
 use esmail_win32::MessageList;
-use win32ui::prelude::*;
-use win32ui::{column, split_row};
+use xui_win32::prelude::*;
+use xui_win32::{column, split_row};
 
 use crate::bench;
 
@@ -130,7 +130,7 @@ pub(crate) fn main() {
         i += 1;
     }
 
-    let result = win32ui::run_app(
+    let result = xui_win32::run_app(
         WindowSpec::new("esMail message list")
             .size(dip(1000.0), dip(640.0))
             .theme(theme),
@@ -191,7 +191,7 @@ pub(crate) fn main() {
     }
 }
 
-impl win32ui::App for App {
+impl xui_win32::App for App {
     type Msg = Msg;
 
     fn update(&mut self, msg: Msg, ui: &mut Ui<Msg>) {

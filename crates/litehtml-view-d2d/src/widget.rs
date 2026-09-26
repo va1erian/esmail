@@ -1,5 +1,5 @@
 //! The owner-drawn [`HtmlWidget`] behind the public [`HtmlView`](crate::HtmlView)
-//! (which lives in `view.rs`): a win32ui [`CustomWidget`] that owns a render
+//! (which lives in `view.rs`): an xui-win32 [`CustomWidget`] that owns a render
 //! worker and paints its latest frame with Direct2D.
 //!
 //! Interaction (links, selection, copy, keyboard) is resolved here on the UI
@@ -17,9 +17,9 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use win32ui::d2d::{D2dCanvas, RectF, TextSystem};
-use win32ui::gdi::Canvas;
-use win32ui::{
+use xui_win32::d2d::{D2dCanvas, RectF, TextSystem};
+use xui_win32::gdi::Canvas;
+use xui_win32::{
     Color, CustomWidget, CursorShape, Hwnd, Input, Key, MouseButton, Rect as PxRect, Renderer,
     Size, Theme, WidgetCx,
 };
@@ -39,14 +39,14 @@ const DRAG_SLOP_DIP: f32 = 3.0;
 /// Longest gap between clicks that still extends a multi-click.
 const MULTI_CLICK: Duration = Duration::from_millis(500);
 /// The translucent highlight fill over the page.
-const SELECTION_FILL: win32ui::d2d::Rgba = win32ui::d2d::Rgba::with_alpha(0x33, 0x99, 0xFF, 0x80);
+const SELECTION_FILL: xui_win32::d2d::Rgba = xui_win32::d2d::Rgba::with_alpha(0x33, 0x99, 0xFF, 0x80);
 
 fn to_rectf(r: Rect) -> RectF {
     RectF::new(r.left, r.top, r.right, r.bottom)
 }
 
 /// The owner-drawn widget behind an [`HtmlView`](crate::HtmlView). All mutable
-/// state lives in `Cell`/`RefCell` fields because the win32ui `CustomWidget`
+/// state lives in `Cell`/`RefCell` fields because the xui-win32 `CustomWidget`
 /// trait hands the widget `&self`.
 pub struct HtmlWidget {
     painter: RefCell<Painter>,
@@ -280,7 +280,7 @@ impl HtmlWidget {
     /// Copies the selection to the clipboard.
     fn copy_selection(&self) {
         if let Some(text) = self.selected_text() {
-            let _ = win32ui::clipboard::set_text(self.hwnd, &text);
+            let _ = xui_win32::clipboard::set_text(self.hwnd, &text);
         }
     }
 }

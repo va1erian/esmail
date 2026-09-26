@@ -12,7 +12,7 @@ use std::io;
 
 use esmail::shell::{self, Instance, Request};
 use esmail_win32::core_glue::resident;
-use win32ui::Proxy;
+use xui_win32::Proxy;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{CreateEventW, EVENT_MODIFY_STATE, INFINITE, OpenEventW, SetEvent, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use esmail::imap::{FLAG_SEEN, ImapCommand};
 use esmail::render::Attachment;
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use super::{App, Msg};
 

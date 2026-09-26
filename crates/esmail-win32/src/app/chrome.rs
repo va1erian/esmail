@@ -1,6 +1,6 @@
 //! Window furniture: the menu bar and the theme choice behind View > Theme.
 
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use super::Msg;
 use super::queue::QueueKind;

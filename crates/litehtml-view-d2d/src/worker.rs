@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use litehtml::html::decode_data_uri;
-use win32ui::d2d::TextSystem;
+use xui_win32::d2d::TextSystem;
 
 use crate::engine::Engine;
 use crate::list::Frame;

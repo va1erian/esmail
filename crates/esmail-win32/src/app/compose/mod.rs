@@ -1,6 +1,6 @@
 //! A compose window: one secondary window per message.
 //!
-//! The window runs its own `App` (win32ui gives every window its own message
+//! The window runs its own `App` (xui-win32 gives every window its own message
 //! queue) and never touches the mail core. It edits a message and asks the main
 //! window, through a `Proxy`, to send it, save it as a draft or drop it; the
 //! main window answers with [`ComposeMsg::Sending`], [`ComposeMsg::Failed`]
@@ -15,7 +15,7 @@ use std::rc::Rc;
 use esmail::compose::{ComposeId, ComposeState};
 use esmail::contacts::Contacts;
 use esmail_win32::core_glue::compose::{has_content, window_title};
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use super::{Msg, chrome};
 use attachments::{FileRead, pick_and_read};
@@ -144,7 +144,7 @@ struct ComposeApp {
 }
 
 /// Opens a compose window owned by `ui`'s window.
-pub fn open(ui: &Ui<Msg>, init: Init) -> win32ui::Result<WindowHandle<ComposeMsg>> {
+pub fn open(ui: &Ui<Msg>, init: Init) -> xui_win32::Result<WindowHandle<ComposeMsg>> {
     let title = window_title(&init.state.subject);
     let spec = chrome::acrylic(WindowSpec::new(title).size(dip(760.0), dip(640.0)), init.acrylic);
     ui.open_window::<ComposeApp, _>(spec, move |ui| ComposeApp::new(ui, init))

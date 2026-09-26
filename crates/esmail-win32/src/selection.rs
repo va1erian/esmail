@@ -2,7 +2,7 @@
 //! that range selection and keyboard movement need, and where a navigation key
 //! moves the focus. Plain data and functions, unit-tested without a window.
 
-use win32ui::Key;
+use xui_win32::Key;
 
 /// The rows that are selected, plus the anchor and focus that range selection
 /// and keyboard movement need.

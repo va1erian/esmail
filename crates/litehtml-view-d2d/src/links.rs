@@ -123,7 +123,7 @@ mod tests {
     use super::*;
 
     fn table_for(html: &str, width: f32) -> std::sync::Arc<LinkTable> {
-        let mut engine = crate::engine::Engine::new(win32ui::d2d::TextSystem::new().unwrap());
+        let mut engine = crate::engine::Engine::new(xui_win32::d2d::TextSystem::new().unwrap());
         engine.draw_pass(html, width).expect("parses");
         engine.links.clone()
     }

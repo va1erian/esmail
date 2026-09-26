@@ -1,7 +1,7 @@
 //! Pure geometry and view-state logic for the message list.
 //!
 //! Everything here is a plain function of numbers or of [`Selection`], kept
-//! free of win32ui and `RowModel` types so it can be unit-tested without a
+//! free of xui-win32 and `RowModel` types so it can be unit-tested without a
 //! window, a message loop or any mail data. The widget (`message_list.rs`)
 //! holds a [`ViewState`] and calls these functions from its input and paint
 //! handlers.
@@ -11,7 +11,7 @@ use std::ops::Range;
 use crate::selection::Selection;
 
 /// The parts of a [`MessageList`](crate::MessageList)'s view that change
-/// without any win32ui call: the row count, the scroll offset (in
+/// without any xui-win32 call: the row count, the scroll offset (in
 /// device-independent pixels) and the selection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewState {
