@@ -7,7 +7,7 @@ use esmail::imap::{ImapCommand, MailHeader};
 use esmail::view_model::RowModel;
 use esmail_win32::core_glue::mailbox::{Applied, Edit, OpenFolder};
 use esmail_win32::core_glue::FolderRef;
-use win32ui::{ControlExt, HasText, Ui};
+use xui_win32::{ControlExt, HasText, Ui};
 
 use super::{App, Msg};
 

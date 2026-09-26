@@ -62,8 +62,8 @@ shape what is captured. Open the PNG with the Read tool before and after any
 change to `show()` or sizing. Release builds are a GUI program (no console);
 debug builds keep the console for the `--screenshot` timing line.
 
-If UI tests are flaky or would grab focus, win32ui ships a Windows Sandbox
-runner (`scripts/sandbox/run.ps1` in the win32ui repository) that runs an app
+If UI tests are flaky or would grab focus, xui ships a Windows Sandbox
+runner (`scripts/sandbox/run.ps1` in the xui repository) that runs an app
 built on it off the desktop.
 
 ## Things worth knowing
@@ -75,7 +75,7 @@ built on it off the desktop.
   IDLE); that is intended.
 - `esmail-win32` must stay egui-free (CI checks `cargo tree -p esmail-win32`).
 - The window icon is the resource `build.rs` embeds (id 1), installed with
-  win32ui's `Ui::set_icon` / `Icon::from_resource`.
+  xui-win32's `Ui::set_icon` / `Icon::from_resource`.
 - `--quit` and `--purge-data` exist for the installer; `--background` (the
   separate listener process) was removed with the egui frontend.
 - Redact fixtures before committing them (fixtures README).

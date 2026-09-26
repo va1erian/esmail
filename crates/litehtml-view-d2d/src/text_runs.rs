@@ -209,7 +209,7 @@ fn run_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use win32ui::d2d::TextSystem;
+    use xui_win32::d2d::TextSystem;
 
     fn table_for(html: &str, width: f32) -> std::sync::Arc<TextRunTable> {
         let mut engine = crate::engine::Engine::new(TextSystem::new().unwrap());

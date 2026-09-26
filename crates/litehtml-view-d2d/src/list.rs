@@ -1,5 +1,5 @@
 //! The backend-neutral display list: the commands a laid-out document becomes
-//! and the types they refer to. Nothing here depends on egui or win32ui, so
+//! and the types they refer to. Nothing here depends on egui or xui-win32, so
 //! the list could be replayed by any painter.
 
 use std::sync::Arc;

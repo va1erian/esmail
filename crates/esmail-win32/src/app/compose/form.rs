@@ -1,7 +1,7 @@
 //! The compose window's widgets and their layout.
 
-use win32ui::prelude::*;
-use win32ui::{column, row};
+use xui_win32::prelude::*;
+use xui_win32::{column, row};
 
 use super::attachments::AttachmentList;
 use super::{ComposeMsg, Field};
@@ -41,21 +41,21 @@ pub struct Form {
     _captions: Vec<Label>,
 }
 
-fn recipient(ui: &mut Ui<ComposeMsg>, field: Field) -> win32ui::Result<Edit<ComposeMsg>> {
+fn recipient(ui: &mut Ui<ComposeMsg>, field: Field) -> xui_win32::Result<Edit<ComposeMsg>> {
     Ok(Edit::single_line(ui)?
         .on_change(move |_| Some(ComposeMsg::Changed(field)))
         .on_focus(move |focused| Some(ComposeMsg::Focused(field, focused)))
         .on_submit(move || Some(ComposeMsg::Submit(field))))
 }
 
-fn button(ui: &mut Ui<ComposeMsg>, text: &str, msg: fn() -> ComposeMsg) -> win32ui::Result<Button<ComposeMsg>> {
+fn button(ui: &mut Ui<ComposeMsg>, text: &str, msg: fn() -> ComposeMsg) -> xui_win32::Result<Button<ComposeMsg>> {
     Ok(Button::new(ui, text)?.on_click(move || Some(msg())))
 }
 
 impl Form {
     /// Creates the widgets and lays them out. `accounts` are the labels of the
     /// accounts the message can be sent from.
-    pub fn build(ui: &mut Ui<ComposeMsg>, accounts: &[String]) -> win32ui::Result<Form> {
+    pub fn build(ui: &mut Ui<ComposeMsg>, accounts: &[String]) -> xui_win32::Result<Form> {
         let from = ComboBox::new(ui, accounts.iter().cloned().enumerate().map(|(index, label)| (label, index)))?.on_select(|_| Some(ComposeMsg::FromChanged));
         let subject = Edit::single_line(ui)?
             .on_change(|_| Some(ComposeMsg::Changed(Field::Subject)))
@@ -82,7 +82,7 @@ impl Form {
             save: button(ui, "Save draft", || ComposeMsg::SaveDraft)?,
             discard: button(ui, "Discard", || ComposeMsg::Discard)?,
             status: Label::new(ui, Rect::default(), "")?,
-            _captions: ["From", "To", "Cc", "Bcc", "Subject", ""].into_iter().map(|text| Label::new(ui, Rect::default(), text)).collect::<win32ui::Result<_>>()?,
+            _captions: ["From", "To", "Cc", "Bcc", "Subject", ""].into_iter().map(|text| Label::new(ui, Rect::default(), text)).collect::<xui_win32::Result<_>>()?,
         };
         form.status.set_visible(false);
         form.arrange(ui, Panels::default());

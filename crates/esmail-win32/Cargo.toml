@@ -1,6 +1,6 @@
 [package]
 name = "esmail-win32"
-description = "esMail on win32ui: a native, egui-free Windows frontend (read-only 3-pane prototype) plus the reusable message list widget. Internal to this workspace."
+description = "esMail on xui: a native, egui-free Windows frontend (read-only 3-pane prototype) plus the reusable message list widget. Internal to this workspace."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -25,14 +25,14 @@ ureq.workspace = true
 # HTML reading pane.
 [target.'cfg(windows)'.dependencies]
 litehtml-view-d2d = { path = "../litehtml-view-d2d" }
-win32ui = { git = "https://github.com/va1erian/win32ui.git", branch = "main" }
+xui-win32 = { git = "https://github.com/va1erian/xui.git", branch = "main" }
 # Attachment save-as/add dialogs.
 rfd.workspace = true
 # The tray icon and its menu.
 tray-icon.workspace = true
 # Only `InvalidateRect` (the scroll-invalidate workaround in message_list.rs)
 # and, in the example, the raw WM_VSCROLL/WM_MOUSEWHEEL drives for
-# --bench-scroll. Same version and feature discipline as win32ui itself.
+# --bench-scroll. Same version and feature discipline as xui-win32 itself.
 windows = { version = "0.62", default-features = false, features = [
     "Win32_Security",
     "Win32_System_Threading",

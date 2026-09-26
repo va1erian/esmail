@@ -2,8 +2,8 @@
 //! commands to add, edit, reconnect and remove them. Like the form it runs its
 //! own `App` and asks the main window to do the work.
 
-use win32ui::prelude::*;
-use win32ui::{column, row};
+use xui_win32::prelude::*;
+use xui_win32::{column, row};
 
 use crate::app::{Msg, chrome};
 
@@ -77,12 +77,12 @@ struct ManageApp {
 }
 
 /// Opens the window owned by `ui`'s window.
-pub fn open(ui: &Ui<Msg>, init: Init) -> win32ui::Result<WindowHandle<ManageMsg>> {
+pub fn open(ui: &Ui<Msg>, init: Init) -> xui_win32::Result<WindowHandle<ManageMsg>> {
     let spec = chrome::acrylic(WindowSpec::new("Accounts").size(dip(640.0), dip(380.0)), init.acrylic);
     ui.open_window::<ManageApp, _>(spec, move |ui| ManageApp::new(ui, init))
 }
 
-fn button(ui: &mut Ui<ManageMsg>, text: &str, msg: fn() -> ManageMsg) -> win32ui::Result<Button<ManageMsg>> {
+fn button(ui: &mut Ui<ManageMsg>, text: &str, msg: fn() -> ManageMsg) -> xui_win32::Result<Button<ManageMsg>> {
     Ok(Button::new(ui, text)?.on_click(move || Some(msg())))
 }
 

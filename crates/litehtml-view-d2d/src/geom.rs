@@ -1,6 +1,6 @@
 //! Neutral geometry and colour types shared by the display list and the
 //! painter. They mirror what the Direct2D backend needs without depending on
-//! egui or win32ui, so the list itself stays backend-neutral (see `list.rs`).
+//! egui or xui-win32, so the list itself stays backend-neutral (see `list.rs`).
 
 /// A point in device-independent pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

@@ -1,4 +1,4 @@
-//! The public [`MessageList`]: a win32ui [`Custom`] widget painted with
+//! The public [`MessageList`]: an xui-win32 [`Custom`] widget painted with
 //! Direct2D + DirectWrite, hosted in the built-in vertical scroll host
 //! ([`Custom::with_vscroll`]).
 //!
@@ -6,7 +6,7 @@
 //! widget (`widget.rs`) paints only the visible rows (see
 //! [`crate::state::visible_range`]) in document coordinates, because the host
 //! translates the canvas by the offset before `paint_d2d` runs. The navigation
-//! keys reach the widget first (win32ui's `CustomWidget::key`), which moves the
+//! keys reach the widget first (xui-win32's `CustomWidget::key`), which moves the
 //! focused row and asks this wrapper to scroll it into view.
 //!
 //! Selection, focus and scroll-offset state live in the pure
@@ -21,8 +21,8 @@ use std::cell::{OnceCell, RefCell};
 use std::rc::{Rc, Weak};
 use std::time::Instant;
 
-use win32ui::d2d::TextSystem;
-use win32ui::{AsControl, Control, Custom, Point, Rect, Theme, Themed, Ui, dip};
+use xui_win32::d2d::TextSystem;
+use xui_win32::{AsControl, Control, Custom, Point, Rect, Theme, Themed, Ui, dip};
 
 use crate::core_glue::compose::Kind;
 use crate::events::MessageListEvents;
@@ -33,7 +33,7 @@ use widget::MessageListWidget;
 
 pub use crate::events::MessageListEvent;
 
-/// A virtualized message list: a win32ui [`Custom`] widget painted with
+/// A virtualized message list: an xui-win32 [`Custom`] widget painted with
 /// Direct2D + DirectWrite, hosted in the built-in vertical scroll host.
 pub struct MessageList<M: 'static> {
     custom: Rc<Custom<MessageListWidget, M>>,
@@ -57,7 +57,7 @@ fn scroll_row_into_view<M: 'static>(custom: &Custom<MessageListWidget, M>, row: 
 
 impl<M: 'static> MessageList<M> {
     /// Creates the list, adopting `ui`'s theme.
-    pub fn new(ui: &mut Ui<M>) -> win32ui::Result<MessageList<M>> {
+    pub fn new(ui: &mut Ui<M>) -> xui_win32::Result<MessageList<M>> {
         let text = TextSystem::new()?;
         let fonts = Fonts::new(&text)?;
         let scale = ui.dpi() as f32 / 96.0;

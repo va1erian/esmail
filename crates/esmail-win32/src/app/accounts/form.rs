@@ -1,8 +1,8 @@
 //! The account form's widgets and their layout.
 
 use esmail::config::{AuthKind, TlsMode};
-use win32ui::prelude::*;
-use win32ui::row;
+use xui_win32::prelude::*;
+use xui_win32::row;
 
 use super::window::FormMsg;
 
@@ -73,27 +73,27 @@ struct Captions {
 }
 
 /// A single-line edit where Enter connects.
-fn field(ui: &mut Ui<FormMsg>) -> win32ui::Result<Edit<FormMsg>> {
+fn field(ui: &mut Ui<FormMsg>) -> xui_win32::Result<Edit<FormMsg>> {
     Ok(Edit::single_line(ui)?.on_submit(|| Some(FormMsg::Connect)))
 }
 
 /// A port number edit.
-fn port(ui: &mut Ui<FormMsg>) -> win32ui::Result<Edit<FormMsg>> {
+fn port(ui: &mut Ui<FormMsg>) -> xui_win32::Result<Edit<FormMsg>> {
     Ok(field(ui)?.number_only(true).max_length(5).on_change(|_| Some(FormMsg::ServersEdited)))
 }
 
-fn button(ui: &mut Ui<FormMsg>, text: &str, msg: fn() -> FormMsg) -> win32ui::Result<Button<FormMsg>> {
+fn button(ui: &mut Ui<FormMsg>, text: &str, msg: fn() -> FormMsg) -> xui_win32::Result<Button<FormMsg>> {
     Ok(Button::new(ui, text)?.on_click(move || Some(msg())))
 }
 
-fn caption(ui: &mut Ui<FormMsg>, text: &str) -> win32ui::Result<Label> {
+fn caption(ui: &mut Ui<FormMsg>, text: &str) -> xui_win32::Result<Label> {
     Label::new(ui, Rect::default(), text)
 }
 
 impl Widgets {
     /// Creates the widgets, without laying them out. They are created in the
     /// order Tab visits them.
-    pub fn build(ui: &mut Ui<FormMsg>) -> win32ui::Result<Widgets> {
+    pub fn build(ui: &mut Ui<FormMsg>) -> xui_win32::Result<Widgets> {
         let name = field(ui)?.cue("Optional: shown in the folder list");
         let email = field(ui)?
             .cue("you@example.com")

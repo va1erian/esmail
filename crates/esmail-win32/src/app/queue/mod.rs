@@ -9,7 +9,7 @@ mod window;
 
 use esmail::db::OutboxItem;
 use esmail_win32::core_glue::{draft_rows, outbox_rows};
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use super::{App, Msg, placement};
 use window::{Init, QueueMsg};

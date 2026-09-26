@@ -1,7 +1,7 @@
 //! The events a [`MessageList`](crate::MessageList) raises and the app-side
 //! closures that map them to the app's `Msg`.
 
-use win32ui::Point;
+use xui_win32::Point;
 
 use crate::core_glue::compose::Kind;
 

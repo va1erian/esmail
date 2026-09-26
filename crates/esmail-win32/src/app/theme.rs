@@ -1,12 +1,12 @@
 //! The window's theme: the user's choice, and following the system's.
 //!
-//! win32ui re-themes the widgets and the frame by itself when the system theme
+//! xui-win32 re-themes the widgets and the frame by itself when the system theme
 //! changes (`Ui::follow_system_theme`), but it has no notification for the app,
 //! and the reading pane's HTML has to be rendered again in the new palette. So
 //! while the system theme is followed, a slow timer compares the window's theme
 //! with the palette on screen.
 
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use esmail_win32::core_glue::ThemeChoice;
 use super::settings::SettingsMsg;

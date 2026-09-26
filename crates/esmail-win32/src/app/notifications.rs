@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use esmail::platform;
 use esmail::session::NotifyFn;
-use win32ui::Proxy;
+use xui_win32::Proxy;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 

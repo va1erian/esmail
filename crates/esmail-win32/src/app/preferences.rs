@@ -5,7 +5,7 @@ use esmail::imap::MailHeader;
 use esmail::oauth;
 use esmail_win32::core_glue::account_setup::google_client_config;
 use esmail_win32::core_glue::{ThemeChoice, sender_trusted, set_sender_trusted};
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use super::chrome::{self, ViewState};
 use super::settings::{self, Request, SettingsMsg};

@@ -5,7 +5,7 @@ A small, fast desktop and 100% vibe-coded mail client for IMAP and SMTP, written
 - Reads and sends mail over IMAP/SMTP, with several accounts side by side.
 - Renders HTML mail with [litehtml](https://github.com/litehtml/litehtml) instead of an embedded browser: no JavaScript engine, a small binary, and message HTML is sanitised before it is shown.
 - Signs in with a password or, for Gmail, with Sign in with Google (OAuth2, no app password).
-- On Windows, lives in the system tray, shows new-mail notifications and comes with an installer that uninstalls cleanly. The frontend is native Win32 (via [win32ui](https://github.com/va1erian/win32ui)), not egui.
+- On Windows, lives in the system tray, shows new-mail notifications and comes with an installer that uninstalls cleanly. The frontend is native Win32 (via [xui](https://github.com/va1erian/xui)), not egui.
 
 This repository is the mail core plus the native Windows frontend. The
 egui/eframe desktop frontend for Linux and macOS lives in

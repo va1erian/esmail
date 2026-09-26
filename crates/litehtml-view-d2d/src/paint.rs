@@ -3,12 +3,12 @@
 
 use std::collections::HashMap;
 
-use win32ui::d2d::{
+use xui_win32::d2d::{
     Cap, D2dCanvas, DashStyle, Font, FontSpec, GradientStop, ImageId, Interpolation,
     LinearGradient as D2dLinearGradient, PointF, RadialGradient as D2dRadialGradient,
     Radius as D2dRadius, RectF, Rgba as D2dRgba, RoundedRect, Stroke as D2dStroke, TextSystem,
 };
-use win32ui::Color;
+use xui_win32::Color;
 
 use crate::geom::{Point, Radius, Rect, Rgba};
 use crate::list::{Cmd, Dash, DisplayList, FontKey, ImageKey};
@@ -244,7 +244,7 @@ impl Painter {
             return Some(*id);
         }
         let image = list.images.get(key as usize)?;
-        let wimg = win32ui::RgbaImage {
+        let wimg = xui_win32::RgbaImage {
             width: image.width,
             height: image.height,
             pixels: image.rgba.clone(),

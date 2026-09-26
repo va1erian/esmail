@@ -20,11 +20,11 @@ Four crates in one workspace:
   `uninstall.rs` (the installer's `--purge-data`), and `emoji.rs` (Twemoji
   segmentation; the artwork is decoded in the frontend).
 - **`crates/esmail-win32`** — the native Windows frontend on
-  [win32ui](https://github.com/va1erian/win32ui): a 3-pane window, compose,
+  [xui](https://github.com/va1erian/xui): a 3-pane window, compose,
   Drafts/Outbox, accounts/settings, tray + notifications, in `src/app/` over
   the reusable widgets and `core_glue/` adapters.
 - **`crates/litehtml-view-d2d`** — the message-body webview: [litehtml](https://github.com/va1erian/litehtml-rs)
-  layout painted with Direct2D/DirectWrite through win32ui. JS-less by design:
+  layout painted with Direct2D/DirectWrite through xui-win32. JS-less by design:
   no legitimate mail client executes JS in email.
 - **`crates/mail-mock-server`** — an in-process IMAP + SMTP server with a
   throwaway TLS CA, used by `crates/esmail/tests/imap_smtp_integration.rs`.
@@ -40,7 +40,7 @@ The UI thread sends render jobs and paints the finished display lists.
 - Remote images are fetched up to eight at a time, each with a timeout; a
   text-only frame is sent first when images are involved.
 - `WebViewHandler` is `Send + Sync` with `&self` methods.
-- A frame is a display list replayed with Direct2D/DirectWrite through win32ui,
+- A frame is a display list replayed with Direct2D/DirectWrite through xui-win32,
   culled to the visible region, so tall messages cost only what is on screen.
 - A litehtml `Document` borrows the container and cannot be stored, so it is
   built, used and dropped inside one worker call. Text selection works from a

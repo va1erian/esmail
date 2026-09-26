@@ -7,7 +7,7 @@
 //! no-op when nothing changed.
 
 use esmail::imap::MailHeader;
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use esmail::oauth::now_unix;
 use esmail_win32::core_glue::{Notice, account_notice, button_name};

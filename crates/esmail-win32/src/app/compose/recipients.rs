@@ -6,7 +6,7 @@ use std::rc::Rc;
 use esmail::contacts::{Contacts, complete_recipient, recipient_token};
 
 /// How many suggestions are offered at once: what the list shows without a
-/// scrollbar (a win32ui `ListView` that needs one paints no rows here).
+/// scrollbar (a xui-win32 `ListView` that needs one paints no rows here).
 const MAX_SUGGESTIONS: usize = 4;
 
 /// A recipient field's text and where its caret is, as the edit reports them.

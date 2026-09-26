@@ -10,8 +10,8 @@ use esmail::db::SearchHit;
 use esmail::imap::MailHeader;
 use esmail::search_query::ParsedQuery;
 use esmail_win32::core_glue::{FolderRef, SearchResults};
-use win32ui::prelude::*;
-use win32ui::HasText;
+use xui_win32::prelude::*;
+use xui_win32::HasText;
 
 use super::{App, Msg};
 

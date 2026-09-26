@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use esmail::view_model::RowModel;
-use win32ui::dip;
+use xui_win32::dip;
 
 use super::MessageList;
 use crate::state::ViewState;

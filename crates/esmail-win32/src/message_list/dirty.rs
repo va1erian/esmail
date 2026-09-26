@@ -1,7 +1,7 @@
 //! Which part of the list a change repaints: the rows it touched, not the whole
-//! widget (win32ui clips the paint to the rectangle handed to `invalidate_rect`).
+//! widget (xui-win32 clips the paint to the rectangle handed to `invalidate_rect`).
 
-use win32ui::Rect;
+use xui_win32::Rect;
 
 use crate::selection::Selection;
 

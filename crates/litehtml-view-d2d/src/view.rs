@@ -1,4 +1,4 @@
-//! The public [`HtmlView`]: an HTML view hosted in its own win32ui child
+//! The public [`HtmlView`]: an HTML view hosted in its own xui-win32 child
 //! window, rendered on a worker thread with litehtml + Direct2D (see the crate
 //! docs and `widget.rs`'s `HtmlWidget`).
 
@@ -6,8 +6,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use win32ui::d2d::TextSystem;
-use win32ui::{Custom, Result, Ui};
+use xui_win32::d2d::TextSystem;
+use xui_win32::{Custom, Result, Ui};
 
 use crate::widget::HtmlWidget;
 use crate::worker::{ImageFetcher, ImageSource, Worker};
@@ -20,7 +20,7 @@ pub enum HtmlViewEvent {
     LinkClicked(String),
 }
 
-/// An HTML view hosted in its own win32ui child window, rendered on a worker
+/// An HTML view hosted in its own xui-win32 child window, rendered on a worker
 /// thread with litehtml + Direct2D.
 ///
 /// The worker is created here and lives for the view's lifetime; `on_frame` is
@@ -89,7 +89,7 @@ impl<M: Send + 'static> HtmlView<M> {
     /// Sets the colour shown behind the document and wherever it paints
     /// nothing (white by default). Pair it with a stylesheet that sets the
     /// text colour, so unstyled messages follow the app's theme.
-    pub fn set_background(&self, color: win32ui::Color) {
+    pub fn set_background(&self, color: xui_win32::Color) {
         self.widget.widget().borrow().set_background(color);
         self.widget.invalidate();
     }
@@ -134,8 +134,8 @@ impl<M: Send + 'static> HtmlView<M> {
     }
 }
 
-impl<M: 'static> win32ui::AsControl for HtmlView<M> {
-    fn control(&self) -> &win32ui::Control {
+impl<M: 'static> xui_win32::AsControl for HtmlView<M> {
+    fn control(&self) -> &xui_win32::Control {
         self.widget.control()
     }
 }

@@ -4,7 +4,7 @@ use esmail::imap::{ImapCommand, ImapEvent};
 use esmail::progress::{Progress, ProgressKind};
 use esmail_win32::core_glue::{CacheEvent, NodeId};
 
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use super::queue::QueueKind;
 use super::{App, Msg};

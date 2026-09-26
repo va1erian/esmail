@@ -1,9 +1,9 @@
 //! `esmail-win32` — the esMail message list rebuilt as a reusable
-//! [win32ui](https://github.com/va1erian/win32ui) component, with no egui.
+//! [xui-win32](https://github.com/va1erian/xui) component, with no egui.
 //!
 //! This is the native-Win32 prototype for one complex screen of esMail: the
-//! message list. [`MessageList`] is a win32ui `CustomWidget` painted with
-//! Direct2D + DirectWrite, hosted in win32ui's built-in vertical scroll host,
+//! message list. [`MessageList`] is an xui-win32 `CustomWidget` painted with
+//! Direct2D + DirectWrite, hosted in xui-win32's built-in vertical scroll host,
 //! so it looks and scrolls like a native list. It is virtualized: rows have a
 //! fixed DPI-aware height and only the visible ones are painted, so a list of
 //! 100,000 rows costs what a handful cost.

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use litehtml::{Document, DrawContext};
-use win32ui::d2d::TextSystem;
+use xui_win32::d2d::TextSystem;
 
 use crate::container::{D2dContainer, ua_sheet};
 use crate::links::LinkTable;

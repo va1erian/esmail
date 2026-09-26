@@ -28,12 +28,12 @@ pub struct Timing {
     pub last_rows: usize,
 }
 
-/// Workaround for a win32ui gap (see the PR's "win32ui root cause"): the
+/// Workaround for an xui-win32 gap (see the PR's "xui-win32 root cause"): the
 /// custom-widget scroll host moves the scroll offset and the native scrollbar
 /// thumb but never invalidates the widget, so the painted rows stay stale until
 /// some unrelated event repaints them. Invalidate here on every scroll to keep
 /// the rows in step with the thumb.
-pub(crate) fn invalidate(hwnd: win32ui::Hwnd) {
+pub(crate) fn invalidate(hwnd: xui_win32::Hwnd) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Gdi::InvalidateRect;
     // SAFETY: `hwnd` names the widget's live child window; a null rect and

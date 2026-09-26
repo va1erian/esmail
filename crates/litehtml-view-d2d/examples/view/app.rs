@@ -1,5 +1,5 @@
 //! Renders an HTML file (or `.eml` fixture, or the built-in `demo` page) in a
-//! win32ui window with an [`HtmlView`] filling it.
+//! xui-win32 window with an [`HtmlView`] filling it.
 //!
 //! ```text
 //! cargo run -p litehtml-view-d2d --example view -- <file.html>
@@ -19,8 +19,8 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use litehtml_view_d2d::{HtmlView, HtmlViewEvent};
-use win32ui::column;
-use win32ui::prelude::*;
+use xui_win32::column;
+use xui_win32::prelude::*;
 
 enum Msg {
     FrameReady,
@@ -132,7 +132,7 @@ pub(crate) fn main() {
         }
     };
 
-    let result = win32ui::run_app(
+    let result = xui_win32::run_app(
         WindowSpec::new("litehtml-view-d2d").size(dip(width), dip(height)),
         |ui| {
             let view = HtmlView::new(
@@ -201,7 +201,7 @@ fn count_highlight(image: &RgbaImage) -> usize {
     n
 }
 
-impl win32ui::App for App {
+impl xui_win32::App for App {
     type Msg = Msg;
 
     fn update(&mut self, msg: Msg, ui: &mut Ui<Msg>) {

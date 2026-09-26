@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use esmail_win32::core_glue::Notice;
 use esmail_win32::core_glue::compose::Kind;
@@ -59,7 +59,7 @@ pub struct ReaderBar {
 }
 
 impl ReaderBar {
-    pub fn new(ui: &mut Ui<Msg>) -> win32ui::Result<ReaderBar> {
+    pub fn new(ui: &mut Ui<Msg>) -> xui_win32::Result<ReaderBar> {
         let reply = Button::new(ui, "Reply")?.on_click(|| Some(Msg::Compose(Kind::Reply)));
         let reply_all = Button::new(ui, "Reply All")?.on_click(|| Some(Msg::Compose(Kind::ReplyAll)));
         let forward = Button::new(ui, "Forward")?.on_click(|| Some(Msg::Compose(Kind::Forward)));

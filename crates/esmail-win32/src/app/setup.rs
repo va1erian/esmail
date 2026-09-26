@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use esmail_win32::MessageList;
 use esmail_win32::core_glue::{BodyLoads, ConfigSaver, Core, FolderTree, Latest, Settings, ThemeChoice, WindowState, load_config};
-use win32ui::prelude::*;
+use xui_win32::prelude::*;
 
 use super::accounts::Accounts;
 use super::args::Args;
@@ -79,7 +79,7 @@ pub(crate) fn main() {
 
     let spec = chrome::acrylic(WindowSpec::new("esMail").size(dip(1200.0), dip(760.0)).theme(chrome::theme(settings.theme)), args.acrylic);
     let session = Session { settings, settings_path, waiting };
-    let result = win32ui::run_app(spec, |ui| build(ui, &args, &config, began, session));
+    let result = xui_win32::run_app(spec, |ui| build(ui, &args, &config, began, session));
     if let Err(error) = result {
         eprintln!("esmail-win32 failed: {error}");
         std::process::exit(1);
@@ -96,9 +96,9 @@ struct Session {
 }
 
 fn build(ui: &mut Ui<Msg>, args: &Args, config: &esmail::config::Config, began: Instant, session: Session) -> App {
-    // The icon `build.rs` embeds (resource id 1): win32ui's window class has no
+    // The icon `build.rs` embeds (resource id 1): xui-win32's window class has no
     // icon, so without this the title bar and taskbar show the generic one.
-    if let Ok(icon) = win32ui::Icon::from_resource(1) {
+    if let Ok(icon) = xui_win32::Icon::from_resource(1) {
         ui.set_icon(icon);
     }
     let Session { settings, settings_path, waiting } = session;

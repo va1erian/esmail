@@ -8,8 +8,8 @@
 //! and the background writer.
 
 use esmail::oauth::ClientSource;
-use win32ui::prelude::*;
-use win32ui::row;
+use xui_win32::prelude::*;
+use xui_win32::row;
 
 use crate::app::{Msg, chrome};
 
@@ -97,7 +97,7 @@ struct SettingsApp {
 }
 
 /// Opens the window owned by `ui`'s window.
-pub fn open(ui: &Ui<Msg>, init: Init) -> win32ui::Result<WindowHandle<SettingsMsg>> {
+pub fn open(ui: &Ui<Msg>, init: Init) -> xui_win32::Result<WindowHandle<SettingsMsg>> {
     let spec = chrome::acrylic(WindowSpec::new("Settings").size(dip(560.0), dip(520.0)), init.acrylic);
     ui.open_window::<SettingsApp, _>(spec, move |ui| SettingsApp::new(ui, init))
 }
