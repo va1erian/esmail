@@ -15,5 +15,5 @@ export CRATE_CC_NO_DEFAULTS=1
 export CC_x86_64_unknown_linux_musl="$wrappers/zcc"
 export AR_x86_64_unknown_linux_musl="$wrappers/zar"
 export CFLAGS_x86_64_unknown_linux_musl="-Os -fPIC -ffunction-sections -fdata-sections"
-exec cargo build -p esmail --no-default-features --features rustls \
+exec cargo build -p esmail -p esmail-glue --no-default-features --features rustls \
     --target x86_64-unknown-linux-musl "$@"

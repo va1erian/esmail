@@ -79,7 +79,7 @@ jobs:
 
       - name: No ring, aws-lc, OpenSSL or D-Bus in the tree
         run: |
-          if cargo tree -p esmail --no-default-features --features rustls -e normal \
+          if cargo tree -p esmail-glue --no-default-features --features rustls -e normal \
               --target x86_64-unknown-linux-musl --prefix none \
               | grep -E '^(ring|aws-lc-rs|aws-lc-sys|openssl|openssl-sys|native-tls|libdbus-sys|webpki-roots) '; then
             echo "the rustls build must not link these"; exit 1
