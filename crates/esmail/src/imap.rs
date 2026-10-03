@@ -2,14 +2,12 @@ use std::time::Duration;
 
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
-use tokio::net::TcpStream;
-use tokio_native_tls::TlsStream;
-use tokio_native_tls::native_tls::TlsConnector;
 use secrecy::ExposeSecret;
 use futures::StreamExt;
 use anyhow::anyhow;
 
 use crate::auth::{Auth, XOAuth2};
+use crate::tls::TlsStream;
 use crate::oauth::SignInExpired;
 use crate::progress::{Progress, ProgressKind};
 
@@ -551,7 +549,7 @@ pub enum ImapEvent {
 pub struct ImapActor {
     cmd_rx: mpsc::Receiver<ImapCommand>,
     event_tx: mpsc::Sender<ImapEvent>,
-    session: Option<async_imap::Session<TlsStream<TcpStream>>>,
+    session: Option<async_imap::Session<TlsStream>>,
     /// Set on the first successful [`ImapActor::connect`]; reused by
     /// [`ImapActor::ensure_connected`] to reconnect without the user retyping
     /// their password.
@@ -854,7 +852,7 @@ impl ImapActor {
         Ok(())
     }
 
-    async fn fetch_mailboxes(session: &mut async_imap::Session<TlsStream<TcpStream>>) -> anyhow::Result<Vec<MailboxInfo>> {
+    async fn fetch_mailboxes(session: &mut async_imap::Session<TlsStream>) -> anyhow::Result<Vec<MailboxInfo>> {
         let mut mailboxes = Vec::new();
         let mut fetches = session.list(Some(""), Some("*")).await?;
         while let Some(name) = fetches.next().await {
@@ -936,7 +934,7 @@ impl ImapActor {
         msg.flags().map(|f| flag_to_str(&f)).collect()
     }
 
-    async fn fetch_headers(session: &mut async_imap::Session<TlsStream<TcpStream>>, mailbox_name: &str, page: u32) -> anyhow::Result<(Vec<MailHeader>, u32, MailboxState)> {
+    async fn fetch_headers(session: &mut async_imap::Session<TlsStream>, mailbox_name: &str, page: u32) -> anyhow::Result<(Vec<MailHeader>, u32, MailboxState)> {
         let mailbox = session.examine(mailbox_name).await?;
         // `examine` already gets these off the server's untagged response —
         // no extra round trip. `db.rs`'s incremental-sync bookkeeping
@@ -977,7 +975,7 @@ impl ImapActor {
     }
 
     /// Fetch one message's full raw RFC822 source.
-    async fn fetch_raw(session: &mut async_imap::Session<TlsStream<TcpStream>>, mailbox_name: &str, uid: u32) -> anyhow::Result<Vec<u8>> {
+    async fn fetch_raw(session: &mut async_imap::Session<TlsStream>, mailbox_name: &str, uid: u32) -> anyhow::Result<Vec<u8>> {
         session.examine(mailbox_name).await?;
         let query = format!("{}", uid);
         let mut fetches = session.uid_fetch(query, "RFC822").await?;
@@ -991,7 +989,7 @@ impl ImapActor {
         Err(anyhow!("Message not found or no body"))
     }
 
-    async fn fetch_body(session: &mut async_imap::Session<TlsStream<TcpStream>>, mailbox_name: &str, uid: u32) -> anyhow::Result<(String, Vec<crate::render::Attachment>)> {
+    async fn fetch_body(session: &mut async_imap::Session<TlsStream>, mailbox_name: &str, uid: u32) -> anyhow::Result<(String, Vec<crate::render::Attachment>)> {
         let raw = Self::fetch_raw(session, mailbox_name, uid).await?;
         let html = crate::render::render_message(&raw);
         let attachments = crate::render::extract_attachments(&raw);
@@ -1004,7 +1002,7 @@ impl ImapActor {
     /// the end, since it exists to describe exactly the messages a
     /// `notify::WatermarkUpdate::NewMail` just reported as new.
     async fn fetch_new_headers(
-        session: &mut async_imap::Session<TlsStream<TcpStream>>,
+        session: &mut async_imap::Session<TlsStream>,
         mailbox_name: &str,
         first_uid: u32,
     ) -> anyhow::Result<Vec<MailHeader>> {
@@ -1025,7 +1023,7 @@ impl ImapActor {
     }
 
     async fn bulk_download(
-        session: &mut async_imap::Session<TlsStream<TcpStream>>,
+        session: &mut async_imap::Session<TlsStream>,
         mailbox_name: &str,
         event_tx: &mpsc::Sender<ImapEvent>,
     ) -> anyhow::Result<()> {
@@ -1092,7 +1090,7 @@ impl ImapActor {
     /// clobbering a flag set by something else between the read and the
     /// write) or adds/removes one set at a time.
     async fn store_flags(
-        session: &mut async_imap::Session<TlsStream<TcpStream>>,
+        session: &mut async_imap::Session<TlsStream>,
         mailbox_name: &str,
         uid: u32,
         add: &[String],
@@ -1132,7 +1130,7 @@ impl ImapActor {
     /// immediately expunging it, so the only `\Deleted` message in the
     /// mailbox at that point is this one.
     async fn move_message(
-        session: &mut async_imap::Session<TlsStream<TcpStream>>,
+        session: &mut async_imap::Session<TlsStream>,
         mailbox_name: &str,
         uid: u32,
         dest: &str,
@@ -1166,7 +1164,7 @@ impl ImapActor {
     /// request/response session wrapper isn't set up to do anywhere else
     /// either.
     async fn fetch_unread_counts(
-        session: &mut async_imap::Session<TlsStream<TcpStream>>,
+        session: &mut async_imap::Session<TlsStream>,
         mailboxes: &[String],
     ) -> std::collections::HashMap<String, u32> {
         let mut counts = std::collections::HashMap::new();
@@ -1209,17 +1207,13 @@ pub(crate) async fn connect_session(
     port: u16,
     username: &str,
     auth: &Auth,
-) -> anyhow::Result<async_imap::Session<TlsStream<TcpStream>>> {
+) -> anyhow::Result<async_imap::Session<TlsStream>> {
     // Fetched before the connection is opened so a token-refresh failure
     // (the sign-in was revoked, say) is reported as itself rather than as a
     // half-open connection that then errors out.
     let secret = auth.secret().await?;
 
-    let tls_connector = TlsConnector::builder().build()?;
-    let tokio_tls_connector = tokio_native_tls::TlsConnector::from(tls_connector);
-
-    let stream = TcpStream::connect((host, port)).await?;
-    let tls_stream = tokio_tls_connector.connect(host, stream).await?;
+    let tls_stream = crate::tls::connect(host, port).await?;
     let mut client = async_imap::Client::new(tls_stream);
     let _ = client.read_response().await;
 
@@ -1276,7 +1270,7 @@ fn spawn_body_worker(
     credentials: Credentials,
 ) {
     tokio::spawn(async move {
-        let mut session: Option<async_imap::Session<TlsStream<TcpStream>>> = None;
+        let mut session: Option<async_imap::Session<TlsStream>> = None;
 
         while let Some(cmd) = cmd_rx.recv().await {
             // A command that fails against an existing session is retried
@@ -1327,7 +1321,7 @@ fn spawn_body_worker(
 /// retry it once before surfacing it -- see the retry loop there.
 async fn run_worker_command(
     cmd: &WorkerCommand,
-    session: &mut async_imap::Session<TlsStream<TcpStream>>,
+    session: &mut async_imap::Session<TlsStream>,
     event_tx: &mpsc::Sender<ImapEvent>,
 ) -> anyhow::Result<()> {
     match cmd {
@@ -1382,7 +1376,7 @@ async fn report_worker_failure(cmd: &WorkerCommand, event_tx: &mpsc::Sender<Imap
 /// returning the session instead of storing it on `self`, and never
 /// sending `Connected`/`Disconnected` -- see `spawn_body_worker`'s doc for
 /// why.
-async fn ensure_worker_connected(credentials: &Credentials) -> anyhow::Result<async_imap::Session<TlsStream<TcpStream>>> {
+async fn ensure_worker_connected(credentials: &Credentials) -> anyhow::Result<async_imap::Session<TlsStream>> {
     let mut delay = Duration::from_secs(1);
     let mut last_err = None;
     for attempt in 1..=MAX_RECONNECT_ATTEMPTS {

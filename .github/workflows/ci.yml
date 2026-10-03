@@ -52,6 +52,42 @@ jobs:
         env:
           ESMAIL_TEST_CA_TRUSTED: "1"
 
+      # The same suite over the `rustls` backend (the one LazyOS builds),
+      # with the trust anchors read from the system bundle.
+      - name: Run IMAP/SMTP simulation tests over rustls
+        run: cargo test -p esmail --no-default-features --features rustls -- --include-ignored
+        env:
+          ESMAIL_TEST_CA_TRUSTED: "1"
+          SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+
+  # The core as LazyOS builds it: static musl, rustls with no crypto provider
+  # of its own, no D-Bus, and nothing that is not GPLv2-compatible (ring,
+  # aws-lc, OpenSSL). zig compiles SQLite for musl.
+  build-musl-rustls:
+    name: Build core for musl (rustls)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install zig
+        run: pip install ziglang==0.16.0
+
+      - name: No ring, aws-lc, OpenSSL or D-Bus in the tree
+        run: |
+          if cargo tree -p esmail --no-default-features --features rustls -e normal \
+              --target x86_64-unknown-linux-musl --prefix none \
+              | grep -E '^(ring|aws-lc-rs|aws-lc-sys|openssl|openssl-sys|native-tls|libdbus-sys|webpki-roots) '; then
+            echo "the rustls build must not link these"; exit 1
+          fi
+
+      - name: Build
+        run: scripts/build-musl.sh
+
   # Build-only on Windows: trusting an extra root CA there means the
   # Windows certificate store, not a files-on-disk step like Linux's
   # update-ca-certificates, and whether that's reliably non-interactive on
