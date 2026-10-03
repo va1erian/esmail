@@ -37,14 +37,14 @@
 //!
 //! # On other targets
 //!
-//! Only the widgets are Windows-only. [`core_glue`], the frontend-independent
-//! layer that drives esMail's IMAP actors, builds everywhere so its logic is
-//! unit-tested on Linux CI too; the `esmail-win32` binary is an empty `main`
-//! there.
+//! Only the widgets are Windows-only. [`core_glue`] is the `esmail-glue`
+//! crate, the frontend-independent layer that drives esMail's IMAP actors and
+//! that the LazyOS frontend shares; the `esmail-win32` binary is an empty
+//! `main` on other targets.
 
 #![warn(missing_docs)]
 
-pub mod core_glue;
+pub use esmail_glue as core_glue;
 #[cfg(windows)]
 mod events;
 #[cfg(windows)]

@@ -1,10 +1,8 @@
-//! The frontend-independent layer between esMail's mail core and this crate's
-//! window: it owns the async runtime and the per-account IMAP sessions, and
-//! turns "something arrived" into a plain drain the UI thread runs on demand.
-//!
-//! It drives the `esmail` library's actors directly (as the egui `main.rs`
-//! does, read path only) and names no UI type, so it can be swapped for the
-//! shared `AppCore` once that lands.
+//! The frontend-independent layer between esMail's mail core and a window:
+//! it owns the async runtime and the per-account IMAP sessions, and turns
+//! "something arrived" into a plain drain the UI thread runs on demand. It
+//! names no UI type; the Windows frontend (`esmail-win32`, as `core_glue`) and
+//! the LazyOS one both build on it.
 //!
 //! # Threading
 //!

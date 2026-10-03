@@ -10,6 +10,8 @@ license.workspace = true
 # The mail core only: no egui, eframe, winit or webview (`cargo tree -p
 # esmail-win32 | grep egui` must stay empty, CI checks it).
 esmail = { path = "../esmail", default-features = false, features = ["native-tls", "os-keyring"] }
+# The frontend-independent layer over the core (`core_glue`).
+esmail-glue = { path = "../esmail-glue" }
 anyhow.workspace = true
 chrono.workspace = true
 log.workspace = true

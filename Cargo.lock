@@ -849,6 +849,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "esmail-glue"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "env_logger",
+ "esmail",
+ "log",
+ "mail-mock-server",
+ "opener",
+ "secrecy",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
+ "ureq",
+]
+
+[[package]]
 name = "esmail-win32"
 version = "0.1.0"
 dependencies = [
@@ -856,6 +874,7 @@ dependencies = [
  "chrono",
  "env_logger",
  "esmail",
+ "esmail-glue",
  "litehtml-view-d2d",
  "log",
  "mail-mock-server",
