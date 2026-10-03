@@ -382,7 +382,11 @@ fn post_token_form(url: &str, form: &[(&'static str, String)]) -> anyhow::Result
     // Google explains a rejected grant in the body of a 4xx, so a non-2xx
     // status must come back as a response rather than a bare `Err`.
     let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(TOKEN_REQUEST_TIMEOUT)).build(),
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(TOKEN_REQUEST_TIMEOUT))
+            .tls_config(crate::tls::http_config()?)
+            .build(),
     );
     let mut response = agent
         .post(url)

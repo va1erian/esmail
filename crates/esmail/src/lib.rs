@@ -28,6 +28,7 @@ pub mod session;
 pub mod shell;
 pub mod shortcuts;
 pub mod smtp;
+pub mod tls;
 pub mod uninstall;
 pub mod view_model;
 pub mod waker;

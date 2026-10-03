@@ -10,7 +10,7 @@ use esmail::compose::ComposeState;
 use esmail::config::TlsMode;
 use esmail::render::extract_attachments;
 use esmail::smtp::{SmtpAccount, SmtpEvent};
-use esmail_win32::core_glue::{Deliveries, Failure, Sender};
+use esmail_glue::{Deliveries, Failure, Sender};
 use mail_mock_server::fixtures::{TEST_PASSWORD, TEST_USER};
 
 fn account(port: u16) -> SmtpAccount {

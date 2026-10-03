@@ -828,12 +828,15 @@ dependencies = [
  "mail-mock-server",
  "mailparse",
  "rusqlite",
+ "rustls",
+ "rustls-native-certs",
  "secrecy",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls",
  "toml 0.8.23",
  "tray-icon",
  "twemoji-assets",
@@ -846,6 +849,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "esmail-glue"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "env_logger",
+ "esmail",
+ "log",
+ "mail-mock-server",
+ "opener",
+ "secrecy",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
+ "ureq",
+]
+
+[[package]]
 name = "esmail-win32"
 version = "0.1.0"
 dependencies = [
@@ -853,6 +874,7 @@ dependencies = [
  "chrono",
  "env_logger",
  "esmail",
+ "esmail-glue",
  "litehtml-view-d2d",
  "log",
  "mail-mock-server",
@@ -1516,9 +1538,12 @@ dependencies = [
  "nom 8.0.0",
  "percent-encoding",
  "quoted_printable",
+ "rustls",
+ "rustls-native-certs",
  "socket2",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls",
  "url",
 ]
 
@@ -2414,6 +2439,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-native-certs"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
+dependencies = [
+ "openssl-probe",
+ "rustls-pki-types",
+ "schannel",
+ "security-framework 3.7.0",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2860,6 +2897,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbae76ab933c85776efabc971569dd6119c580d8f5d448769dec1764bf796ef2"
 dependencies = [
  "native-tls",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
+dependencies = [
+ "rustls",
  "tokio",
 ]
 

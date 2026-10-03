@@ -40,6 +40,10 @@ macro_rules! skip_unless_ca_trusted {
             );
             return;
         }
+        // The `rustls` backend uses the process-default crypto provider,
+        // which the program (here, the test) installs.
+        #[cfg(feature = "rustls")]
+        let _ = rustls::crypto::ring::default_provider().install_default();
     };
 }
 

@@ -10,9 +10,21 @@ use std::time::Duration;
 /// hold up the rest of the message (ureq has no timeout unless asked).
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| ureq::Agent::new_with_config(ureq::Agent::config_builder().timeout_global(Some(FETCH_TIMEOUT)).build()))
+/// `None` when the TLS settings cannot be built (no trusted CA certificates):
+/// then no image is fetched rather than one fetched unchecked.
+fn agent() -> Option<&'static ureq::Agent> {
+    static AGENT: OnceLock<Option<ureq::Agent>> = OnceLock::new();
+    AGENT
+        .get_or_init(|| match esmail::tls::http_config() {
+            Ok(tls) => Some(ureq::Agent::new_with_config(
+                ureq::Agent::config_builder().timeout_global(Some(FETCH_TIMEOUT)).tls_config(tls).build(),
+            )),
+            Err(error) => {
+                log::warn!("remote images are off: {error:#}");
+                None
+            }
+        })
+        .as_ref()
 }
 
 /// The bytes at an `http(s)` `url`, or `None` for any other scheme or a failed
@@ -22,7 +34,8 @@ pub fn fetch(url: &str) -> Option<Vec<u8>> {
     if !scheme_ok {
         return None;
     }
-    match agent().get(url).call().and_then(|response| response.into_body().read_to_vec()) {
+    let agent = agent()?;
+    match agent.get(url).call().and_then(|response| response.into_body().read_to_vec()) {
         Ok(bytes) => Some(bytes),
         Err(error) => {
             log::warn!("could not fetch remote image {url}: {error}");

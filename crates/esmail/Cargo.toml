@@ -10,11 +10,40 @@ license.workspace = true
 name = "esmail"
 path = "src/lib.rs"
 
+[features]
+default = ["native-tls", "os-keyring"]
+# TLS for IMAP, SMTP and HTTPS through the platform's own library (SChannel on
+# Windows, OpenSSL elsewhere); HTTPS keeps ureq's rustls with `ring`.
+native-tls = ["dep:tokio-native-tls", "lettre/tokio1-native-tls", "ureq/rustls"]
+# TLS through rustls with no crypto provider of its own: the program installs
+# one as the process default before connecting (LazyOS installs its
+# GPLv2-compatible RustCrypto provider). Trust anchors are the system's CA
+# bundle (`SSL_CERT_FILE`, or the usual paths). Exactly one of the two.
+rustls = [
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:rustls-native-certs",
+    "lettre/tokio1-rustls",
+    "lettre/rustls-no-provider",
+    "lettre/rustls-native-certs",
+    "ureq/rustls-no-provider",
+]
+# Passwords in the platform's credential store: Windows Credential Manager,
+# the macOS keychain, or Secret Service over D-Bus on Linux. Without it
+# `keyring` falls back to its in-memory mock store unless the program installs
+# a credential builder of its own (`keyring::set_default_credential_builder`),
+# as LazyOS does. Each backend's crate is gated to its own target inside
+# `keyring`, so turning all three on builds only the host's.
+os-keyring = ["keyring/windows-native", "keyring/sync-secret-service", "keyring/apple-native"]
+
 [dependencies]
 ureq.workspace = true
 
 tokio.workspace = true
-tokio-native-tls.workspace = true
+tokio-native-tls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
 futures.workspace = true
 
 async-imap.workspace = true
@@ -46,41 +75,19 @@ interprocess.workspace = true
 # Tray icon + Windows toast notifications (B10). Windows-only: neither crate
 # is even compiled on other platforms, let alone linked.
 #
-# `keyring`'s real platform credential stores are all opt-in Cargo features
-# (see keyring-3.x's [features]: no `default` list at all) -- with none
-# enabled, `keyring` silently falls back to its in-memory-only `mock` store
-# on every platform (keyring-3.x's own src/lib.rs: `#[cfg(all(target_os =
-# "windows", not(feature = "windows-native")))] pub use mock as default;`,
-# and the equivalent for Linux/macOS). The base `keyring.workspace = true`
-# above carried no such feature, so `secrets::set_password`/`get_password`
-# were quietly talking to a store that: a) `MockCredentialBuilder::build`'s
-# own doc comment says "keeps the password in the entry" -- and
-# `secrets::entry()` builds a brand-new `keyring::Entry` on every call, so
-# even a `get_password` moments after a `set_password` in the *same*
-# session returned nothing; and b) never touched the real OS keychain, so
-# nothing could have survived a restart either way. This is the actual
-# cause of "the password doesn't appear to be saved" -- see the GitHub
-# issue this was filed against. Fixed by requesting the real backend per
-# platform.
+# `keyring`'s real platform credential stores are all opt-in Cargo features;
+# with none enabled it silently falls back to an in-memory mock store, which
+# once made saved passwords vanish. They are requested by `os-keyring` above.
 [target.'cfg(windows)'.dependencies]
 tray-icon.workspace = true
 windows.workspace = true
-keyring = { workspace = true, features = ["windows-native"] }
 windows-registry.workspace = true
 widestring.workspace = true
 
-# Secret Service (gnome-keyring/kwallet over D-Bus) -- matches the
-# `libdbus-1-dev` package `.github/workflows/build.yml`'s Linux job already
-# installs for other reasons, so this needs no new CI dependency.
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { workspace = true, features = ["sync-secret-service"] }
-
-# Not built by this repo's CI today, but included so a macOS build gets a
-# real keychain instead of silently inheriting the mock fallback too.
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { workspace = true, features = ["apple-native"] }
-
 [dev-dependencies]
 mail-mock-server = { path = "../mail-mock-server" }
+# A crypto provider for the tests of the `rustls` backend; never linked into
+# the library itself.
+rustls = { workspace = true, features = ["ring"] }
 # The `toast` example initializes logging.
 env_logger.workspace = true

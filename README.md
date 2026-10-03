@@ -37,6 +37,14 @@ cargo run --release -p esmail-win32        # build and start it (Windows)
 cargo test --workspace                     # unit tests
 ```
 
+The core has two TLS backends, picked by Cargo features of the `esmail`
+crate: `native-tls` (the default: SChannel on Windows, OpenSSL elsewhere) and
+`rustls`, which uses whatever rustls crypto provider the program installs and
+the system's CA bundle. `os-keyring` (default) keeps passwords in the
+platform's credential store. The LazyOS port builds the core with
+`--no-default-features --features rustls` for static musl;
+`scripts/build-musl.sh` does that build.
+
 The IMAP/SMTP tests run esMail's real network code against an in-process
 server. They are ignored by default; see
 [crates/mail-mock-server/README.md](crates/mail-mock-server/README.md) for how

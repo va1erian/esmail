@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use esmail::config::{AccountConfig, Config};
 use esmail::imap::ImapEvent;
 use esmail::notify::{account_from_launch_arguments, launch_arguments};
-use esmail_win32::core_glue::Core;
-use esmail_win32::core_glue::resident::account_index;
+use esmail_glue::Core;
+use esmail_glue::resident::account_index;
 use mail_mock_server::fixtures::{TEST_PASSWORD, TEST_USER};
 
 const WAIT: Duration = Duration::from_secs(30);

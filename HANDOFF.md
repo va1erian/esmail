@@ -32,7 +32,8 @@ crates/esmail/src/           the egui-free core: imap.rs, idle_watch.rs, smtp.rs
                              config.rs/secrets.rs, notify.rs + platform/, uninstall.rs
 crates/esmail/src/app/       AppCore: the frontend-agnostic model (used by esmail-egui)
 crates/esmail-win32/src/app/ the native Windows frontend
-crates/esmail-win32/src/core_glue/  adapters over the core for the win32 app
+crates/esmail-glue/           adapters over the core, shared by the win32 and LazyOS apps
+                             (re-exported by esmail-win32 as `core_glue`)
 crates/esmail-win32/src/message_list/  the reusable, virtualized message list widget
 crates/litehtml-view-d2d/    the Direct2D/DirectWrite message-body webview
 crates/mail-mock-server/     in-process IMAP + SMTP server for tests
